@@ -1,4 +1,4 @@
-# Script khởi động Codex MCP Server trên Windows (foreground, xem log trực tiếp)
+# Start ChatGPT Local Coder MCP on Windows in the foreground so logs remain visible.
 param(
     [string]$Workspace = $env:WORKSPACE_PATH,
     [int]$Port = 3000,
@@ -34,7 +34,7 @@ function Get-DotEnvValue([string]$Name) {
 
 if (-not (Test-Path ".env")) {
     Copy-Item ".env.example" ".env"
-    Write-Host "Da tao file .env - hay chinh sua WORKSPACE_PATH" -ForegroundColor Yellow
+    Write-Host "Created .env - update WORKSPACE_PATH before using the server." -ForegroundColor Yellow
 }
 
 if (-not $Workspace) {
@@ -54,7 +54,7 @@ if ($ChatGptAutoApprove) {
 }
 
 Write-Host ""
-Write-Host "=== Codex MCP Server ===" -ForegroundColor Cyan
+Write-Host "=== ChatGPT Local Coder MCP ===" -ForegroundColor Cyan
 Write-Host "Default cwd: $Workspace"
 Write-Host "Full machine access: ON"
 if ($ChatGptAutoApprove) { Write-Host "ChatGPT auto-approve: $ChatGptAutoApprove" }
@@ -75,36 +75,34 @@ if ($existingPid) {
     $proc = Get-Process -Id $existingPid -ErrorAction SilentlyContinue
     $procName = if ($proc) { $proc.ProcessName } else { "unknown" }
 
-    Write-Host "[CANH BAO] Port $Port dang duoc dung boi PID $existingPid ($procName)" -ForegroundColor Yellow
+    Write-Host "[WARNING] Port $Port is already in use by PID $existingPid ($procName)" -ForegroundColor Yellow
 
     if ($Force) {
-        Write-Host "Dang tat process cu (Force)..." -ForegroundColor Yellow
+        Write-Host "Stopping the existing process (-Force)..." -ForegroundColor Yellow
         Stop-Process -Id $existingPid -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 1
     } else {
-        $answer = Read-Host "Dung server cu va chay lai? (y/n)"
+        $answer = Read-Host "Stop the existing server and restart? (y/n)"
         if ($answer -match '^[yY]') {
             Stop-Process -Id $existingPid -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 1
         } else {
-            Write-Host "Huy. Server cu van dang chay tai http://localhost:$Port" -ForegroundColor Red
+            Write-Host "Cancelled. The existing server is still running at http://localhost:$Port" -ForegroundColor Red
             exit 1
         }
     }
 }
 
-if (-not (Test-Path "dist/index.js")) {
-    Write-Host "Building..." -ForegroundColor Yellow
-    npm run build
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Build that bai!" -ForegroundColor Red
-        Read-Host "Nhan Enter de dong"
-        exit 1
-    }
+Write-Host "Building latest source..." -ForegroundColor Yellow
+npm run build
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Build failed!" -ForegroundColor Red
+    Read-Host "Press Enter to close"
+    exit 1
 }
 
-Write-Host "Khoi dong server (log hien ben duoi)..." -ForegroundColor Green
-Write-Host "Nhan Ctrl+C de dung server" -ForegroundColor DarkGray
+Write-Host "Starting server (logs appear below)..." -ForegroundColor Green
+Write-Host "Press Ctrl+C to stop the server" -ForegroundColor DarkGray
 Write-Host ""
 
 & node dist/index.js
@@ -112,9 +110,9 @@ $exitCode = $LASTEXITCODE
 
 Write-Host ""
 if ($exitCode -ne 0) {
-    Write-Host "Server loi (exit code: $exitCode)" -ForegroundColor Red
+    Write-Host "Server exited with an error (exit code: $exitCode)" -ForegroundColor Red
 } else {
-    Write-Host "Server da dung." -ForegroundColor Yellow
+    Write-Host "Server stopped." -ForegroundColor Yellow
 }
 
 exit $exitCode

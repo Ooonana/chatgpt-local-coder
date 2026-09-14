@@ -1,4 +1,4 @@
-# OpenAI Secure MCP Tunnel - URL on dinh, khong doi moi lan chay (thay cloudflared)
+# OpenAI Secure MCP Tunnel - stable URL that does not change on every run (alternative to cloudflared).
 param(
     [int]$Port = 0,
     [int]$HealthPort = 0,
@@ -59,11 +59,11 @@ function Get-TunnelClientPath {
 
 function Install-TunnelClient {
     if (Test-Path $TunnelExe) {
-        Write-Host "tunnel-client da co: $TunnelExe" -ForegroundColor Green
+        Write-Host "tunnel-client already installed: $TunnelExe" -ForegroundColor Green
         return $TunnelExe
     }
 
-    Write-Host "Dang tai tunnel-client $TUNNEL_VERSION ..." -ForegroundColor Yellow
+    Write-Host "Downloading tunnel-client $TUNNEL_VERSION ..." -ForegroundColor Yellow
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
     $zipPath = Join-Path $env:TEMP $ZipName
 
@@ -72,7 +72,7 @@ function Install-TunnelClient {
 
     $candidates = Get-ChildItem -Path $BinDir -Recurse -Filter "tunnel-client.exe" -ErrorAction SilentlyContinue
     if ($candidates.Count -eq 0) {
-        throw "Khong tim thay tunnel-client.exe trong $ZipName"
+        throw "Could not find tunnel-client.exe in $ZipName"
     }
 
     $extracted = $candidates[0].FullName
@@ -82,7 +82,7 @@ function Install-TunnelClient {
     }
 
     Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-    Write-Host "Da cai: $TunnelExe" -ForegroundColor Green
+    Write-Host "Installed: $TunnelExe" -ForegroundColor Green
     return $TunnelExe
 }
 
@@ -110,7 +110,7 @@ function Stop-ExistingTunnel([int]$TargetHealthPort) {
     if (-not $ownerPid) { return }
     $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
     $name = if ($proc) { $proc.ProcessName } else { "unknown" }
-    Write-Host "Dang tat tunnel cu (PID $ownerPid - $name)..." -ForegroundColor Yellow
+    Write-Host "Stopping existing tunnel (PID $ownerPid - $name)..." -ForegroundColor Yellow
     Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
 }
@@ -146,28 +146,28 @@ function Test-McpServer([int]$TargetPort) {
 
 function Show-ConnectorGuide([string]$TunnelId, [int]$UiPort = 8080) {
     Write-Host ""
-    Write-Host "=== ChatGPT Connector (chi lam 1 lan) ===" -ForegroundColor Cyan
-    Write-Host "1. Giu terminal nay chay (tunnel-client)"
-    Write-Host "2. Mo: https://chatgpt.com/#settings/Connectors"
-    Write-Host "3. Them connector -> Connection: Tunnel -> chon 'my tunnel'"
-    Write-Host "   Hoac dan tunnel_id: $TunnelId"
-    Write-Host "4. Settings -> Apps -> dat quyen connector"
-    Write-Host "5. Refresh connector, mo chat moi"
+    Write-Host "=== ChatGPT Connector (one-time setup) ===" -ForegroundColor Cyan
+    Write-Host "1. Keep this terminal running (tunnel-client)"
+    Write-Host "2. Open: https://chatgpt.com/#settings/Connectors"
+    Write-Host "3. Add a connector -> Connection: Tunnel -> choose 'my tunnel'"
+    Write-Host "   Or paste the tunnel_id: $TunnelId"
+    Write-Host "4. Settings -> Apps -> configure connector permissions"
+    Write-Host "5. Refresh the connector and open a new chat"
     Write-Host ""
     Write-Host "Admin UI: http://127.0.0.1:$UiPort/ui" -ForegroundColor Green
     Write-Host "Health:   http://127.0.0.1:$UiPort/readyz" -ForegroundColor Green
     Write-Host ""
-    Write-Host "LUU Y: Khong bam 'Luon cho phep' tren popup ChatGPT" -ForegroundColor Yellow
+    Write-Host "NOTE: If 'Always allow' resets the MCP session, configure permissions in Settings -> Apps instead." -ForegroundColor Yellow
 }
 
 function Invoke-TunnelInit {
     Write-Host ""
-    Write-Host "=== OpenAI Tunnel - Cai dat lan dau ===" -ForegroundColor Cyan
+    Write-Host "=== OpenAI Tunnel - First-time setup ===" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Can 2 gia tri tu OpenAI Platform:" -ForegroundColor Yellow
+    Write-Host "Two values are required from OpenAI Platform:" -ForegroundColor Yellow
     Write-Host "  Tunnels:  https://platform.openai.com/settings/organization/tunnels"
     Write-Host "  API Keys: https://platform.openai.com/settings/organization/api-keys"
-    Write-Host "  (Dung Runtime API key, KHONG dung Admin key)" -ForegroundColor DarkGray
+    Write-Host "  (Use a Runtime API key, NOT an Admin key)" -ForegroundColor DarkGray
     Write-Host ""
 
     $existingId = Get-DotEnvValue "OPENAI_TUNNEL_ID"
@@ -175,23 +175,23 @@ function Invoke-TunnelInit {
 
     if ($existingId) {
         $tunnelId = $existingId
-        Write-Host "Tunnel ID (tu .env): $tunnelId"
+        Write-Host "Tunnel ID (from .env): $tunnelId"
     } else {
-        $tunnelId = Read-Host "Nhap OPENAI_TUNNEL_ID (tunnel_...)"
+        $tunnelId = Read-Host "Enter OPENAI_TUNNEL_ID (tunnel_...)"
     }
 
     if ($existingKey) {
         $apiKey = $existingKey
-        Write-Host "API Key: **** (tu .env)"
+        Write-Host "API Key: **** (from .env)"
     } else {
-        $apiKey = Read-Host "Nhap OPENAI_TUNNEL_API_KEY (sk-...)"
+        $apiKey = Read-Host "Enter OPENAI_TUNNEL_API_KEY (sk-...)"
     }
 
     if (-not $tunnelId -or $tunnelId -notmatch '^tunnel_[0-9a-f]{32}$') {
-        throw "OPENAI_TUNNEL_ID khong hop le. Dang tunnel_ + 32 ky tu hex."
+        throw "Invalid OPENAI_TUNNEL_ID. Expected tunnel_ followed by 32 hexadecimal characters."
     }
     if (-not $apiKey) {
-        throw "OPENAI_TUNNEL_API_KEY trong."
+        throw "OPENAI_TUNNEL_API_KEY is empty."
     }
 
     Set-DotEnvValue "OPENAI_TUNNEL_ID" $tunnelId
@@ -201,7 +201,8 @@ function Invoke-TunnelInit {
     $resolvedPort = if ($Port -gt 0) { $Port } elseif ($envPort) { [int]$envPort } else { 3000 }
     $envHealth = Get-DotEnvValue "OPENAI_TUNNEL_HEALTH_PORT"
     $resolvedHealth = if ($HealthPort -gt 0) { $HealthPort } elseif ($envHealth) { [int]$envHealth } else { 8080 }
-    $mcpUrl = "http://127.0.0.1:$resolvedPort/mcp"
+    $token = Get-DotEnvValue "MCP_TOKEN"
+    $mcpUrl = if ($token) { "http://127.0.0.1:$resolvedPort/mcp/$token" } else { "http://127.0.0.1:$resolvedPort/mcp" }
     Ensure-Profile -McpUrl $mcpUrl -TunnelId $tunnelId -TargetHealthPort $resolvedHealth
 
     $bin = Install-TunnelClient
@@ -210,15 +211,15 @@ function Invoke-TunnelInit {
     $env:CONTROL_PLANE_TUNNEL_ID = $tunnelId
 
     Write-Host ""
-    Write-Host "Chay doctor..." -ForegroundColor Yellow
+    Write-Host "Running doctor..." -ForegroundColor Yellow
     & $bin doctor --profile-file $ProfileFile --explain
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "Doctor that bai - kiem tra tunnel_id, api key, va quyen Tunnels Read+Use" -ForegroundColor Red
+        Write-Host "Doctor failed - check tunnel_id, API key, and Tunnels Read+Use permissions." -ForegroundColor Red
         exit 1
     }
 
     Write-Host ""
-    Write-Host "Da luu vao .env. Lan sau chi can:" -ForegroundColor Green
+    Write-Host "Saved to .env. Next time, run:" -ForegroundColor Green
     Write-Host "  .\start.ps1 -Force          # terminal 1"
     Write-Host "  .\openai-tunnel.ps1         # terminal 2"
     Show-ConnectorGuide -TunnelId $tunnelId
@@ -245,10 +246,10 @@ $apiKey = Get-DotEnvValue "OPENAI_TUNNEL_API_KEY"
 
 if (-not $tunnelId -or -not $apiKey) {
     Write-Host ""
-    Write-Host "[CHUA CAU HINH] Chay setup lan dau:" -ForegroundColor Yellow
+    Write-Host "[NOT CONFIGURED] Run first-time setup:" -ForegroundColor Yellow
     Write-Host "  .\openai-tunnel.ps1 -Init" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Hoac them vao .env:" -ForegroundColor DarkGray
+    Write-Host "Or add these values to .env:" -ForegroundColor DarkGray
     Write-Host "  OPENAI_TUNNEL_ID=tunnel_..."
     Write-Host "  OPENAI_TUNNEL_API_KEY=sk-..."
     exit 1
@@ -259,7 +260,8 @@ if (-not $bin) {
     $bin = Install-TunnelClient
 }
 
-$mcpUrl = "http://127.0.0.1:$resolvedPort/mcp"
+$token = Get-DotEnvValue "MCP_TOKEN"
+$mcpUrl = if ($token) { "http://127.0.0.1:$resolvedPort/mcp/$token" } else { "http://127.0.0.1:$resolvedPort/mcp" }
 Ensure-Profile -McpUrl $mcpUrl -TunnelId $tunnelId -TargetHealthPort $resolvedHealth
 
 $env:OPENAI_TUNNEL_API_KEY = $apiKey
@@ -270,10 +272,10 @@ $existingPid = Get-PortOwnerPid -TargetPort $resolvedHealth
 if ($existingPid -and (Test-TunnelHealthy $resolvedHealth)) {
     if (-not $Force) {
         Write-Host ""
-        Write-Host "[OK] Tunnel DA CHAY san (PID $existingPid, port $resolvedHealth)" -ForegroundColor Green
-        Write-Host "Khong can mo lai - chi chay 1 instance tunnel-client." -ForegroundColor Yellow
-        Write-Host "Muon restart: .\openai-tunnel.ps1 -Force" -ForegroundColor DarkGray
-        Write-Host "Hoac tat: Stop-Process -Id $existingPid -Force" -ForegroundColor DarkGray
+        Write-Host "[OK] Tunnel is already running (PID $existingPid, port $resolvedHealth)" -ForegroundColor Green
+        Write-Host "No need to start another one - only one tunnel-client instance is required." -ForegroundColor Yellow
+        Write-Host "To restart: .\openai-tunnel.ps1 -Force" -ForegroundColor DarkGray
+        Write-Host "To stop it: Stop-Process -Id $existingPid -Force" -ForegroundColor DarkGray
         Show-ConnectorGuide -TunnelId $tunnelId -UiPort $resolvedHealth
         exit 0
     }
@@ -283,8 +285,8 @@ if ($existingPid -and (Test-TunnelHealthy $resolvedHealth)) {
         Stop-ExistingTunnel -TargetHealthPort $resolvedHealth
     } else {
         Write-Host ""
-        Write-Host "[LOI] Port $resolvedHealth dang bi PID $existingPid chiem (khong phai tunnel healthy)" -ForegroundColor Red
-        Write-Host "Chay lai voi -Force de tat process cu, hoac doi port trong .env:" -ForegroundColor Yellow
+        Write-Host "[ERROR] Port $resolvedHealth is occupied by PID $existingPid, but no healthy tunnel was detected." -ForegroundColor Red
+        Write-Host "Run again with -Force to stop the existing process, or change the port in .env:" -ForegroundColor Yellow
         Write-Host "  OPENAI_TUNNEL_HEALTH_PORT=8081" -ForegroundColor Cyan
         exit 1
     }
@@ -297,10 +299,10 @@ if ($Doctor) {
 
 if (-not (Test-McpServer $resolvedPort)) {
     Write-Host ""
-    Write-Host "[CANH BAO] MCP server chua chay tai http://127.0.0.1:$resolvedPort" -ForegroundColor Yellow
-    Write-Host "Mo terminal khac va chay: .\start.ps1 -Force" -ForegroundColor Cyan
+    Write-Host "[WARNING] MCP server is not running at http://127.0.0.1:$resolvedPort" -ForegroundColor Yellow
+    Write-Host "Open another terminal and run: .\start.ps1 -Force" -ForegroundColor Cyan
     Write-Host ""
-    $answer = Read-Host "Van chay tunnel? (y/n)"
+    $answer = Read-Host "Start the tunnel anyway? (y/n)"
     if ($answer -notmatch '^[yY]') { exit 1 }
 }
 
@@ -310,8 +312,8 @@ Write-Host "Tunnel ID:  $tunnelId"
 Write-Host "MCP local:  $mcpUrl"
 Write-Host "Health UI:  http://127.0.0.1:$resolvedHealth/ui"
 Write-Host ""
-Write-Host "URL on dinh - khong doi moi lan chay (khac cloudflared)" -ForegroundColor Green
-Write-Host "Nhan Ctrl+C de dung tunnel" -ForegroundColor DarkGray
+Write-Host "Stable URL - it does not change on every run, unlike a cloudflared quick tunnel." -ForegroundColor Green
+Write-Host "Press Ctrl+C to stop the tunnel" -ForegroundColor DarkGray
 Write-Host ""
 
 Show-ConnectorGuide -TunnelId $tunnelId -UiPort $resolvedHealth

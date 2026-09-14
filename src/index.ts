@@ -26,6 +26,8 @@ import {
   type InstructionContext,
 } from "./lib/instruction-context.js";
 import { getChatGptToolProfile } from "./lib/tool-profile.js";
+import { shutdownLspSessions } from "./lib/lsp-client.js";
+import { shutdownPtySessions } from "./tools/pty.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -96,9 +98,9 @@ const sessionManager = createSessionManager({
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
-// ChatGPT co the goi "/" hoac "/mcp" — ho tro ca hai.
-// Neu dat MCP_TOKEN, endpoint doi thanh "/<token>" + "/mcp/<token>" va cac path
-// khong co token se tra 401 (chong scan tunnel URL / trang web goi vao localhost).
+// ChatGPT may call either "/" or "/mcp" — support both.
+// When MCP_TOKEN is set, only the tokenized endpoints "/<token>" and
+// "/mcp/<token>" are valid; unguarded paths are handled below.
 const MCP_PATHS = MCP_TOKEN ? [`/${MCP_TOKEN}`, `/mcp/${MCP_TOKEN}`] : ["/", "/mcp"];
 const MCP_PATHS_SET = new Set(MCP_PATHS);
 // /health is unauthenticated, and startup output may be collected in logs.
@@ -151,8 +153,8 @@ app.use((req, res, next) => {
 });
 
 if (MCP_TOKEN) {
-  // 404 chu KHONG phai 401: theo chuan MCP, 401 la tin hieu "can OAuth" — client
-  // (ChatGPT) se di tim OAuth metadata, khong thay, roi treo. 404 = khong co gi o day.
+  // Return 404, not 401: MCP clients interpret 401 as an OAuth challenge and may
+  // start metadata discovery. A 404 correctly indicates that no endpoint exists here.
   for (const unguarded of ["/", "/mcp"]) {
     app.all(unguarded, (_req, res) => {
       res.status(404).json({ ok: false, error: "Not found" });
@@ -208,9 +210,9 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
       return;
     }
 
-    // ChatGPT gui mot so request (vd "server/discover") KHONG kem Mcp-Session-Id.
-    // Tra 400 o day khien connector retry vo han ("loading mai"). Thay vao do tao
-    // session moi + warm-up roi phuc vu request, de SDK tra loi JSON-RPC hop le.
+    // ChatGPT can send some requests (for example "server/discover") without an
+    // Mcp-Session-Id. Returning 400 here can trigger endless connector retries, so
+    // recover/create a session and let the SDK return a valid JSON-RPC response.
     if (SESSION_RECOVERY) {
       const adopted = await sessionManager.tryRecoverStale(
         randomUUID(),
@@ -308,7 +310,7 @@ const adminServer = startAdminServer({
 const server = app.listen(PORT, HOST, () => {
   console.log("");
   console.log("========================================");
-  console.log("  Codex MCP Server");
+  console.log("  ChatGPT Local Coder MCP");
   console.log("========================================");
   console.log(`  Local:     http://${HOST}:${PORT}`);
   console.log(`  MCP:       http://${HOST}:${PORT}${DISPLAY_MCP_PATHS[0]}`);
@@ -318,35 +320,40 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`  Default cwd: ${workspaceRoot}`);
   console.log(`  Full machine access: ON (no path restrictions)`);
   console.log(`  Session recovery: ${SESSION_RECOVERY ? "ON" : "OFF"}`);
-  console.log(`  Auth:      ${MCP_TOKEN ? "ON (MCP_TOKEN in URL path)" : "OFF — dat MCP_TOKEN trong .env!"}`);
+  console.log(`  Auth:      ${MCP_TOKEN ? "ON (MCP_TOKEN in URL path)" : "OFF — set MCP_TOKEN in .env!"}`);
   console.log(`  PID:       ${process.pid}`);
   console.log("========================================");
-  console.log("  Dang chay... (Ctrl+C de dung)");
+  console.log("  Running... (Ctrl+C to stop)");
   console.log("========================================");
   console.log("");
 });
 
 server.on("error", (err: NodeJS.ErrnoException) => {
   if (err.code === "EADDRINUSE") {
-    console.error(`\n[LOI] Port ${PORT} da co server khac dang chay!`);
-    console.error("Chay lenh sau de tim process:");
+    console.error(`\n[ERROR] Port ${PORT} is already in use by another server!`);
+    console.error("Run this command to find the process:");
     console.error(`  netstat -ano | findstr ":${PORT}"`);
-    console.error("Hoac dung: .\\stop.ps1 de tat server cu\n");
+    console.error("Or run .\\stop.ps1 to stop the existing server.\n");
   } else {
-    console.error("\n[LOI] Khong the khoi dong server:", err.message, "\n");
+    console.error("\n[ERROR] Could not start the server:", err.message, "\n");
   }
   process.exit(1);
 });
 
 process.on("SIGINT", () => {
-  console.log("\n[DUNG] Server dang tat...");
+  console.log("\n[STOP] Server is shutting down...");
   sessionManager.stopCleanup();
-  void upstreamManager.shutdown();
-  adminServer.close();
-  server.close(() => process.exit(0));
+  void Promise.allSettled([
+    upstreamManager.shutdown(),
+    shutdownLspSessions(),
+    shutdownPtySessions(),
+  ]).finally(() => {
+    adminServer.close();
+    server.close(() => process.exit(0));
+  });
 });
 
-// Tranh process tu tat khi stdin dong (Windows)
+// Keep the process alive when stdin closes on Windows.
 if (process.stdin.isTTY) {
   process.stdin.resume();
 }

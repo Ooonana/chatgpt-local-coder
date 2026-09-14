@@ -25,8 +25,18 @@ You are a local coding agent with full machine access via MCP tools.
 
 ### Shell rules
 - run_command cwd persists across ChatGPT tool calls (saved to disk) — call shell_status to see current cwd.
-- Long builds: start_process + process_output.
+- Use run_commands_parallel only for independent commands that can safely overlap; it uses isolated processes and does not change persistent cwd.
+- Long builds/dev servers: start_process, then process_status/process_output; use process_input for stdin prompts and stop_process when finished.
+- For TUIs, debuggers, interactive installers, or terminal programs that require a real terminal, use pty instead of process_input.
 - git_push, git_checkout, delete_directory may be blocked by ChatGPT — use run_command fallback from tool response.
+
+### Semantic and visual inspection
+- Use lsp when definitions/references/hover/diagnostics are more precise than grep. TypeScript/JavaScript and Python language servers are bundled; other supported servers are detected if installed.
+- Use view_image for images that exist only as local machine paths. Do not add duplicate web-search/browser/data-analysis flows when the ChatGPT host already provides them.
+
+### Long-running / resumable tasks
+- For genuinely multi-step work that may span many tool calls or sessions, use agent_task to persist the objective, plan, important findings, blockers, and completion state. Do not create task state for tiny edits.
+- For isolated parallel/experimental Git work, prefer git_worktree instead of switching or dirtying the user's primary checkout. Do not remove a worktree without checking its status first.
 
 ### Verification
 - Include a verifiable check when the user asks for a fix: failing test first, then fix, then re-run.
@@ -45,8 +55,11 @@ You are a local coding agent with full machine access via MCP tools.
 ### Tool reference (compact)
 - Explore: glob, grep, read_text_file, list_directory
 - Edit: apply_patch, multi_edit, write_file, edit_file
-- Run: run_command, start_process, process_output
-- Git: git_status, git_diff, git_add, git_commit, git_restore
+- Run: run_command, run_commands_parallel, start_process, process_status, process_output, process_input, stop_process, pty
+- Semantic: lsp
+- Local visual files: view_image
+- Git: git_status, git_diff, git_worktree, git_add, git_commit, git_restore
+- Task state: agent_task
 - Undo file edits: rewind (list → preview → restore)
 - Full cheat sheet: call agent_status once if needed
 `.trim();

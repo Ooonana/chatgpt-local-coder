@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /**
- * Chuẩn output JSON cho mọi tool — ChatGPT dễ parse.
+ * Standard JSON envelope for every tool so clients can parse results consistently.
  *
  * Schema:
  * { ok, tool, summary, data }

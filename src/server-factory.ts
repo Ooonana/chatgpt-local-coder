@@ -8,6 +8,10 @@ import { registerRewindTools } from "./tools/rewind.js";
 import { registerMcpBridgeTools } from "./tools/mcp-bridge.js";
 import { registerNodeReplTool } from "./tools/node-repl.js";
 import { registerPonytailTurnTool } from "./tools/ponytail.js";
+import { registerAgentTaskTool } from "./tools/agent-task.js";
+import { registerImageTools } from "./tools/image.js";
+import { registerLspTool } from "./tools/lsp.js";
+import { registerPtyTool } from "./tools/pty.js";
 import { buildServerInstructions } from "./lib/quickstart.js";
 import type { McpUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { getChatGptToolProfile, shouldExposeTool } from "./lib/tool-profile.js";
@@ -83,6 +87,10 @@ export function createMcpServer(
   registerContextTools(server, workspaceRoot);
   registerNodeReplTool(server, workspaceRoot);
   registerPonytailTurnTool(server);
+  registerAgentTaskTool(server, workspaceRoot);
+  registerImageTools(server);
+  registerLspTool(server, workspaceRoot);
+  registerPtyTool(server, workspaceRoot);
   registerRewindTools(server);
 
   if (upstreamManager) {

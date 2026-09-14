@@ -1,7 +1,7 @@
 {
   "name": "chatgpt-local-coder",
   "version": "1.0.0",
-  "description": "Turn ChatGPT web into a local coding agent via MCP — files, shell, git, apply_patch, 40+ tools",
+  "description": "Turn the ChatGPT app into a local coding agent via MCP — files, shell, git, apply_patch, and extensible tools",
   "repository": {
     "type": "git",
     "url": "https://github.com/hoangcoderr/chatgpt-local-coder.git"
@@ -18,7 +18,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node scripts/test-patch.mjs && node scripts/test-tools.mjs && node scripts/test-checkpoints.mjs && node scripts/test-mcp-upstream.mjs && node scripts/test-mcp-oauth.mjs && node scripts/test-activity-log.mjs && node scripts/test-project-memory.mjs && node scripts/test-tool-profile.mjs && node scripts/test-shell-persist.mjs",
+    "test": "tsc && node scripts/test-patch.mjs && node scripts/test-tools.mjs && node scripts/test-checkpoints.mjs && node scripts/test-mcp-upstream.mjs && node scripts/test-mcp-oauth.mjs && node scripts/test-activity-log.mjs && node scripts/test-project-memory.mjs && node scripts/test-tool-profile.mjs && node scripts/test-shell-persist.mjs && node scripts/test-agent-task.mjs && node scripts/test-modern-tools.mjs",
     "test:all": "node scripts/run-all-tests.mjs",
     "test:integration": "tsc && node scripts/test-mcp-bridge-integration.mjs",
     "init-claude-md": "node scripts/init-claude-md.mjs",
@@ -44,6 +44,10 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "node-pty": "^1.1.0",
+    "pyright": "^1.1.414",
+    "typescript-language-server": "^6.0.0",
+    "typescript-lsp": "npm:typescript@^6.0.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {

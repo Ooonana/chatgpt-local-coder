@@ -12,12 +12,12 @@ const ENV_KEYS = [
 ];
 
 const TITLES = {
-  dashboard: "Tổng quan",
+  dashboard: "Overview",
   servers: "MCP Servers",
   import: "Import",
-  activity: "Nhật ký",
+  activity: "Activity",
   project: "Project context",
-  settings: "Cài đặt",
+  settings: "Settings",
   logs: "Raw status",
 };
 
@@ -69,7 +69,7 @@ function esc(s) {
 
 function serversTable(rows, { actions = true } = {}) {
   const controls = actions ? '<div class="btn-group" style="margin-bottom:12px"><button class="btn ghost" data-action="computer-use">Computer Use</button><button class="btn ghost" data-action="codex-hooks">Codex hooks</button><button class="btn ghost" data-action="local-tools">Local tools</button></div>' : '';
-  if (!rows.length) return controls + '<div class="empty">Chưa có upstream server. Thêm mới hoặc Import.</div>';
+  if (!rows.length) return controls + '<div class="empty">No upstream servers configured. Add one or import a configuration.</div>';
   const head = `<table><thead><tr>
     <th>Server</th><th>Transport</th><th>Status</th><th>Expose</th><th>Tools</th>
     ${actions ? "<th></th>" : ""}
@@ -81,8 +81,8 @@ function serversTable(rows, { actions = true } = {}) {
             <button class="btn sm ghost" data-action="test" data-id="${esc(s.id)}">Test</button>
             <button class="btn sm ghost" data-action="tools" data-id="${esc(s.id)}">Tools</button>
             ${s.transport === "http" && s.auth === "oauth" ? `<button class="btn sm ghost" data-action="oauth" data-id="${esc(s.id)}">OAuth</button>` : ""}
-            <button class="btn sm ghost" data-action="edit" data-id="${esc(s.id)}">Sửa</button>
-            <button class="btn sm ghost" data-action="delete" data-id="${esc(s.id)}">Xóa</button>
+            <button class="btn sm ghost" data-action="edit" data-id="${esc(s.id)}">Edit</button>
+            <button class="btn sm ghost" data-action="delete" data-id="${esc(s.id)}">Delete</button>
           </div></td>`
         : "";
       return `<tr>
@@ -153,8 +153,8 @@ function bindServerActions(container, config) {
         } else if (action === "codex-hooks") {
           const r = await api("/api/codex-hooks");
           document.getElementById("codex-hooks-list").innerHTML = r.hooks.length
-            ? r.hooks.map((hook) => `<label class="field checkbox"><input type="checkbox" data-codex-hook="${esc(hook.id)}" ${hook.enabled ? "checked" : ""} ${hook.supported ? "" : "disabled"} /><span><strong>${esc(hook.plugin)}</strong> · ${esc(hook.event)}${hook.supported ? "" : " <small class=\"muted\">MCP không có event này</small>"}<br /><small class="muted">${esc(hook.command)}</small></span></label>`).join("")
-            : '<div class="muted">Không có hook Codex đã cài và bật.</div>';
+            ? r.hooks.map((hook) => `<label class="field checkbox"><input type="checkbox" data-codex-hook="${esc(hook.id)}" ${hook.enabled ? "checked" : ""} ${hook.supported ? "" : "disabled"} /><span><strong>${esc(hook.plugin)}</strong> · ${esc(hook.event)}${hook.supported ? "" : " <small class=\"muted\">This event is not available through MCP</small>"}<br /><small class="muted">${esc(hook.command)}</small></span></label>`).join("")
+            : '<div class="muted">No enabled Codex hooks were found.</div>';
           document.getElementById("codex-hooks-dialog").showModal();
         } else if (action === "oauth") {
           const r = await api(`/api/upstream/${id}/oauth/start`, { method: "POST", body: JSON.stringify({ reset: true }) });
@@ -166,14 +166,14 @@ function bindServerActions(container, config) {
           const list = document.getElementById("tools-list");
           list.innerHTML = r.tools.length
             ? r.tools.map((t) => `<div class="tool-row"><div class="name">${esc(t.name)}</div><div class="desc">${esc(t.description || "")}</div></div>`).join("")
-            : '<div class="muted">Không có tools</div>';
+            : '<div class="muted">No tools available</div>';
           document.getElementById("tools-dialog").showModal();
         } else if (action === "edit") {
           openServerDialog(config.servers.find((x) => x.id === id));
         } else if (action === "delete") {
-          if (!confirm(`Xóa server "${id}"?`)) return;
+          if (!confirm(`Delete server "${id}"?`)) return;
           await api(`/api/upstream/${id}`, { method: "DELETE" });
-          toast("Đã xóa");
+          toast("Deleted");
           await loadServers();
         }
       } catch (err) {
@@ -187,7 +187,7 @@ async function loadImport() {
   const { sources } = await api("/api/import/sources");
   const grid = document.getElementById("import-grid");
   if (!sources.length) {
-    grid.innerHTML = '<div class="empty">Không tìm thấy config MCP trên máy.</div>';
+    grid.innerHTML = '<div class="empty">No MCP configuration files were found on this machine.</div>';
     return;
   }
   grid.innerHTML = sources
@@ -207,7 +207,7 @@ async function loadImport() {
           method: "POST",
           body: JSON.stringify({ path: btn.dataset.path, merge: true }),
         });
-        toast(`Import OK: ${r.imported.join(", ") || "(không mới)"}`);
+        toast(`Import OK: ${r.imported.join(", ") || "(no new servers)"}`);
         await refreshAll();
       } catch (err) {
         toast(err.message, true);
@@ -219,7 +219,7 @@ async function loadImport() {
 function formatTime(iso) {
   try {
     const d = new Date(iso);
-    return d.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   } catch {
     return iso;
   }
@@ -304,7 +304,7 @@ async function loadActivity({ reset = false } = {}) {
     const feed = document.getElementById("activity-feed");
     feed.innerHTML = entries.length
       ? entries.map(renderActivityRow).join("")
-      : '<div class="empty">Không có log khớp bộ lọc.</div>';
+      : '<div class="empty">No activity matches the current filters.</div>';
     activitySeenIds = new Set(entries.map((e) => e.id));
     bindActivityRows(feed);
     return;
@@ -388,7 +388,7 @@ serverForm.transport.addEventListener("change", () => transportFields(serverForm
 function openServerDialog(server) {
   editingServerId = server?.id ?? null;
   serverForm.reset();
-  document.getElementById("dialog-title").textContent = server ? "Sửa MCP Server" : "Thêm MCP Server";
+  document.getElementById("dialog-title").textContent = server ? "Edit MCP Server" : "Add MCP Server";
   if (server) {
     serverForm.id.value = server.id;
     serverForm.id.readOnly = true;
@@ -424,13 +424,13 @@ serverForm.addEventListener("submit", async (e) => {
   try {
     args = serverForm.args.value.trim() ? JSON.parse(serverForm.args.value) : [];
   } catch {
-    return toast("Args phải là JSON array hợp lệ", true);
+    return toast("Args must be a valid JSON array", true);
   }
   try {
     headers = serverForm.headers.value.trim() ? JSON.parse(serverForm.headers.value) : {};
     if (!headers || Array.isArray(headers)) throw new Error();
   } catch {
-    return toast("Headers phải là JSON object hợp lệ", true);
+    return toast("Headers must be a valid JSON object", true);
   }
   const server = {
     id: serverForm.id.value.trim(),
@@ -455,7 +455,7 @@ serverForm.addEventListener("submit", async (e) => {
   try {
     await api("/api/upstream", { method: "POST", body: JSON.stringify({ server }) });
     dialog.close();
-    toast("Đã lưu");
+    toast("Saved");
     await loadServers();
   } catch (err) {
     toast(err.message, true);
@@ -475,7 +475,7 @@ document.getElementById("save-computer-use").addEventListener("click", async () 
   const enabled = document.getElementById("computer-use-enabled").checked;
   await api("/api/plugins", { method: "PUT", body: JSON.stringify({ config: { computer_use: { enabled } } }) });
   document.getElementById("computer-use-dialog").close();
-  toast(enabled ? "Computer Use đã bật. Mở chat MCP mới để skill xuất hiện." : "Computer Use đã tắt.");
+  toast(enabled ? "Computer Use enabled. Open a new MCP chat for the skill to appear." : "Computer Use disabled.");
 });
 
 document.getElementById("close-codex-hooks").addEventListener("click", () => document.getElementById("codex-hooks-dialog").close());
@@ -483,7 +483,7 @@ document.getElementById("save-codex-hooks").addEventListener("click", async () =
   const enabled = [...document.querySelectorAll("[data-codex-hook]:checked")].map((input) => input.dataset.codexHook);
   await api("/api/codex-hooks", { method: "PUT", body: JSON.stringify({ enabled }) });
   document.getElementById("codex-hooks-dialog").close();
-  toast("Đã lưu. Hook SessionStart áp dụng ở chat MCP mới.");
+  toast("Saved. SessionStart hook changes apply to new MCP chats.");
 });
 
 document.querySelectorAll(".nav-item").forEach((btn) => {
@@ -514,7 +514,7 @@ document.getElementById("activity-live").addEventListener("change", () => {
 document.getElementById("activity-clear").addEventListener("click", () => {
   activitySeenIds.clear();
   document.getElementById("activity-feed").innerHTML =
-    '<div class="empty">Đã xóa hiển thị. Log mới vẫn sẽ xuất hiện khi Live bật.</div>';
+    '<div class="empty">View cleared. New activity will still appear while Live is enabled.</div>';
 });
 
 document.getElementById("add-server").addEventListener("click", () => openServerDialog(null));
@@ -523,7 +523,7 @@ document.getElementById("save-env").addEventListener("click", async () => {
   document.querySelectorAll("#env-form input").forEach((el) => (values[el.name] = el.value));
   try {
     await api("/api/config/env", { method: "PUT", body: JSON.stringify({ values }) });
-    toast("Đã lưu .env");
+    toast("Saved .env");
   } catch (err) {
     toast(err.message, true);
   }
@@ -532,13 +532,13 @@ document.getElementById("save-env").addEventListener("click", async () => {
 document.getElementById("import-file-btn").addEventListener("click", async () => {
   const filePath = document.getElementById("import-file-path").value.trim();
   const source = document.getElementById("import-file-source").value;
-  if (!filePath) return toast("Nhập đường dẫn file", true);
+  if (!filePath) return toast("Enter a file path", true);
   try {
     const r = await api("/api/import/file", {
       method: "POST",
       body: JSON.stringify({ path: filePath, detect_as: source, merge: true }),
     });
-    toast(`Import OK: ${r.imported.join(", ") || "(không mới)"}`);
+    toast(`Import OK: ${r.imported.join(", ") || "(no new servers)"}`);
     await refreshAll();
   } catch (err) {
     toast(err.message, true);
@@ -572,5 +572,5 @@ document.getElementById("save-local-tools").addEventListener("click", async () =
   const disabled = [...document.querySelectorAll("[data-tool-disable]:checked")].map((input) => input.dataset.toolDisable);
   await api("/api/local-tools", { method: "PUT", body: JSON.stringify({ overrides: { enabled, disabled } }) });
   document.getElementById("local-tools-dialog").close();
-  toast("Đã lưu. Mở chat MCP mới để áp dụng.");
+  toast("Saved. Open a new MCP chat to apply the changes.");
 });

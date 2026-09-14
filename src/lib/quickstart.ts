@@ -4,8 +4,9 @@ export const MCP_QUICKSTART = `
 2. Call project_context(path) only for a different repo than WORKSPACE_PATH.
 3. Explore with glob (file names) and grep (content), then read_text_file.
 4. Edit with apply_patch (preferred), multi_edit, or write_file for new files.
-5. Run builds/tests with run_command (short) or start_process + process_output (long).
-6. Undo file edits with rewind (list → preview → restore). Shell/bash file changes are not tracked.
+5. Run builds/tests with run_command (short), run_commands_parallel (independent commands), or start_process + process_status/process_output (long). Use pty for truly interactive terminal programs.
+6. For resumable multi-step work, persist objective/plan/findings with agent_task. For isolated Git experiments, use git_worktree.
+7. Undo file edits with rewind (list → preview → restore). Shell/bash file changes are not tracked.
 
 ## Output format
 All tools return JSON: { ok, tool, summary, data }
@@ -13,13 +14,19 @@ All tools return JSON: { ok, tool, summary, data }
 ## Tool cheat sheet
 - glob / grep / read_text_file: explore (offset+limit for partial reads)
 - apply_patch: single-file @@ hunks OR multi-file *** Begin Patch format
-- create_directory / delete_directory / copy_file / move_file / delete_file
 - run_command: persistent shell (cd persists); shell_status / shell_reset
-- git_status / git_diff / git_add / git_commit / git_branch / git_restore / git_stash
+- run_commands_parallel: run independent commands concurrently without mutating persistent cwd
+- start_process / process_status / process_output / process_input / stop_process: background process lifecycle
+- pty: real PTY/ConPTY for TUIs, debuggers, interactive installers, and terminal-native CLIs
+- lsp: semantic hover/definition/references/symbols/diagnostics; TypeScript/JS + Python bundled
+- view_image: return an arbitrary local image path as MCP image content for host visual analysis
+- agent_task: persist/resume a multi-step coding objective, plan, notes, and status
+- git_status / git_diff / git_worktree / git_add / git_commit / git_restore
 - rewind: action=list|preview|restore|status — undo file edits via automatic checkpoints
 - enabled upstream MCP tools are exposed directly as <server>__<tool> (for example chrome-devtools__list_pages, linear__get_user); prefer direct tools
-- mcp_servers / mcp_tools / mcp_call — upstream diagnostics/fallback when a direct proxy is unavailable
-- git_push / git_checkout / delete_directory: may be blocked by ChatGPT safety — use run_command fallback
+- mcp_servers: upstream status. mcp_tools / mcp_call are low-level full-profile diagnostics/fallbacks
+- Full/optional-profile helpers not normally advertised in slim include raw binary I/O, search_files/list_allowed_directories, delete_directory, git_checkout/git_push/git_pull/git_reset, and mcp_tools/mcp_call
+- If a helper is hidden by the active profile, use an appropriate run_command equivalent or enable it in Admin UI, then open a new MCP chat
 
 ## apply_patch — single file
 @@
@@ -46,7 +53,7 @@ export function buildServerInstructions(
   contextBlock?: string
 ): string {
   const header = [
-    "# Codex Local Coder MCP",
+    "# ChatGPT Local Coder MCP",
     `Default project: ${workspaceRoot}`,
     "Full machine access: ON. Tag this connector in ChatGPT before every task.",
   ].join("\n");

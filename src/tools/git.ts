@@ -75,6 +75,75 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     return toolResult("git_log", { path: cwd, count, commits: r.stdout.split("\n").filter(Boolean) });
   });
 
+  server.registerTool("git_worktree", {
+    title: "Git Worktree",
+    description:
+      "List or manage isolated Git worktrees for parallel coding tasks. add/remove/prune modify local repository worktree state; no remote operations are performed.",
+    inputSchema: {
+      path: z.string().optional(),
+      action: z.enum(["list", "add", "remove", "prune"]).optional().default("list"),
+      worktree_path: z.string().optional(),
+      branch: z.string().optional(),
+      new_branch: z.string().optional(),
+      start_point: z.string().optional(),
+      force: z.boolean().optional().default(false),
+    },
+    annotations: toolAnnotations("edit"),
+  }, async ({ path: repoPath, action, worktree_path, branch, new_branch, start_point, force }) => {
+    const cwd = await repo(repoPath);
+    if (action === "list") {
+      const r = await gitOrThrow(["worktree", "list", "--porcelain"], cwd);
+      return toolResult("git_worktree", { path: cwd, action, output: r.stdout });
+    }
+
+    requireWriteAllowed();
+    if (action === "prune") {
+      const args = ["worktree", "prune"];
+      if (force) args.push("--expire", "now");
+      const r = await gitOrThrow(args, cwd);
+      await audit({ tool: "git_worktree", action: "prune", target: cwd, status: "ok" });
+      return toolResult("git_worktree", { path: cwd, action, output: r.stdout || r.stderr || "Pruned" });
+    }
+
+    if (!worktree_path) throw new Error(`worktree_path is required for ${action}`);
+    const target = await validatePath(worktree_path);
+
+    if (action === "remove") {
+      const args = ["worktree", "remove"];
+      if (force) args.push("--force");
+      args.push(target);
+      const r = await gitOrThrow(args, cwd);
+      await audit({ tool: "git_worktree", action: "remove", target, status: "ok", details: { force } });
+      return toolResult("git_worktree", { path: cwd, action, worktree_path: target, output: r.stdout || r.stderr || "Removed" });
+    }
+
+    if (branch && new_branch) throw new Error("Use branch or new_branch, not both");
+    const args = ["worktree", "add"];
+    if (force) args.push("--force");
+    if (new_branch) args.push("-b", new_branch);
+    args.push(target);
+    if (new_branch) args.push(start_point || "HEAD");
+    else if (branch) args.push(branch);
+    else if (start_point) args.push(start_point);
+    const r = await gitOrThrow(args, cwd);
+    await audit({
+      tool: "git_worktree",
+      action: "add",
+      target,
+      status: "ok",
+      details: { branch, new_branch, start_point, force },
+    });
+    return toolResult("git_worktree", {
+      path: cwd,
+      action,
+      worktree_path: target,
+      branch,
+      new_branch,
+      start_point,
+      output: r.stdout || r.stderr || "Added",
+    });
+  });
+
   server.registerTool("git_add", {
     title: "Git Add", description: "Stage files for commit.",
     inputSchema: { path: z.string().optional(), files: z.array(z.string()).optional(), all: z.boolean().optional().default(true) },

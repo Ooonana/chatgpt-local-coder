@@ -3,12 +3,83 @@ import path from "path";
 
 export type ToolProfileName = "full" | "slim";
 
+/**
+ * Every native tool declared under src/tools. Keep this catalog in sync with
+ * server.registerTool() declarations; scripts/test-tool-profile.mjs verifies
+ * the two sets are identical so the Admin UI/profile overrides cannot drift.
+ */
 export const LOCAL_TOOL_CATALOG = [
-  "read_text_file", "write_file", "edit_file", "multi_edit", "apply_patch", "glob", "grep", "list_directory",
-  "run_command", "shell_status", "shell_reset", "start_process", "process_output", "node_repl", "ponytail_turn",
-  "git_status", "git_diff", "git_add", "git_commit", "git_restore", "agent_status", "project_context",
-  "remember", "load_path_rules", "list_skills", "load_skill", "rewind", "mcp_servers", "mcp_tools", "mcp_call",
-];
+  // Filesystem
+  "read_text_file",
+  "read_file_base64",
+  "write_file",
+  "write_file_base64",
+  "edit_file",
+  "multi_edit",
+  "replace_regex",
+  "apply_patch",
+  "list_directory",
+  "glob",
+  "grep",
+  "delete_file",
+  "create_directory",
+  "delete_directory",
+  "copy_file",
+  "move_file",
+  "search_files",
+  "directory_tree",
+  "list_allowed_directories",
+
+  // Shell / processes
+  "run_command",
+  "run_commands_parallel",
+  "shell_status",
+  "shell_reset",
+  "start_process",
+  "process_status",
+  "process_output",
+  "process_input",
+  "stop_process",
+  "clear_processes",
+  "pty",
+
+  // Git
+  "git_status",
+  "git_diff",
+  "git_log",
+  "git_worktree",
+  "git_add",
+  "git_commit",
+  "git_branch",
+  "git_checkout",
+  "git_restore",
+  "git_push",
+  "git_pull",
+  "git_stash",
+  "git_reset",
+
+  // Context / agent state
+  "list_skills",
+  "load_skill",
+  "project_context",
+  "agent_status",
+  "remember",
+  "load_path_rules",
+  "agent_task",
+  "node_repl",
+  "ponytail_turn",
+  "rewind",
+  "view_image",
+  "lsp",
+
+  // Upstream MCP bridge
+  "mcp_servers",
+  "mcp_tools",
+  "mcp_call",
+] as const;
+
+export type LocalToolName = (typeof LOCAL_TOOL_CATALOG)[number];
+export const LOCAL_TOOL_COUNT = LOCAL_TOOL_CATALOG.length;
 
 interface LocalToolOverrides {
   enabled?: string[];
@@ -17,40 +88,70 @@ interface LocalToolOverrides {
 
 const overridesPath = () => path.resolve(process.cwd(), "profiles", "tool-overrides.json");
 
+function sanitizeLocalToolOverrides(next: LocalToolOverrides): LocalToolOverrides {
+  const known = new Set<string>(LOCAL_TOOL_CATALOG);
+  const clean = (names: string[] | undefined) =>
+    [...new Set((names ?? []).filter((name) => known.has(name)))];
+  const enabled = clean(next.enabled);
+  const disabled = clean(next.disabled).filter((name) => !enabled.includes(name));
+  return { enabled, disabled };
+}
+
 export function getLocalToolOverrides(): LocalToolOverrides {
   try {
-    return JSON.parse(fs.readFileSync(overridesPath(), "utf-8")) as LocalToolOverrides;
+    return sanitizeLocalToolOverrides(
+      JSON.parse(fs.readFileSync(overridesPath(), "utf-8")) as LocalToolOverrides
+    );
   } catch {
     return {};
   }
 }
 
 export function saveLocalToolOverrides(next: LocalToolOverrides): void {
+  const sanitized = sanitizeLocalToolOverrides(next);
   fs.mkdirSync(path.dirname(overridesPath()), { recursive: true });
-  fs.writeFileSync(overridesPath(), JSON.stringify(next, null, 2));
+  fs.writeFileSync(overridesPath(), JSON.stringify(sanitized, null, 2) + "\n");
 }
 
-/** Core tools for ChatGPT web — smaller tools/list payload, fewer discovery errors. */
+/** Core tools for the ChatGPT app — smaller tools/list payload, fewer discovery errors. */
 export const SLIM_CHATGPT_TOOLS = new Set([
   "read_text_file",
   "write_file",
   "edit_file",
   "multi_edit",
+  "replace_regex",
   "apply_patch",
   "glob",
   "grep",
   "list_directory",
+  "directory_tree",
+  "create_directory",
+  "copy_file",
+  "move_file",
+  "delete_file",
   "run_command",
+  "run_commands_parallel",
   "shell_status",
+  "shell_reset",
   "start_process",
+  "process_status",
   "process_output",
+  "process_input",
+  "stop_process",
+  "clear_processes",
+  "pty",
   "git_status",
   "git_diff",
+  "git_log",
+  "git_worktree",
   "git_add",
   "git_commit",
+  "git_branch",
+  "git_stash",
   "git_restore",
   "agent_status",
   "project_context",
+  "agent_task",
   "remember",
   "load_path_rules",
   "list_skills",
@@ -58,6 +159,8 @@ export const SLIM_CHATGPT_TOOLS = new Set([
   "node_repl",
   "ponytail_turn",
   "rewind",
+  "view_image",
+  "lsp",
   "mcp_servers",
 ]);
 

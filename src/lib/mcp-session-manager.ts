@@ -28,12 +28,12 @@ const lastTransportErrors: Record<string, string> = {};
 const sessionOpChains = new Map<string, Promise<void>>();
 
 /**
- * Gan Mcp-Session-Id vao request truoc khi day cho transport.
+ * Attach Mcp-Session-Id to the request before passing it to the transport.
  *
- * SDK >=1.29 boc Node transport quanh WebStandardStreamableHTTPServerTransport
- * va dung @hono/node-server de doi IncomingMessage -> fetch Request. Hono dung
- * `incoming.rawHeaders`, KHONG dung `incoming.headers` — nen chi va req.headers
- * la vo tac dung. Phai va ca hai.
+ * SDK >=1.29 wraps the Node transport around
+ * WebStandardStreamableHTTPServerTransport and uses @hono/node-server to convert
+ * IncomingMessage -> fetch Request. Hono reads `incoming.rawHeaders`, not
+ * `incoming.headers`, so patching req.headers alone has no effect; both must be set.
  */
 function withSessionIdHeader(
   req: Request,
@@ -180,7 +180,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
   function scheduleDeleteGrace(sessionId: string): void {
     cancelDeleteGrace(sessionId);
     console.log(
-      `[MCP] Session DELETE — giữ ${SESSION_DELETE_GRACE_MS / 1000}s để tool call đang chạy: ${sessionId}`
+      `[MCP] Session DELETE — keeping it for ${SESSION_DELETE_GRACE_MS / 1000}s so in-flight tool calls can finish: ${sessionId}`
     );
     deleteGraceTimers[sessionId] = setTimeout(() => {
       delete deleteGraceTimers[sessionId];
@@ -385,9 +385,10 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       const run = async () => {
         await session.transport.handleRequest(req, res, body);
       };
-      // GET mo SSE stream song lau: handleRequest chi resolve khi stream dong.
-      // Neu day vao hang doi tuan tu, no giu khoa vinh vien va MOI POST sau do
-      // (tools/list, tools/call) se treo — deadlock. Chi tuan tu hoa POST/DELETE.
+      // GET opens a long-lived SSE stream; handleRequest resolves only when that
+      // stream closes. Serializing GET would hold the session queue indefinitely
+      // and deadlock later POST calls (tools/list, tools/call), so serialize only
+      // POST/DELETE operations.
       if (sid && req.method !== "GET") {
         await enqueueSessionOp(sid, run);
       } else {

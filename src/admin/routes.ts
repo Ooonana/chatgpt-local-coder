@@ -15,6 +15,11 @@ import { getCheckpointConfig } from "../lib/checkpoint.js";
 import { getLocalPluginsConfig, saveLocalPluginsConfig } from "../lib/plugin-config.js";
 import { getCodexHooks, saveCodexHooks } from "../lib/codex-hooks.js";
 import {
+  LOCAL_TOOL_CATALOG,
+  getLocalToolOverrides,
+  saveLocalToolOverrides,
+} from "../lib/tool-profile.js";
+import {
   getRecentActivity,
   loadAuditHistory,
   subscribeActivity,
@@ -169,13 +174,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
 
   router.get("/api/local-tools", async (_req, res) => {
     try {
-      const { LOCAL_TOOL_CATALOG } = await import("../lib/tool-profile.js");
-      const configPath = path.resolve(process.cwd(), "profiles", "tool-overrides.json");
-      let overrides: { enabled?: string[]; disabled?: string[] } = {};
-      try {
-        overrides = JSON.parse(await fs.readFile(configPath, "utf-8"));
-      } catch {}
-      res.json({ ok: true, tools: LOCAL_TOOL_CATALOG, overrides });
+      res.json({ ok: true, tools: LOCAL_TOOL_CATALOG, overrides: getLocalToolOverrides() });
     } catch (err) {
       res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -183,17 +182,17 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
 
   router.put("/api/local-tools", async (req, res) => {
     try {
-      const { LOCAL_TOOL_CATALOG } = await import("../lib/tool-profile.js");
-      const known = new Set(LOCAL_TOOL_CATALOG);
-      const names = (value: unknown) => Array.isArray(value)
-        ? [...new Set(value.filter((name): name is string => typeof name === "string" && known.has(name)))]
-        : [];
-      const enabled = names(req.body?.overrides?.enabled);
-      const disabled = names(req.body?.overrides?.disabled).filter((name) => !enabled.includes(name));
-      const configPath = path.resolve(process.cwd(), "profiles", "tool-overrides.json");
-      await fs.mkdir(path.dirname(configPath), { recursive: true });
-      await fs.writeFile(configPath, JSON.stringify({ enabled, disabled }, null, 2) + "\n", "utf-8");
-      res.json({ ok: true, overrides: { enabled, disabled }, restart_required: "Open a new ChatGPT MCP session after changing local tool visibility." });
+      const raw = req.body?.overrides ?? {};
+      const next = {
+        enabled: Array.isArray(raw.enabled) ? raw.enabled.filter((name: unknown): name is string => typeof name === "string") : [],
+        disabled: Array.isArray(raw.disabled) ? raw.disabled.filter((name: unknown): name is string => typeof name === "string") : [],
+      };
+      saveLocalToolOverrides(next);
+      res.json({
+        ok: true,
+        overrides: getLocalToolOverrides(),
+        restart_required: "Open a new ChatGPT MCP session after changing local tool visibility.",
+      });
     } catch (err) {
       res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }

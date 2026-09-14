@@ -2,7 +2,7 @@
 
 # ChatGPT Local Coder
 
-**Turn ChatGPT web into a local coding agent — files, shell, git, patches, 40+ MCP tools.**
+**Turn the ChatGPT app into a local coding agent — files, shell, git, patches, and extensible MCP tools.**
 
 [![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-6366f1?style=flat-square)](https://modelcontextprotocol.io)
 [![ChatGPT](https://img.shields.io/badge/ChatGPT-Developer%20Mode-10a37f?style=flat-square)](https://platform.openai.com/docs/guides/developer-mode)
@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 [![Windows](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078d4?style=flat-square)](https://nodejs.org)
 
-[Quick Start](#-quick-start) · [Connect ChatGPT](#-connect-chatgpt) · [Tools](#-tools) · [Tunnel](#-tunnel-options) · [Troubleshooting](#-troubleshooting) · [Tiếng Việt](#-tiếng-việt)
+[Quick Start](#-quick-start) · [Connect ChatGPT](#-connect-chatgpt) · [Tools](#-tools) · [Tunnel](#-tunnel-options) · [Troubleshooting](#-troubleshooting)
 
 </div>
 
@@ -18,12 +18,12 @@
 
 ChatGPT Local Coder is a **self-hosted MCP server** that gives ChatGPT (and any MCP client) full access to your machine — read and edit code, run `npm test`, manage git, apply unified diffs, and explore projects with `glob` / `grep`.
 
-No desktop app. No vendor lock-in. Run one Node process on your PC, expose it through a tunnel, and code from ChatGPT in the browser.
+No separate coding client. No vendor lock-in. Run one Node process on your PC, expose it through a tunnel, and code from a regular ChatGPT chat with the connector enabled.
 
 ```
 ┌─────────────────┐     HTTPS      ┌──────────────────┐     localhost     ┌─────────────────────┐
-│   ChatGPT Web   │ ─────────────► │  Tunnel (opt.)   │ ────────────────► │  chatgpt-local-coder │
-│ Developer Mode  │                │ OpenAI / CF      │      :3000/mcp    │  40+ MCP tools       │
+│   ChatGPT App   │ ─────────────► │  Tunnel (opt.)   │ ────────────────► │  chatgpt-local-coder │
+│ Developer Mode  │                │ OpenAI / CF      │      :3000/mcp    │  Native MCP tools    │
 └─────────────────┘                └──────────────────┘                   └──────────┬──────────┘
                                                                                     │
                                          ┌──────────────────────────────────────────┼──────────┐
@@ -111,7 +111,7 @@ See [Tunnel options](#-tunnel-options) below. You need a **public HTTPS** URL po
 
 ### 4. Use in chat — **must tag the connector**
 
-Every message that should use local tools **must include the connector**. If you skip this, ChatGPT only uses built-in tools, may show *"Looking for available tools"* / *"Đang tìm các công cụ có sẵn"*, then **"Error in message stream"** / **"Lỗi trong luồng tin nhắn"** — with **no error in server logs** (the MCP server was never called).
+Every message that should use local tools **must include the connector**. If you skip this, ChatGPT only uses built-in tools, may show *"Looking for available tools"*, then **"Error in message stream"** — with **no error in server logs** (the MCP server was never called).
 
 **How to tag (pick one):**
 
@@ -198,7 +198,7 @@ Free sessions expire after **60 minutes** and the URL changes each time, so you 
 
 ## 🧰 Tools
 
-**40+ tools** with structured JSON responses `{ ok, tool, summary, data }`.
+Native tools use structured JSON responses `{ ok, tool, summary, data }`. The source-of-truth catalog is `src/lib/tool-profile.ts`; `scripts/test-tool-profile.mjs` verifies it matches the native `server.registerTool()` declarations.
 
 ### Onboarding *(call these first)*
 
@@ -231,20 +231,46 @@ Free sessions expire after **60 minutes** and the URL changes each time, so you 
 | Tool | Description |
 |------|-------------|
 | `run_command` | Run shell commands (`npm test`, builds, …) |
+| `run_commands_parallel` | Run independent commands concurrently in isolated shell processes |
 | `shell_status` / `shell_reset` | Persistent shell session |
 | `start_process` | Long-running / background commands |
-| `process_status` / `process_output` / `stop_process` | Manage background jobs |
+| `process_status` / `process_output` | Inspect background jobs and logs |
+| `process_input` | Send piped stdin to prompts/REPLs (`append_newline`, optional EOF); not a full PTY |
+| `stop_process` | Stop the background process tree (important for dev servers on Windows) |
+| `pty` | Real PTY/ConPTY session for TUIs, debuggers, interactive installers, and terminal-native CLIs |
+
+### Semantic + visual tools
+
+| Tool | Description |
+|------|-------------|
+| `lsp` | Hover, definition, references, document/workspace symbols, and diagnostics. TypeScript/JS + Python are bundled; clangd/rust-analyzer/gopls are detected when installed |
+| `view_image` | Return a local PNG/JPEG/WEBP/GIF path as MCP image content for ChatGPT visual analysis |
 
 ### Git
 
 | Tool | Description |
 |------|-------------|
 | `git_status` / `git_diff` / `git_log` | Inspect repo |
+| `git_worktree` | List/add/remove/prune isolated local worktrees for parallel tasks |
 | `git_add` / `git_commit` | Stage and commit |
 | `git_branch` / `git_checkout` | Branch list, create, switch (local only) |
 | `git_restore` | Restore tracked files to last commit |
 | `git_push` / `git_pull` | Sync with configured remote |
 | `git_stash` / `git_reset` | Stash and reset |
+
+### Tool profiles
+
+`CHATGPT_TOOL_PROFILE=slim` is the default for the ChatGPT app and advertises the core coding set. `CHATGPT_TOOL_PROFILE=full` advertises every native tool in the catalog. The Admin UI can force-enable or disable individual local tools without changing the base profile. Unknown/stale override names are filtered.
+
+The default slim profile intentionally exposes high-value local development helpers while keeping more destructive/remote/redundant operations such as recursive directory deletion, Git reset/push/pull/checkout, raw binary writes, and low-level MCP calls opt-in.
+
+### Agent task state
+
+| Tool | Description |
+|------|-------------|
+| `agent_task` | Persist/resume a multi-step coding objective, workspace, plan, notes, and status across MCP sessions |
+
+`agent_task` stores coordination state only; it does not start another model or hidden subagent.
 
 ### Claude Code ↔ MCP mapping
 
@@ -304,12 +330,12 @@ The exact URL is printed in the startup banner. Stopping the server stops the ad
 
 | Tab | What it does |
 |-----|--------------|
-| **Tổng quan** | PID, active ChatGPT sessions, default cwd, upstream health |
+| **Overview** | PID, active ChatGPT sessions, default cwd, upstream health |
 | **MCP Servers** | Enable/disable upstream MCP servers, test connections, inspect their tools |
 | **Import** | Pull existing MCP config from Cursor / Claude Code / OpenCode |
-| **Nhật ký** | Live tool-call log from ChatGPT (SSE stream) |
+| **Activity** | Live tool-call log from ChatGPT (SSE stream) |
 | **Project** | Preview the exact MCP instructions injected into ChatGPT each session |
-| **Cài đặt** | Read **and write** `.env` |
+| **Settings** | Read **and write** `.env` |
 | **Raw status** | Raw JSON status dump |
 
 This is the **hub** side of the project: upstream MCP servers are proxied through this one connector, so ChatGPT reaches their tools without being wired up separately. Configure them in `MCP_UPSTREAM_CONFIG` (default `profiles/mcp-upstream.json`).
@@ -327,9 +353,10 @@ src/
 │   ├── patch.ts             # apply_patch engine
 │   └── persistent-shell.ts  # Stateful shell
 └── tools/
-    ├── filesystem.ts        # 18 tools
-    ├── shell.ts             # 8 tools
-    ├── git.ts               # 11 tools
+    ├── filesystem.ts        # filesystem/search/edit tools
+    ├── shell.ts             # shell + background process tools
+    ├── git.ts               # Git + worktree tools
+    ├── agent-task.ts        # persistent multi-step task state
     └── context.ts           # agent_status, project_context
 ```
 
@@ -363,7 +390,7 @@ This server grants **full access to your machine** — files, shell, git. Only e
 
 | Problem | Fix |
 |---------|-----|
-| **"Error in message stream"** / **"Lỗi trong luồng tin nhắn"** right after *"Looking for tools"* — **no server log** | You did **not tag the connector**. New chat → **+** → **More** → enable connector, or type **`@Local Coder`** in the message. Then retry. |
+| **"Error in message stream"** right after *"Looking for tools"* — **no server log** | You did **not tag the connector**. New chat → **+** → **More** → enable connector, or type **`@Local Coder`** in the message. Then retry. |
 | **Resource not found** on tool call | Refresh connector + new chat. Server auto-recovers sessions — ensure latest build is running. |
 | **Connection failed** | Check `.\start.ps1` + tunnel are both running. URL must be HTTPS. |
 | **Permission popup every call** | Settings → Apps → set connector to *Ask before important changes*. Don't use popup "Always allow". |
@@ -396,49 +423,3 @@ See also [AGENTS.md](AGENTS.md) for agent onboarding and `apply_patch` format.
 ## ⭐ Support
 
 If this saves you time, **star the repo** — it helps others find it.
-
----
-
-## 🇻🇳 Tiếng Việt
-
-**ChatGPT Local Coder** biến ChatGPT web thành agent code trên máy bạn qua MCP.
-
-```powershell
-git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
-cd chatgpt-local-coder
-copy .env.example .env
-npm install && npm run build
-.\start.ps1                    # terminal 1
-.\openai-tunnel.ps1            # terminal 2 (tunnel cố định)
-```
-
-**macOS / Linux** — các script `.ps1` chỉ chạy trên Windows:
-
-```bash
-git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
-cd chatgpt-local-coder
-cp .env.example .env
-npm install && npm run build
-
-# Tạo token rồi dán vào MCP_TOKEN trong .env
-node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
-
-npm start                                    # terminal 1
-ssh -p 443 -R0:localhost:3000 a.pinggy.io    # terminal 2
-```
-
-Dùng Pinggy nếu mạng chặn cloudflared (cổng 7844). Nếu cloudflared chạy được thì `npm run tunnel` cũng ổn.
-
-**ChatGPT:** Settings → Connectors → tạo connector → Refresh → chat mới.
-
-**URL connector phải có token:** `https://<tunnel>/mcp/<MCP_TOKEN>`. Vào `/mcp` trơn sẽ trả **404**. Coi URL này như mật khẩu — ai có nó là có shell trên máy bạn.
-
-**Bắt buộc tag connector mỗi chat:** Chat mới → **+** → **More** → bật connector, hoặc gõ **`@`** + tên connector trong ô chat. Nếu không tag, ChatGPT báo *"Đang tìm các công cụ có sẵn"* rồi *"Lỗi trong luồng tin nhắn"* — **server không có log lỗi** vì MCP chưa được gọi.
-
-**WORKSPACE_PATH:** đặt đúng thư mục project (không phải thư mục `chatgpt-local-coder`). Server tự đọc `CLAUDE.md` / `AGENTS.md` giống Claude Code.
-
-**Admin UI:** tự bật cùng `npm start` tại `http://127.0.0.1:<ADMIN_PORT>/ui` (mặc định 3001), không tắt riêng được. Dùng để quản lý MCP server khác, xem log tool call, sửa `.env`. **Đừng tunnel cổng này ra ngoài** — chỉ tunnel :3000.
-
-**Lưu ý:** Không bấm **"Luôn cho phép"** trên popup — cấu hình quyền ở Settings → Apps. Sau khi restart server: Refresh connector + mở chat mới + tag lại connector.
-
-Chi tiết cho AI agent: [AGENTS.md](AGENTS.md)
