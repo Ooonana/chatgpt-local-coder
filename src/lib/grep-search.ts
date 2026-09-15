@@ -3,6 +3,8 @@ import path from "path";
 
 export type GrepOutputMode = "content" | "files_with_matches" | "count";
 
+const MAX_GREP_FILE_BYTES = 8 * 1024 * 1024;
+
 interface GrepOptions {
   pattern: string;
   path: string;
@@ -55,9 +57,13 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
   const fileMatches = new Map<string, number>();
   const contentLines: string[] = [];
   let totalMatches = 0;
+  let skippedLargeFiles = 0;
+
+  const reachedLimit = () =>
+    outputMode === "content" ? contentLines.length >= headLimit : fileMatches.size >= headLimit;
 
   async function walk(dir: string): Promise<void> {
-    if (outputMode === "content" && contentLines.length >= headLimit) return;
+    if (reachedLimit()) return;
 
     let entries;
     try {
@@ -67,7 +73,7 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
     }
 
     for (const entry of entries) {
-      if (outputMode === "content" && contentLines.length >= headLimit) break;
+      if (reachedLimit()) break;
       if (entry.name.startsWith(".") && entry.name !== ".") continue;
 
       const fullPath = path.join(dir, entry.name);
@@ -80,6 +86,12 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
 
       let text: string;
       try {
+        const stat = await fs.stat(fullPath);
+        if (!stat.isFile()) continue;
+        if (stat.size > MAX_GREP_FILE_BYTES) {
+          skippedLargeFiles++;
+          continue;
+        }
         text = await fs.readFile(fullPath, "utf-8");
       } catch {
         continue;
@@ -127,15 +139,18 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
 
   if (outputMode === "files_with_matches") {
     const files = [...fileMatches.keys()].slice(0, headLimit);
-    return files.length ? files.join("\n") : "No matches found";
+    const base = files.length ? files.join("\n") : "No matches found";
+    return skippedLargeFiles ? `${base}\n[skipped ${skippedLargeFiles} file(s) larger than 8 MiB]` : base;
   }
 
   if (outputMode === "count") {
     const rows = [...fileMatches.entries()]
       .slice(0, headLimit)
       .map(([file, count]) => `${file}:${count}`);
-    return rows.length ? rows.join("\n") : "No matches found";
+    const base = rows.length ? rows.join("\n") : "No matches found";
+    return skippedLargeFiles ? `${base}\n[skipped ${skippedLargeFiles} file(s) larger than 8 MiB]` : base;
   }
 
-  return contentLines.length ? contentLines.join("\n") : "No matches found";
+  const base = contentLines.length ? contentLines.join("\n") : "No matches found";
+  return skippedLargeFiles ? `${base}\n[skipped ${skippedLargeFiles} file(s) larger than 8 MiB]` : base;
 }

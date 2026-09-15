@@ -1,4 +1,4 @@
-import { spawn } from "child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import fs from "fs";
 import path from "path";
 
@@ -18,6 +18,28 @@ let sessionInitializedAt: string | null = null;
 let persistenceRoot: string | null = null;
 const history: string[] = [];
 const MAX_HISTORY = 50;
+const MAX_SHELL_OUTPUT_CHARS = 400_000;
+
+async function killProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (process.platform !== "win32" && child.pid) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {}
+  }
+  if (process.platform !== "win32" || !child.pid) {
+    child.kill("SIGKILL");
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+    killer.once("error", () => {
+      child.kill("SIGKILL");
+      resolve();
+    });
+    killer.once("close", () => resolve());
+  });
+}
 
 export function setShellPersistenceRoot(workspaceRoot: string): void {
   persistenceRoot = path.resolve(workspaceRoot);
@@ -205,6 +227,7 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     const child = spawn(shell, args, {
       cwd,
       windowsHide: true,
+      detached: process.platform !== "win32",
       env: {
         ...process.env,
         CI: "true",
@@ -223,13 +246,18 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     let stderr = "";
     let timedOut = false;
 
+    const appendBounded = (current: string, chunk: Buffer): string => {
+      const next = current + chunk.toString();
+      return next.length > MAX_SHELL_OUTPUT_CHARS ? next.slice(-MAX_SHELL_OUTPUT_CHARS) : next;
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      void killProcessTree(child).catch(() => child.kill("SIGKILL"));
     }, timeoutMs);
 
-    child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
+    child.stdout?.on("data", (d: Buffer) => (stdout = appendBounded(stdout, d)));
+    child.stderr?.on("data", (d: Buffer) => (stderr = appendBounded(stderr, d)));
     child.on("close", (code) => {
       clearTimeout(timer);
       if (timedOut) {

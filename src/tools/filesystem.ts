@@ -13,8 +13,28 @@ import { toolResult } from "../lib/tool-result.js";
 import { globFiles } from "../lib/glob-search.js";
 import { grepSearch } from "../lib/grep-search.js";
 
+const MAX_TEXT_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_EDITABLE_TEXT_BYTES = 16 * 1024 * 1024;
+const MAX_TEXT_INPUT_CHARS = 2_000_000;
+const MAX_BASE64_INPUT_CHARS = 5_000_000;
+const MAX_EDIT_FRAGMENT_CHARS = 1_000_000;
+const MAX_MULTI_EDIT_FRAGMENT_CHARS = 50_000;
+const MAX_PATCH_CHARS = 2_000_000;
+const MAX_TREE_ENTRIES = 20_000;
+const MAX_SEARCH_FILE_BYTES = 4 * 1024 * 1024;
+const MAX_DIRECTORY_LIST_ENTRIES = 5_000;
 
-
+async function readEditableTextFile(filePath: string): Promise<string> {
+  const stat = await fs.stat(filePath);
+  if (!stat.isFile()) throw new Error("Path is not a regular file");
+  if (stat.size > MAX_EDITABLE_TEXT_BYTES) {
+    throw new Error(
+      `File is too large to edit safely (${stat.size} bytes; max ${MAX_EDITABLE_TEXT_BYTES}). ` +
+      "Use a streaming/specialized command for generated or very large files."
+    );
+  }
+  return fs.readFile(filePath, "utf-8");
+}
 async function searchDirectory(
   dir: string,
   regex: RegExp,
@@ -36,6 +56,8 @@ async function searchDirectory(
       await searchDirectory(fullPath, regex, globPattern, results, maxResults);
     } else if (matchesGlob(entry.name, globPattern)) {
       try {
+        const stat = await fs.stat(fullPath);
+        if (stat.size > MAX_SEARCH_FILE_BYTES) continue;
         const content = await fs.readFile(fullPath, "utf-8");
         const lines = content.split("\n");
         lines.forEach((line, idx) => {
@@ -56,17 +78,30 @@ function matchesGlob(filename: string, pattern: string): boolean {
   return regex.test(filename);
 }
 
-async function buildTree(dirPath: string, depth: number, maxDepth: number): Promise<object> {
+async function buildTree(
+  dirPath: string,
+  depth: number,
+  maxDepth: number,
+  budget: { entries: number; maxEntries: number } = { entries: 0, maxEntries: MAX_TREE_ENTRIES }
+): Promise<object> {
   const name = path.basename(dirPath);
-  const entries = await fs.readdir(dirPath, { withFileTypes: true });
-
+  if (budget.entries >= budget.maxEntries) {
+    return { name, type: "directory", truncated: true, reason: "entry_limit" };
+  }
   if (depth >= maxDepth) return { name, type: "directory", truncated: true };
+
+  const entries = await fs.readdir(dirPath, { withFileTypes: true });
 
   const children = [];
   for (const entry of entries) {
     if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+    if (budget.entries >= budget.maxEntries) {
+      children.push({ name: "…", type: "truncated", reason: "entry_limit" });
+      break;
+    }
+    budget.entries++;
     const childPath = path.join(dirPath, entry.name);
-    if (entry.isDirectory()) children.push(await buildTree(childPath, depth + 1, maxDepth));
+    if (entry.isDirectory()) children.push(await buildTree(childPath, depth + 1, maxDepth, budget));
     else children.push({ name: entry.name, type: "file" });
   }
 
@@ -82,15 +117,23 @@ export function registerFilesystemTools(server: McpServer): void {
       inputSchema: {
         path: z.string(),
         offset: z.number().int().positive().optional().describe("1-based line number to start reading"),
-        limit: z.number().int().positive().optional().describe("Number of lines to read from offset"),
-        head: z.number().optional(),
-        tail: z.number().optional(),
+        limit: z.number().int().positive().max(100_000).optional().describe("Number of lines to read from offset"),
+        head: z.number().int().positive().max(100_000).optional(),
+        tail: z.number().int().positive().max(100_000).optional(),
       },
 
       annotations: toolAnnotations("read"),
     },
     async ({ path: filePath, offset, limit, head, tail }) => {
       const validPath = await validatePath(filePath);
+      const stat = await fs.stat(validPath);
+      if (!stat.isFile()) throw new Error("Path is not a regular file");
+      if (stat.size > MAX_TEXT_FILE_BYTES) {
+        throw new Error(
+          `Text file is too large to load safely (${stat.size} bytes; max ${MAX_TEXT_FILE_BYTES}). ` +
+          "Use grep, a shell command that streams the needed range, or read_file_base64 chunks."
+        );
+      }
       const content = await fs.readFile(validPath, "utf-8");
       const lines = content.split("\n");
 
@@ -114,11 +157,11 @@ export function registerFilesystemTools(server: McpServer): void {
     "read_file_base64",
     {
       title: "Read File Base64",
-      description: "Read any local file as base64. Use offset/length for large files. Max chunk 8 MiB.",
+      description: "Read any local file as base64. Use offset/length for large files. Max chunk 2 MiB so the duplicated structured/text MCP result stays below tunnel limits.",
       inputSchema: {
         path: z.string(),
         offset: z.number().int().nonnegative().optional().default(0),
-        length: z.number().int().positive().max(8 * 1024 * 1024).optional().default(1024 * 1024),
+        length: z.number().int().positive().max(2 * 1024 * 1024).optional().default(1024 * 1024),
       },
 
       annotations: toolAnnotations("read"),
@@ -128,7 +171,7 @@ export function registerFilesystemTools(server: McpServer): void {
       const stat = await fs.stat(validPath);
       if (!stat.isFile()) throw new Error("Path is not a regular file");
       const start = Math.min(offset, stat.size);
-      const chunkLength = Math.min(length, 8 * 1024 * 1024, stat.size - start);
+      const chunkLength = Math.min(length, 2 * 1024 * 1024, stat.size - start);
       const handle = await fs.open(validPath, "r");
       try {
         const buffer = Buffer.alloc(chunkLength);
@@ -157,7 +200,7 @@ export function registerFilesystemTools(server: McpServer): void {
     {
       title: "Write File",
       description: "Save text to a local file. Routine local file update.",
-      inputSchema: { path: z.string(), content: z.string() },
+      inputSchema: { path: z.string(), content: z.string().max(MAX_TEXT_INPUT_CHARS) },
 
       annotations: toolAnnotations("edit"),
     },
@@ -181,7 +224,7 @@ export function registerFilesystemTools(server: McpServer): void {
     {
       title: "Write File Base64",
       description: "Create or overwrite a binary file from base64 content.",
-      inputSchema: { path: z.string(), content: z.string() },
+      inputSchema: { path: z.string(), content: z.string().max(MAX_BASE64_INPUT_CHARS) },
 
       annotations: toolAnnotations("edit"),
     },
@@ -204,8 +247,8 @@ export function registerFilesystemTools(server: McpServer): void {
       description: "Apply exact text replacement to a file. Returns diff.",
       inputSchema: {
         path: z.string(),
-        old_text: z.string(),
-        new_text: z.string(),
+        old_text: z.string().max(MAX_EDIT_FRAGMENT_CHARS),
+        new_text: z.string().max(MAX_EDIT_FRAGMENT_CHARS),
         replace_all: z.boolean().optional().default(false),
         dry_run: z.boolean().optional().default(false),
       },
@@ -215,7 +258,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, old_text, new_text, replace_all, dry_run }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const content = await fs.readFile(validPath, "utf-8");
+      const content = await readEditableTextFile(validPath);
       if (!content.includes(old_text)) throw new Error("old_text not found in file. Ensure exact match.");
       const newContent = replace_all ? content.split(old_text).join(new_text) : content.replace(old_text, new_text);
       const diff = buildSimpleDiff(content, newContent);
@@ -234,7 +277,11 @@ export function registerFilesystemTools(server: McpServer): void {
       description: "Apply multiple exact replacements to one text file atomically.",
       inputSchema: {
         path: z.string(),
-        edits: z.array(z.object({ old_text: z.string(), new_text: z.string(), replace_all: z.boolean().optional().default(false) })),
+        edits: z.array(z.object({
+          old_text: z.string().max(MAX_MULTI_EDIT_FRAGMENT_CHARS),
+          new_text: z.string().max(MAX_MULTI_EDIT_FRAGMENT_CHARS),
+          replace_all: z.boolean().optional().default(false),
+        })).min(1).max(20),
         dry_run: z.boolean().optional().default(false),
       },
 
@@ -243,7 +290,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, edits, dry_run }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const original = await fs.readFile(validPath, "utf-8");
+      const original = await readEditableTextFile(validPath);
       let next = original;
       for (const edit of edits) {
         if (!next.includes(edit.old_text)) throw new Error(`old_text not found: ${edit.old_text.slice(0, 120)}`);
@@ -267,14 +314,20 @@ export function registerFilesystemTools(server: McpServer): void {
     {
       title: "Replace Regex",
       description: "Apply a JavaScript regex replacement to a text file.",
-      inputSchema: { path: z.string(), pattern: z.string(), replacement: z.string(), flags: z.string().optional().default("g"), dry_run: z.boolean().optional().default(false) },
+      inputSchema: {
+        path: z.string(),
+        pattern: z.string().max(100_000),
+        replacement: z.string().max(MAX_EDIT_FRAGMENT_CHARS),
+        flags: z.string().max(20).optional().default("g"),
+        dry_run: z.boolean().optional().default(false),
+      },
 
       annotations: toolAnnotations("edit"),
     },
     async ({ path: filePath, pattern, replacement, flags, dry_run }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const original = await fs.readFile(validPath, "utf-8");
+      const original = await readEditableTextFile(validPath);
       const regex = new RegExp(pattern, flags);
       const next = original.replace(regex, replacement);
       if (next === original) throw new Error("Regex made no changes.");
@@ -294,7 +347,7 @@ export function registerFilesystemTools(server: McpServer): void {
         "Preferred way to edit code. Codex @@ hunks or *** Begin Patch format. Read the file first. Use dry_run:true to preview.",
       inputSchema: {
         path: z.string().optional().describe("Target file (single-file) or base directory (multi-file)"),
-        patch: z.string(),
+        patch: z.string().max(MAX_PATCH_CHARS),
         dry_run: z.boolean().optional().default(false),
       },
 
@@ -310,7 +363,9 @@ export function registerFilesystemTools(server: McpServer): void {
           const stat = await fs.stat(validPath);
           baseDir = stat.isDirectory() ? validPath : path.dirname(validPath);
         }
-        const patchPaths = parseMultiFilePatch(patch, baseDir).map((op) => op.path);
+        const patchPaths = await Promise.all(
+          parseMultiFilePatch(patch, baseDir).map((op) => validatePath(op.path))
+        );
         const checkpointId = await checkpointBefore("apply_patch", patchPaths, { dry_run });
         const results = await applyMultiFilePatch(patch, { base_dir: baseDir, dry_run });
         const failed = results.filter((r) => !r.ok);
@@ -335,7 +390,7 @@ export function registerFilesystemTools(server: McpServer): void {
 
       if (!filePath) throw new Error("path is required for single-file patches");
       const validPath = await validatePath(filePath);
-      const original = await fs.readFile(validPath, "utf-8");
+      const original = await readEditableTextFile(validPath);
       const next = applyUnifiedPatchToText(original, patch);
       const diff = buildSimpleDiff(original, next);
       const checkpointId = await checkpointBefore("apply_patch", [validPath], { dry_run });
@@ -365,9 +420,18 @@ export function registerFilesystemTools(server: McpServer): void {
         (p) => new RegExp("^" + p.replace(/\./g, "\\.").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i")
       );
       const filtered = entries.filter((e) => !ignoreMatchers.some((m) => m.test(e.name)));
-      const items = filtered.map((e) => ({ name: e.name, type: e.isDirectory() ? "directory" : "file" }));
+      const truncated = filtered.length > MAX_DIRECTORY_LIST_ENTRIES;
+      const items = filtered
+        .slice(0, MAX_DIRECTORY_LIST_ENTRIES)
+        .map((e) => ({ name: e.name, type: e.isDirectory() ? "directory" : "file" }));
       await audit({ tool: "list_directory", action: "list", target: validPath, status: "ok" });
-      return toolResult("list_directory", { path: validPath, entries: items, count: items.length });
+      return toolResult("list_directory", {
+        path: validPath,
+        entries: items,
+        count: items.length,
+        truncated,
+        total_entries: filtered.length,
+      });
     }
   );
 
@@ -398,9 +462,9 @@ export function registerFilesystemTools(server: McpServer): void {
       title: "Grep",
       description: "Explore: search file contents by regex. Prefer over reading many files blindly. Modes: content, files_with_matches, count.",
       inputSchema: {
-        pattern: z.string(),
+        pattern: z.string().max(100_000),
         path: z.string().optional(),
-        glob: z.string().optional().default("*"),
+        glob: z.string().max(2_000).optional().default("*"),
         output_mode: z.enum(["content", "files_with_matches", "count"]).optional().default("content"),
         case_insensitive: z.boolean().optional().default(false),
         multiline: z.boolean().optional().default(false),
@@ -551,7 +615,7 @@ export function registerFilesystemTools(server: McpServer): void {
     }
   );
 
-  server.registerTool("search_files", { title: "Search Files", description: "Search file contents for a text pattern.", inputSchema: { path: z.string(), pattern: z.string(), glob: z.string().optional().default("*"), max_results: z.number().optional().default(50) }, annotations: toolAnnotations("read") }, async ({ path: searchPath, pattern, glob: globPattern, max_results }) => {
+  server.registerTool("search_files", { title: "Search Files", description: "Search file contents for a text pattern.", inputSchema: { path: z.string(), pattern: z.string().max(100_000), glob: z.string().optional().default("*"), max_results: z.number().int().positive().max(500).optional().default(50) }, annotations: toolAnnotations("read") }, async ({ path: searchPath, pattern, glob: globPattern, max_results }) => {
     const validPath = await validatePath(searchPath);
     const results: string[] = [];
     await searchDirectory(validPath, new RegExp(pattern, "i"), globPattern, results, max_results);
@@ -559,7 +623,7 @@ export function registerFilesystemTools(server: McpServer): void {
     return toolResult("search_files", { path: validPath, pattern, matches: results, count: results.length });
   });
 
-  server.registerTool("directory_tree", { title: "Directory Tree", description: "Get recursive directory structure as JSON.", inputSchema: { path: z.string(), max_depth: z.number().optional().default(4) }, annotations: toolAnnotations("read") }, async ({ path: dirPath, max_depth }) => {
+  server.registerTool("directory_tree", { title: "Directory Tree", description: "Get recursive directory structure as JSON, bounded by depth and entry count.", inputSchema: { path: z.string(), max_depth: z.number().int().nonnegative().max(12).optional().default(4) }, annotations: toolAnnotations("read") }, async ({ path: dirPath, max_depth }) => {
     const validPath = await validatePath(dirPath);
     const tree = await buildTree(validPath, 0, max_depth);
     await audit({ tool: "directory_tree", action: "tree", target: validPath, status: "ok" });
@@ -567,11 +631,11 @@ export function registerFilesystemTools(server: McpServer): void {
   });
 
   server.registerTool("list_allowed_directories", { title: "List Allowed Directories", description: "Show default working directory and machine access scope.", inputSchema: {}, annotations: toolAnnotations("read") }, async () => {
-    const { getDefaultCwd, getMachineRoots } = await import("../lib/path-security.js");
+    const { getDefaultCwd, getMachineRoots, getFullDiskAccess } = await import("../lib/path-security.js");
     const { describePermissionProfile } = await import("../lib/permissions.js");
     const machineRoots = getMachineRoots();
     return toolResult("list_allowed_directories", {
-      full_machine_access: true,
+      full_machine_access: getFullDiskAccess(),
       permission: describePermissionProfile(),
       default_cwd: getDefaultCwd(),
       machine_roots: machineRoots,

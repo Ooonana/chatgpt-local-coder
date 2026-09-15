@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "profile": "open",
+  "path_roots": [],
+  "allow_write": true,
+  "allow_commands": true,
+  "allow_unsafe_runtimes": true,
+  "command_allow_patterns": [],
+  "command_deny_patterns": []
+}

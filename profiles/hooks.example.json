@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "enabled": false,
+  "hooks": [
+    {
+      "id": "example-pre-tool-check",
+      "event": "pre_tool_use",
+      "command": "node scripts/example-hook.mjs",
+      "enabled": false,
+      "tool": ["write_file", "apply_patch"],
+      "timeout_ms": 5000,
+      "blocking": true
+    }
+  ]
+}

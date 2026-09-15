@@ -1,9 +1,10 @@
+import os from "node:os";
+import path from "node:path";
 import { spawn } from "node:child_process";
-import path from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath } from "node:url";
 
-const scratch = "C:/Users/Dao Nguyen Hoang/AppData/Local/Temp/grok-goal-41c5f05971ba/implementer";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const scratch = process.env.GOAL_SCRATCH || path.join(os.tmpdir(), "chatgpt-local-coder-verification");
 
 const child = spawn(process.execPath, [path.join(root, "scripts/capture-verification-evidence.mjs")], {
   cwd: root,
@@ -11,4 +12,8 @@ const child = spawn(process.execPath, [path.join(root, "scripts/capture-verifica
   stdio: "inherit",
 });
 
+child.on("error", (error) => {
+  console.error(error);
+  process.exit(1);
+});
 child.on("exit", (code) => process.exit(code ?? 1));

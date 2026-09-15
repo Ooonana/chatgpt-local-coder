@@ -4,6 +4,7 @@ import { validatePath } from "../lib/path-security.js";
 import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
+import { boundDiagnosticValue } from "../lib/bounded-value.js";
 import {
   activeLspSessions,
   getLspClient,
@@ -36,7 +37,7 @@ export function registerLspTool(server: McpServer, defaultCwd: string): void {
         path: z.string().optional(),
         line: z.number().int().positive().optional(),
         column: z.number().int().positive().optional(),
-        query: z.string().optional(),
+        query: z.string().max(20_000).optional(),
         include_declaration: z.boolean().optional().default(true),
         server: serverSchema.optional().default("auto"),
         workspace: z.string().optional(),
@@ -102,6 +103,16 @@ export function registerLspTool(server: McpServer, defaultCwd: string): void {
           }
         }
       }
+
+      // Language servers can return tens of thousands of references/symbols.
+      // Keep semantic results useful while ensuring one pathological server
+      // response cannot consume huge memory or hit the MCP tunnel payload cap.
+      result = boundDiagnosticValue(result, {
+        maxStringChars: 50_000,
+        maxArrayItems: 1_000,
+        maxObjectKeys: 500,
+        maxDepth: 10,
+      });
 
       const status = client.status();
       await audit({

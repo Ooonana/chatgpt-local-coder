@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "enabled": false,
+  "executable": "",
+  "args": [],
+  "prompt_via_stdin": true,
+  "timeout_ms": 1800000,
+  "max_concurrency": 4,
+  "isolation": "none",
+  "env": {}
+}

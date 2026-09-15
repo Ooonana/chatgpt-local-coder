@@ -25,6 +25,7 @@ interface ManagedProcess {
   stderr: string[];
   exitCode: number | null;
   signal: NodeJS.Signals | null;
+  spawnError?: string;
 }
 
 interface OneShotCommandResult {
@@ -41,6 +42,20 @@ interface OneShotCommandResult {
 const processes = new Map<string, ManagedProcess>();
 const MAX_LOG_CHARS = 400_000;
 const MAX_PROCESS_INPUT_CHARS = 100_000;
+const MAX_COMMAND_CHARS = 500_000;
+
+export function getManagedProcessSnapshot() {
+  return [...processes.values()].map((item) => ({
+    id: item.id,
+    pid: item.child.pid,
+    command: item.command,
+    cwd: item.cwd,
+    started_at: item.startedAt,
+    running: item.exitCode === null && item.signal === null,
+    exit_code: item.exitCode,
+    signal: item.signal,
+  }));
+}
 
 function getShellInvocation(command: string): { shell: string; args: string[]; effectiveCommand: string } {
   let shell = "bash";
@@ -58,6 +73,12 @@ function getShellInvocation(command: string): { shell: string; args: string[]; e
 }
 
 async function killChildProcessTree(child: ChildProcessWithoutNullStreams, force: boolean): Promise<void> {
+  if (process.platform !== "win32" && child.pid) {
+    try {
+      process.kill(-child.pid, force ? "SIGKILL" : "SIGTERM");
+      return;
+    } catch {}
+  }
   if (process.platform !== "win32" || !child.pid) {
     child.kill(force ? "SIGKILL" : "SIGTERM");
     return;
@@ -91,6 +112,7 @@ export async function runOneShotCommand(
     const child = spawn(shell, args, {
       cwd,
       windowsHide: true,
+      detached: process.platform !== "win32",
       env: {
         ...process.env,
         CI: "true",
@@ -117,13 +139,15 @@ export async function runOneShotCommand(
       stderr += data.toString();
       trimLogs();
     });
+    let timer: NodeJS.Timeout | undefined;
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
+      if (timer) clearTimeout(timer);
       reject(error);
     });
 
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       timedOut = true;
       void killChildProcessTree(child, true).catch(() => child.kill("SIGKILL"));
     }, timeoutMs);
@@ -132,7 +156,7 @@ export async function runOneShotCommand(
     child.on("close", (code, signal) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       resolve({
         command,
         cwd,
@@ -160,6 +184,26 @@ async function terminateProcessTree(item: ManagedProcess, force: boolean): Promi
   await killChildProcessTree(item.child, force);
 }
 
+async function waitForManagedProcessExit(item: ManagedProcess, timeoutMs = 2_000): Promise<void> {
+  if (item.exitCode !== null || item.signal !== null || item.spawnError) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    timer.unref?.();
+    item.child.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+export async function shutdownManagedProcesses(): Promise<void> {
+  const active = [...processes.values()].filter(
+    (item) => item.exitCode === null && item.signal === null && !item.spawnError
+  );
+  await Promise.allSettled(active.map((item) => terminateProcessTree(item, true)));
+  await Promise.all(active.map((item) => waitForManagedProcessExit(item)));
+}
+
 export function registerShellTools(server: McpServer, defaultCwd: string, timeoutSec: number): void {
   void bootstrapShellSession(defaultCwd);
 
@@ -170,15 +214,16 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       description:
         "Run shell commands to verify work (tests, build, lint). Cwd persists across ChatGPT tool calls (saved to disk). Use shell_status to check cwd. Use start_process for long jobs.",
       inputSchema: {
-        command: z.string(),
+        command: z.string().max(MAX_COMMAND_CHARS),
         working_directory: z.string().optional().describe("One-off override; does not reset persistent cwd unless you use shell_reset"),
       },
 
       annotations: toolAnnotations("command"),
     },
     async ({ command, working_directory }) => {
-      requireCommandAllowed(command);
       const cwdOverride = working_directory ? await validatePath(working_directory) : undefined;
+      const policyCwd = cwdOverride ?? getShellStatus().cwd ?? defaultCwd;
+      requireCommandAllowed(command, policyCwd);
       const result = await execInShellSession(command, defaultCwd, timeoutSec * 1000, cwdOverride);
       await audit({
         tool: "run_command",
@@ -202,7 +247,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         "Run independent shell commands concurrently in isolated processes. Use for builds/tests/searches that can safely run at the same time. Does not change the persistent run_command cwd.",
       inputSchema: {
         commands: z.array(z.object({
-          command: z.string(),
+          command: z.string().max(MAX_COMMAND_CHARS),
           working_directory: z.string().optional(),
           timeout_seconds: z.number().int().positive().max(3600).optional(),
         })).min(1).max(16),
@@ -222,8 +267,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           const spec = commands[index];
           const started = Date.now();
           try {
-            requireCommandAllowed(spec.command);
             const cwd = spec.working_directory ? await validatePath(spec.working_directory) : defaultParallelCwd;
+            requireCommandAllowed(spec.command, cwd);
             const result = await runOneShotCommand(
               spec.command,
               cwd,
@@ -300,18 +345,19 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     {
       title: "Start Background Process",
       description: "Start a long-running command in the background. Use process_output/process_status/stop_process afterwards.",
-      inputSchema: { command: z.string(), working_directory: z.string().optional() },
+      inputSchema: { command: z.string().max(MAX_COMMAND_CHARS), working_directory: z.string().optional() },
 
       annotations: toolAnnotations("command"),
     },
     async ({ command, working_directory }) => {
-      requireCommandAllowed(command);
       const cwd = working_directory ? await validatePath(working_directory) : getShellStatus().cwd || defaultCwd;
+      requireCommandAllowed(command, cwd);
       const { shell, args } = getShellInvocation(command);
 
       const child = spawn(shell, args, {
         cwd,
         windowsHide: true,
+        detached: process.platform !== "win32",
         env: {
           ...process.env,
           CI: "true",
@@ -319,6 +365,22 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           GIT_PAGER: "cat",
           NO_COLOR: "1",
         },
+      });
+
+      // A missing/broken shell emits an asynchronous `error` event. Without an
+      // explicit listener Node treats it as uncaught and can terminate the MCP
+      // server. Do not advertise a process id until the child actually spawned.
+      await new Promise<void>((resolve, reject) => {
+        const onSpawn = () => {
+          child.off("error", onError);
+          resolve();
+        };
+        const onError = (error: Error) => {
+          child.off("spawn", onSpawn);
+          reject(error);
+        };
+        child.once("spawn", onSpawn);
+        child.once("error", onError);
       });
       const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const item: ManagedProcess = {
@@ -335,8 +397,13 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       processes.set(id, item);
       child.stdout.on("data", (d: Buffer) => appendLog(item.stdout, d));
       child.stderr.on("data", (d: Buffer) => appendLog(item.stderr, d));
+      child.on("error", (error) => {
+        item.spawnError = error.message;
+        if (item.exitCode === null) item.exitCode = 1;
+        appendLog(item.stderr, Buffer.from(`\n[process error] ${error.message}\n`));
+      });
       child.on("close", (code, signal) => {
-        item.exitCode = code;
+        item.exitCode = code ?? item.exitCode ?? (item.spawnError ? 1 : null);
         item.signal = signal;
       });
       await audit({ tool: "start_process", action: "start", target: cwd, status: "ok", details: { id, command } });
@@ -368,6 +435,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           stdin_writable: p.child.stdin.writable && !p.child.stdin.destroyed,
           exit_code: p.exitCode,
           signal: p.signal,
+          spawn_error: p.spawnError ?? null,
         }));
       return toolResult("process_status", { processes: processes_list }, { summary: `${processes_list.length} process(es)` });
     }
@@ -397,6 +465,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         stdin_writable: item.child.stdin.writable && !item.child.stdin.destroyed,
         exit_code: item.exitCode,
         signal: item.signal,
+        spawn_error: item.spawnError ?? null,
         stdout: item.stdout.join("").slice(-tail_chars),
         stderr: item.stderr.join("").slice(-tail_chars),
       };
@@ -427,6 +496,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       if (!item.child.stdin.writable || item.child.stdin.destroyed) {
         throw new Error(`Process ${id} stdin is not writable`);
       }
+      requireCommandAllowed(item.command, item.cwd);
 
       const payload = append_newline ? `${input}${process.platform === "win32" ? "\r\n" : "\n"}` : input;
       await new Promise<void>((resolve, reject) => {

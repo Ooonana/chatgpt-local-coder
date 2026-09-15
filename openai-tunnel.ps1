@@ -5,7 +5,9 @@ param(
     [switch]$Install,
     [switch]$Doctor,
     [switch]$Init,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$WaitForServer,
+    [int]$WaitForServerSeconds = 60
 )
 
 $ErrorActionPreference = "Stop"
@@ -220,8 +222,7 @@ function Invoke-TunnelInit {
 
     Write-Host ""
     Write-Host "Saved to .env. Next time, run:" -ForegroundColor Green
-    Write-Host "  .\start.ps1 -Force          # terminal 1"
-    Write-Host "  .\openai-tunnel.ps1         # terminal 2"
+    Write-Host "  .\start.ps1                 # starts/restarts MCP and tunnel automatically"
     Show-ConnectorGuide -TunnelId $tunnelId
 }
 
@@ -298,12 +299,28 @@ if ($Doctor) {
 }
 
 if (-not (Test-McpServer $resolvedPort)) {
-    Write-Host ""
-    Write-Host "[WARNING] MCP server is not running at http://127.0.0.1:$resolvedPort" -ForegroundColor Yellow
-    Write-Host "Open another terminal and run: .\start.ps1 -Force" -ForegroundColor Cyan
-    Write-Host ""
-    $answer = Read-Host "Start the tunnel anyway? (y/n)"
-    if ($answer -notmatch '^[yY]') { exit 1 }
+    if ($WaitForServer) {
+        Write-Host ""
+        Write-Host "[Tunnel] Waiting for MCP server at http://127.0.0.1:$resolvedPort ..." -ForegroundColor Yellow
+        $deadline = (Get-Date).AddSeconds([Math]::Max(1, $WaitForServerSeconds))
+        while ((Get-Date) -lt $deadline -and -not (Test-McpServer $resolvedPort)) {
+            Start-Sleep -Milliseconds 500
+        }
+
+        if (-not (Test-McpServer $resolvedPort)) {
+            Write-Host "[ERROR] MCP server did not become healthy within $WaitForServerSeconds seconds." -ForegroundColor Red
+            exit 1
+        }
+
+        Write-Host "[Tunnel] MCP server is healthy. Starting tunnel." -ForegroundColor Green
+    } else {
+        Write-Host ""
+        Write-Host "[WARNING] MCP server is not running at http://127.0.0.1:$resolvedPort" -ForegroundColor Yellow
+        Write-Host "Open another terminal and run: .\start.ps1" -ForegroundColor Cyan
+        Write-Host ""
+        $answer = Read-Host "Start the tunnel anyway? (y/n)"
+        if ($answer -notmatch '^[yY]') { exit 1 }
+    }
 }
 
 Write-Host ""

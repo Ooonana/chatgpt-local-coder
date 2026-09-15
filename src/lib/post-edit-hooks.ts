@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
+import { requireCommandAllowed } from "./permissions.js";
 
 export interface PostEditHook {
   glob: string;
@@ -41,6 +42,7 @@ async function loadHooksConfig(): Promise<HooksConfig> {
 
 function runHook(command: string, filePath: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; exit_code: number | null }> {
   const expanded = command.replace(/\{path\}/g, filePath).replace(/\{file\}/g, filePath);
+  requireCommandAllowed(expanded, path.dirname(filePath));
   const shell = process.platform === "win32" ? "powershell.exe" : "bash";
   const args = process.platform === "win32" ? ["-NoProfile", "-Command", expanded] : ["-lc", expanded];
 

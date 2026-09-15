@@ -11,18 +11,52 @@ import { createMcpServer } from "../server-factory.js";
 import { getUpstreamManager } from "./mcp-upstream-manager.js";
 import { refreshProxiedTools } from "./mcp-tool-proxy.js";
 import { runCodexSessionStartHooks } from "./codex-hooks.js";
+import { runLocalHooks } from "./local-hooks.js";
 
 
 const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
-const SESSION_TTL_MS = parseInt(process.env.MCP_SESSION_TTL_MS || "86400000", 10); // 24h
-const SESSION_CLEANUP_INTERVAL_MS = parseInt(
-  process.env.MCP_SESSION_CLEANUP_MS || "300000",
-  10
-); // 5m
-const SESSION_DELETE_GRACE_MS = parseInt(
-  process.env.MCP_SESSION_DELETE_GRACE_MS || "45000",
-  10
+const DEFAULT_SSE_KEEPALIVE_MS = 10_000;
+function boundedPositiveInt(raw: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(Math.max(Math.trunc(parsed), min), max);
+}
+
+const SESSION_TTL_MS = boundedPositiveInt(
+  process.env.MCP_SESSION_TTL_MS,
+  86_400_000,
+  60_000,
+  7 * 24 * 60 * 60 * 1000
+); // default 24h
+const SESSION_CLEANUP_INTERVAL_MS = boundedPositiveInt(
+  process.env.MCP_SESSION_CLEANUP_MS,
+  300_000,
+  1_000,
+  60 * 60 * 1000
+); // default 5m
+const SESSION_DELETE_GRACE_MS = boundedPositiveInt(
+  process.env.MCP_SESSION_DELETE_GRACE_MS,
+  45_000,
+  1_000,
+  5 * 60 * 1000
 ); // keep session after DELETE so in-flight tool calls can finish
+const SESSION_RECOVERY_LOOPBACK_TIMEOUT_MS = boundedPositiveInt(
+  process.env.MCP_SESSION_RECOVERY_TIMEOUT_MS,
+  10_000,
+  1_000,
+  60_000
+);
+
+export const MCP_SSE_KEEPALIVE_MS = boundedPositiveInt(
+  process.env.MCP_SSE_KEEPALIVE_MS,
+  DEFAULT_SSE_KEEPALIVE_MS,
+  1_000,
+  60_000
+);
+
+export const MCP_JSON_RESPONSE = ["1", "true", "yes", "on"].includes(
+  (process.env.MCP_JSON_RESPONSE || "false").trim().toLowerCase()
+);
 
 const lastTransportErrors: Record<string, string> = {};
 const sessionOpChains = new Map<string, Promise<void>>();
@@ -57,9 +91,10 @@ function withSessionIdHeader(
 }
 
 /**
- * ChatGPT (openai-mcp) gui MCP-Protocol-Version moi hon SDK ho tro (vd 2026-07-28)
- * trong request discovery. SDK se tra 400 cho moi request mang version la, lam
- * connector retry vo han. Kep ve version SDK that su ho tro.
+ * ChatGPT can advertise an MCP protocol version newer than the installed SDK
+ * supports during discovery. Passing that unknown version through makes the SDK
+ * return 400 and can trigger repeated connector retries, so negotiate down to a
+ * version that this SDK actually supports.
  */
 function negotiateProtocolVersion(requested: string | undefined): string {
   if (requested && (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(requested)) {
@@ -73,6 +108,7 @@ export interface McpSession {
   server: McpServer;
   lastAccessedAt: number;
   createdAt: number;
+  closed?: boolean;
 }
 
 export interface SessionManagerConfig {
@@ -127,6 +163,7 @@ async function loopbackMcpPost(
     method: "POST",
     headers,
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(SESSION_RECOVERY_LOOPBACK_TIMEOUT_MS),
   });
 
   return {
@@ -159,6 +196,7 @@ async function enqueueSessionOp(sessionId: string, op: () => Promise<void>): Pro
 export function createSessionManager(config: SessionManagerConfig): SessionManager {
   const sessions: Record<string, McpSession> = {};
   const pendingRecoveries: Record<string, McpSession> = {};
+  const recoveryFlights = new Map<string, Promise<McpSession | undefined>>();
   const deleteGraceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -198,6 +236,11 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     delete lastTransportErrors[sessionId];
     sessionOpChains.delete(sessionId);
     console.log(`[MCP] Session removed (${reason}): ${sessionId}`);
+    void runLocalHooks("session_end", {
+      workspace: config.workspaceRoot,
+      session_id: sessionId,
+      result: { reason },
+    }).catch(() => undefined);
   }
 
   function clearPendingRecovery(sessionId: string): void {
@@ -209,33 +252,52 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       console.warn("[MCP] Codex SessionStart hook failed:", error);
       return "";
     });
+    const localSessionHook = await runLocalHooks("session_start", { workspace: config.workspaceRoot });
+    if (!localSessionHook.allow) {
+      throw new Error(localSessionHook.reason || "Session blocked by local session_start hook");
+    }
+    const localHookInstructions = localSessionHook.additional_context;
     const mcpServer = createMcpServer(
       config.workspaceRoot,
       config.shellTimeout,
       config.workspaceRoots,
       true,
       getUpstreamManager(),
-      [config.projectMemoryInstructions, hookInstructions].filter(Boolean).join("\n\n")
+      [config.projectMemoryInstructions, hookInstructions, localHookInstructions].filter(Boolean).join("\n\n")
     );
 
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: preferredSessionId
         ? () => preferredSessionId
         : () => randomUUID(),
-      enableJsonResponse: true,
+      // SSE is the SDK default and is safer for long-running tool calls because
+      // it emits keepalive comment frames while the POST is still in progress.
+      // JSON mode is retained only as an opt-in compatibility escape hatch.
+      enableJsonResponse: MCP_JSON_RESPONSE,
+      keepAliveMs: MCP_SSE_KEEPALIVE_MS,
       onsessioninitialized: (sid) => {
         const existing = sessions[sid];
+        cancelDeleteGrace(sid);
+        if (existing?.closed && existing.transport !== transport) {
+          getUpstreamManager().unregisterMcpServer(existing.server);
+          void existing.server.close().catch(() => undefined);
+        }
         sessions[sid] = {
           transport,
           server: mcpServer,
           lastAccessedAt: Date.now(),
           createdAt: existing?.createdAt ?? Date.now(),
+          closed: false,
         };
         clearPendingRecovery(sid);
         console.log(`[MCP] Session initialized: ${sid}`);
       },
       onsessionclosed: (sid) => {
-        if (sid) scheduleDeleteGrace(sid);
+        if (!sid) return;
+        const current = sessions[sid];
+        if (!current || current.transport !== transport) return;
+        current.closed = true;
+        scheduleDeleteGrace(sid);
       },
     });
 
@@ -248,7 +310,9 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     // Keep session alive across transient SSE disconnects; explicit DELETE cleans up.
     transport.onclose = () => {
       const sid = transport.sessionId;
-      if (!sid || !sessions[sid]) return;
+      const current = sid ? sessions[sid] : undefined;
+      if (!sid || !current || current.transport !== transport) return;
+      current.closed = true;
       console.log(`[MCP] Transport closed for ${sid} (session kept for recovery)`);
     };
 
@@ -260,14 +324,20 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       .catch((error) => console.warn("[MCP] Upstream tool refresh failed:", error));
 
     const sid = transport.sessionId ?? preferredSessionId ?? randomUUID();
-    return (
-      sessions[sid] ?? {
-        transport,
-        server: mcpServer,
-        lastAccessedAt: Date.now(),
-        createdAt: Date.now(),
-      }
-    );
+    const initialized = sessions[sid];
+    // During immediate recovery after a client DELETE, the grace window can
+    // intentionally retain the old closed session under the same ID. Never
+    // return that closed transport as the newly-built pending recovery session.
+    // Once this transport actually initializes, onsessioninitialized replaces
+    // the retained entry atomically.
+    if (initialized?.transport === transport) return initialized;
+    return {
+      transport,
+      server: mcpServer,
+      lastAccessedAt: Date.now(),
+      createdAt: initialized?.createdAt ?? Date.now(),
+      closed: false,
+    };
   }
 
   async function warmUpRecoveredSession(
@@ -285,7 +355,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         params: {
           protocolVersion,
           capabilities: {},
-          clientInfo: { name: "codex-mcp-session-recovery", version: "1.0.0" },
+          clientInfo: { name: "chatgpt-local-coder-session-recovery", version: "1.0.0" },
         },
       },
       staleSessionId
@@ -316,15 +386,71 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     return Boolean(sessions[staleSessionId]);
   }
 
+  async function ensureRecoveredSession(
+    staleSessionId: string,
+    mcpPath: string,
+    protocolVersion: string
+  ): Promise<McpSession | undefined> {
+    const existing = sessions[staleSessionId];
+    if (existing && !existing.closed) return existing;
+
+    const inFlight = recoveryFlights.get(staleSessionId);
+    if (inFlight) return inFlight;
+
+    const recovery = (async () => {
+      let pending: McpSession | undefined;
+      try {
+        console.log(`[MCP] Attempting session recovery for stale ID: ${staleSessionId}`);
+        pending = await buildSession(staleSessionId);
+        pendingRecoveries[staleSessionId] = pending;
+
+        const warmed = await warmUpRecoveredSession(staleSessionId, mcpPath, protocolVersion);
+        if (!warmed) {
+          clearPendingRecovery(staleSessionId);
+          if (sessions[staleSessionId]) removeSession(staleSessionId, "recovery failed");
+          else await pending.server.close().catch(() => undefined);
+          return undefined;
+        }
+
+        const recovered = sessions[staleSessionId];
+        if (!recovered) {
+          clearPendingRecovery(staleSessionId);
+          await pending.server.close().catch(() => undefined);
+          return undefined;
+        }
+
+        touch(staleSessionId);
+        console.log(`[MCP] Session recovered: ${staleSessionId}`);
+        return recovered;
+      } catch (error) {
+        clearPendingRecovery(staleSessionId);
+        if (pending && !sessions[staleSessionId]) {
+          await pending.server.close().catch(() => undefined);
+        }
+        throw error;
+      }
+    })();
+
+    recoveryFlights.set(staleSessionId, recovery);
+    try {
+      return await recovery;
+    } finally {
+      if (recoveryFlights.get(staleSessionId) === recovery) {
+        recoveryFlights.delete(staleSessionId);
+      }
+    }
+  }
+
   return {
     get(sessionId: string) {
-      return sessions[sessionId];
+      const session = sessions[sessionId];
+      return session?.closed ? undefined : session;
     },
 
     touch,
 
     count() {
-      return Object.keys(sessions).length;
+      return Object.values(sessions).filter((session) => !session.closed).length;
     },
 
     sendSessionNotFound(res: Response, requestId: string | number | null = null) {
@@ -406,31 +532,12 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         return false;
       }
 
-      console.log(`[MCP] Attempting session recovery for stale ID: ${staleSessionId}`);
-
       const protocolVersion = negotiateProtocolVersion(
         req.headers["mcp-protocol-version"] as string | undefined
       );
       const mcpPath = req.path || "/mcp";
-
-      const pending = await buildSession(staleSessionId);
-      pendingRecoveries[staleSessionId] = pending;
-
-      const warmed = await warmUpRecoveredSession(staleSessionId, mcpPath, protocolVersion);
-      if (!warmed) {
-        clearPendingRecovery(staleSessionId);
-        removeSession(staleSessionId, "recovery failed");
-        return false;
-      }
-
-      const recovered = sessions[staleSessionId];
-      if (!recovered) {
-        clearPendingRecovery(staleSessionId);
-        return false;
-      }
-
-      touch(staleSessionId);
-      console.log(`[MCP] Session recovered: ${staleSessionId}`);
+      const recovered = await ensureRecoveredSession(staleSessionId, mcpPath, protocolVersion);
+      if (!recovered) return false;
 
       const patchedReq = withSessionIdHeader(req, staleSessionId, protocolVersion);
       await enqueueSessionOp(staleSessionId, async () => {

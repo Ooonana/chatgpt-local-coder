@@ -224,7 +224,7 @@ export class McpUpstreamManager {
     transport: StdioClientTransport | StreamableHTTPClientTransport;
     pid: number | null;
   }> {
-    const client = new Client({ name: "codex-mcp-hub", version: "2.0.0" });
+    const client = new Client({ name: "chatgpt-local-coder-hub", version: "2.0.0" });
 
     if (config.transport === "stdio") {
       const transport = new StdioClientTransport({

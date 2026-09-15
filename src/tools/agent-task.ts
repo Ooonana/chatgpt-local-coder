@@ -4,6 +4,7 @@ import { validatePath } from "../lib/path-security.js";
 import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
+import { requireWriteAllowed } from "../lib/permissions.js";
 import {
   createAgentTask,
   getAgentTask,
@@ -45,6 +46,8 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
         if (!task) throw new Error(`Unknown agent task id: ${id}`);
         return toolResult("agent_task", { action, task }, { summary: `${task.title} — ${task.status}` });
       }
+
+      requireWriteAllowed();
 
       if (action === "start") {
         if (!objective?.trim()) throw new Error("objective is required for start");

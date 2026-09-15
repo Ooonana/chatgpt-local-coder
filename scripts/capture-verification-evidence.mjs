@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "url";
+import { getFreePorts } from "./free-port.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -82,8 +83,7 @@ await runCommand("npm", ["test"], "npm-test-1.log");
 console.log("Running npm test (pass 2)...");
 await runCommand("npm", ["test"], "npm-test-2.log");
 
-const mcpPort = 4500 + Math.floor(Math.random() * 100);
-const adminPort = mcpPort + 1;
+const [mcpPort, adminPort] = await getFreePorts(2);
 
 console.log(`Capturing boot evidence mcp=${mcpPort} admin=${adminPort}...`);
 await captureBoot("1", mcpPort, adminPort);

@@ -34,6 +34,9 @@ function openExternal(url: string): void {
       : process.platform === "darwin"
         ? spawn("open", [url], { detached: true, stdio: "ignore" })
         : spawn("xdg-open", [url], { detached: true, stdio: "ignore" });
+    // spawn failures are asynchronous; a try/catch alone does not catch ENOENT.
+    // Browser launch is optional, so consume the error and leave the URL in Admin UI.
+    child.once("error", () => {});
     child.unref();
   } catch {
     // The Admin UI also exposes the authorization URL, so browser launch failure is non-fatal.

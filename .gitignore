@@ -3,11 +3,13 @@ dist/
 .mcp-audit.log
 .mcp-checkpoints/
 .tool-test-tmp/
+.tool-test-pack.json
 bin/
 profiles/*
 !profiles/mcp-upstream.json
 !profiles/post-edit-hooks.json
 !profiles/chatgpt-connector-description.txt
+!profiles/*.example.json
 .mcp-state/
 .mcp-oauth/
 .codex-remote-attachments/

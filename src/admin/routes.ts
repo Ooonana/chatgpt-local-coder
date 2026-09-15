@@ -15,6 +15,26 @@ import { getCheckpointConfig } from "../lib/checkpoint.js";
 import { getLocalPluginsConfig, saveLocalPluginsConfig } from "../lib/plugin-config.js";
 import { getCodexHooks, saveCodexHooks } from "../lib/codex-hooks.js";
 import {
+  describePermissionProfile,
+  getPermissionConfig,
+  getPermissionConfigPath,
+  savePermissionConfig,
+} from "../lib/permissions.js";
+import {
+  getLocalHooksConfig,
+  getLocalHooksConfigPath,
+  saveLocalHooksConfig,
+} from "../lib/local-hooks.js";
+import {
+  getSubagentConfig,
+  getSubagentConfigPath,
+  listSubagents,
+  saveSubagentConfig,
+} from "../lib/subagent-manager.js";
+import { getRuntimeSnapshot } from "../lib/runtime-state.js";
+import { getManagedProcessSnapshot } from "../tools/shell.js";
+import { getPtySessionSnapshot } from "../tools/pty.js";
+import {
   LOCAL_TOOL_CATALOG,
   getLocalToolOverrides,
   saveLocalToolOverrides,
@@ -71,6 +91,8 @@ function serializeDotEnv(values: Record<string, string>, original: string): stri
 export function createAdminRouter(manager: McpUpstreamManager, options: {
   mcpPort: number;
   pid: number;
+  transportMode: "sse" | "json";
+  keepAliveMs: number;
   sessionCount: () => number;
   instructionSummary?: () => Record<string, unknown>;
   instructionsPreview?: () => string;
@@ -82,15 +104,35 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     const upstream = await manager.listStatuses();
     res.json({
       status: "ok",
-      name: "codex-mcp-admin",
+      name: "chatgpt-local-coder-admin",
       pid: options.pid,
       mcp_port: options.mcpPort,
+      transport_mode: options.transportMode,
+      sse_keepalive_ms: options.transportMode === "sse" ? options.keepAliveMs : null,
       active_sessions: options.sessionCount(),
       default_cwd: getDefaultCwd(),
       full_disk_access: getFullDiskAccess(),
+      permission: describePermissionProfile(),
       upstream,
       checkpoint: getCheckpointConfig(),
       instructions: options.instructionSummary?.() ?? null,
+    });
+  });
+
+  router.get("/api/runtime", (_req, res) => {
+    const memory = process.memoryUsage();
+    const subagents = listSubagents().map(({ stdout: _stdout, stderr: _stderr, ...item }) => item);
+    res.json({
+      ok: true,
+      runtime: getRuntimeSnapshot(),
+      processes: getManagedProcessSnapshot(),
+      ptys: getPtySessionSnapshot(),
+      subagents,
+      memory: {
+        rss_bytes: memory.rss,
+        heap_used_bytes: memory.heapUsed,
+        heap_total_bytes: memory.heapTotal,
+      },
     });
   });
 
@@ -156,6 +198,83 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     res.json({ ok: true, config: next, restart_required: "Open a new ChatGPT MCP session after changing plugin state." });
   });
 
+  router.get("/api/permissions", (_req, res) => {
+    res.json({
+      ok: true,
+      path: getPermissionConfigPath(),
+      config: getPermissionConfig(),
+      description: describePermissionProfile(),
+      restart_required: false,
+    });
+  });
+
+  router.put("/api/permissions", (req, res) => {
+    try {
+      const config = savePermissionConfig(req.body?.config ?? req.body ?? {});
+      res.json({
+        ok: true,
+        path: getPermissionConfigPath(),
+        config,
+        description: describePermissionProfile(),
+        restart_required: false,
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/hooks", async (_req, res) => {
+    try {
+      res.json({ ok: true, path: getLocalHooksConfigPath(), config: await getLocalHooksConfig() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.put("/api/hooks", async (req, res) => {
+    try {
+      const config = await saveLocalHooksConfig(req.body?.config ?? req.body ?? {});
+      res.json({ ok: true, path: getLocalHooksConfigPath(), config, restart_required: false });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get("/api/subagents", async (_req, res) => {
+    try {
+      const config = await getSubagentConfig();
+      res.json({
+        ok: true,
+        path: getSubagentConfigPath(),
+        config: { ...config, env: undefined },
+        env_keys: Object.keys(config.env ?? {}),
+        chatgpt_subscription_reuse: false,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.put("/api/subagents", async (req, res) => {
+    try {
+      const submitted = req.body?.config ?? req.body ?? {};
+      const current = await getSubagentConfig();
+      const config = await saveSubagentConfig({
+        ...submitted,
+        env: submitted.env === undefined ? current.env : submitted.env,
+      });
+      res.json({
+        ok: true,
+        path: getSubagentConfigPath(),
+        config: { ...config, env: undefined },
+        env_keys: Object.keys(config.env ?? {}),
+        chatgpt_subscription_reuse: false,
+        restart_required: false,
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
   router.get("/api/codex-hooks", async (_req, res) => {
     try {
       res.json({ ok: true, hooks: await getCodexHooks() });

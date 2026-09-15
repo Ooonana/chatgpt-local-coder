@@ -69,7 +69,7 @@ try {
   }
   ok("high-value local developer tools exposed in slim");
 
-  for (const t of ["git_worktree", "agent_task"]) {
+  for (const t of ["git_worktree", "agent_task", "subagent"]) {
     if (!shouldExposeTool(t, "slim")) throw new Error(`${t} missing from slim`);
     if (!LOCAL_TOOL_CATALOG.includes(t)) throw new Error(`${t} missing from local catalog`);
   }

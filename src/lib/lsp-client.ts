@@ -3,6 +3,7 @@ import fsp from "fs/promises";
 import path from "path";
 import { pathToFileURL, fileURLToPath } from "url";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "child_process";
+import { boundDiagnosticValue } from "./bounded-value.js";
 
 export type LspServerId = "typescript" | "pyright" | "clangd" | "rust-analyzer" | "gopls";
 
@@ -82,6 +83,8 @@ const LANGUAGE_ID_BY_EXTENSION: Record<string, string> = {
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const sessions = new Map<string, LspClient>();
+const MAX_LSP_DOCUMENT_BYTES = 8 * 1024 * 1024;
+const MAX_LSP_MESSAGE_BYTES = 16 * 1024 * 1024;
 
 function localBinPath(executable: string): string | null {
   const suffix = process.platform === "win32" ? ".cmd" : "";
@@ -292,6 +295,19 @@ class LspClient {
         continue;
       }
       const length = Number(match[1]);
+      if (!Number.isFinite(length) || length < 0 || length > MAX_LSP_MESSAGE_BYTES) {
+        const error = new Error(
+          `LSP server ${this.serverId} sent an invalid/oversized message (${match[1]} bytes)`
+        );
+        this.buffer = Buffer.alloc(0);
+        for (const pending of this.pending.values()) {
+          clearTimeout(pending.timer);
+          pending.reject(error);
+        }
+        this.pending.clear();
+        this.child?.kill();
+        return;
+      }
       const bodyStart = headerEnd + 4;
       if (this.buffer.length < bodyStart + length) return;
       const body = this.buffer.subarray(bodyStart, bodyStart + length).toString("utf8");
@@ -310,7 +326,10 @@ class LspClient {
       if (method === "textDocument/publishDiagnostics") {
         const params = message.params as { uri?: string; diagnostics?: unknown[] } | undefined;
         if (params?.uri) {
-          const diagnostics = Array.isArray(params.diagnostics) ? params.diagnostics : [];
+          const diagnostics = boundDiagnosticValue(
+            Array.isArray(params.diagnostics) ? params.diagnostics : [],
+            { maxStringChars: 20_000, maxArrayItems: 500, maxObjectKeys: 200, maxDepth: 8 }
+          ) as unknown[];
           this.diagnostics.set(params.uri, diagnostics);
           const waiters = this.diagnosticWaiters.get(params.uri) || [];
           this.diagnosticWaiters.delete(params.uri);
@@ -356,6 +375,14 @@ class LspClient {
   async openDocument(filePath: string): Promise<string> {
     await this.start();
     const uri = pathToFileURL(filePath).href;
+    const stat = await fsp.stat(filePath);
+    if (!stat.isFile()) throw new Error("LSP path is not a regular file");
+    if (stat.size > MAX_LSP_DOCUMENT_BYTES) {
+      throw new Error(
+        `LSP document is too large (${stat.size} bytes; max ${MAX_LSP_DOCUMENT_BYTES}). ` +
+        "Use grep/read ranges or a specialized tool for generated/very large files."
+      );
+    }
     const text = await fsp.readFile(filePath, "utf8");
     const languageId = languageIdForPath(filePath);
     const previous = this.openVersions.get(uri);

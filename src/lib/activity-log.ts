@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "fs/promises";
 import { getAuditPath } from "./audit.js";
+import { boundDiagnosticValue } from "./bounded-value.js";
 
 export type ActivityKind = "tool" | "mcp" | "session" | "system";
 
@@ -19,9 +20,18 @@ export interface ActivityEntry {
   details?: Record<string, unknown>;
 }
 
-const MAX_ENTRIES = parseInt(process.env.ACTIVITY_LOG_MAX || "500", 10);
+const MAX_ENTRIES = (() => {
+  const parsed = Number(process.env.ACTIVITY_LOG_MAX || 500);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 500;
+  return Math.min(Math.max(Math.trunc(parsed), 20), 5_000);
+})();
 const entries: ActivityEntry[] = [];
 const listeners = new Set<(entry: ActivityEntry) => void>();
+let activityConsoleEnabled = true;
+
+export function setActivityConsoleEnabled(enabled: boolean): void {
+  activityConsoleEnabled = enabled;
+}
 
 function trimSummary(text: string, max = 160): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
@@ -32,7 +42,28 @@ export function summarizeToolArgs(tool: string, args: unknown): string {
   if (!args || typeof args !== "object") return "";
   const a = args as Record<string, unknown>;
 
-  if (tool === "run_command" && typeof a.command === "string") return trimSummary(a.command, 120);
+  if (["run_command", "start_process"].includes(tool) && typeof a.command === "string") {
+    return trimSummary(a.command, 120);
+  }
+  if (tool === "run_commands_parallel" && Array.isArray(a.commands)) {
+    const concurrency = typeof a.concurrency === "number" ? ` · concurrency ${a.concurrency}` : "";
+    return `${a.commands.length} command(s)${concurrency}`;
+  }
+  if (tool === "pty") {
+    const action = typeof a.action === "string" ? a.action : "action";
+    const command = typeof a.command === "string" ? ` · ${trimSummary(a.command, 90)}` : "";
+    const id = typeof a.id === "string" ? ` · ${a.id}` : "";
+    return `${action}${id}${command}`;
+  }
+  if (tool === "subagent") {
+    const action = typeof a.action === "string" ? a.action : "action";
+    const label = typeof a.label === "string" && a.label ? ` · ${a.label}` : "";
+    const objective = typeof a.objective === "string" ? ` · ${trimSummary(a.objective, 90)}` : "";
+    return `${action}${label}${objective}`;
+  }
+  if (["process_status", "process_output", "process_input", "stop_process"].includes(tool) && typeof a.id === "string") {
+    return a.id;
+  }
   if (typeof a.path === "string") return a.path;
   if (typeof a.server_id === "string" && typeof a.tool === "string") {
     return `${a.server_id} → ${a.tool}`;
@@ -53,12 +84,20 @@ export function appendActivity(partial: Omit<ActivityEntry, "id" | "time"> & { t
     id: randomUUID(),
     time: partial.time ?? new Date().toISOString(),
     ...partial,
+    details: partial.details
+      ? boundDiagnosticValue(partial.details, {
+          maxStringChars: 2_000,
+          maxArrayItems: 40,
+          maxObjectKeys: 80,
+          maxDepth: 5,
+        }) as Record<string, unknown>
+      : undefined,
   };
 
   entries.push(entry);
   while (entries.length > MAX_ENTRIES) entries.shift();
 
-  writeConsole(entry);
+  if (activityConsoleEnabled) writeConsole(entry);
   for (const listener of listeners) {
     try {
       listener(entry);

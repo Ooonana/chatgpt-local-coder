@@ -55,7 +55,7 @@ ${stack.length ? stack.map((c) => `- \`${c}\``).join("\n") : "- <!-- add build/t
 ## Architecture
 <!-- Key directories and how they connect -->
 
-## ChatGPT + Codex MCP
+## ChatGPT Local Coder
 - WORKSPACE_PATH should point to this directory
 - Tag connector **@Local Coder** in every ChatGPT message
 `;

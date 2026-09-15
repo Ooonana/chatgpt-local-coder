@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -16,6 +15,8 @@ import {
   createSessionManager,
   extractRequestId,
   isInitializeRequest,
+  MCP_JSON_RESPONSE,
+  MCP_SSE_KEEPALIVE_MS,
 } from "./lib/mcp-session-manager.js";
 import { initUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { startAdminServer } from "./admin/server.js";
@@ -28,6 +29,13 @@ import {
 import { getChatGptToolProfile } from "./lib/tool-profile.js";
 import { shutdownLspSessions } from "./lib/lsp-client.js";
 import { shutdownPtySessions } from "./tools/pty.js";
+import { shutdownManagedProcesses } from "./tools/shell.js";
+import {
+  describePermissionProfile,
+  setPermissionWorkspaceRoots,
+} from "./lib/permissions.js";
+import { shutdownSubagents } from "./lib/subagent-manager.js";
+import { startTerminalDashboard } from "./lib/terminal-dashboard.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -60,6 +68,7 @@ function resolveWorkspaceRoots(): string[] {
 const workspaceRoots = resolveWorkspaceRoots();
 const workspaceRoot = workspaceRoots[0] || process.cwd();
 setDefaultCwd(workspaceRoot);
+setPermissionWorkspaceRoots(workspaceRoots);
 
 const upstreamManager = await initUpstreamManager();
 
@@ -97,7 +106,33 @@ const sessionManager = createSessionManager({
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+// The secure MCP tunnel has a 10 MiB request/response ceiling. Keep the local
+// parser below that too so direct/local clients get a deterministic rejection
+// instead of letting unusually large JSON bodies consume excessive memory.
+app.use(express.json({ limit: "9mb" }));
+app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const bodyError = err as { type?: string; status?: number; message?: string } | undefined;
+  if (bodyError?.type === "entity.too.large" || bodyError?.status === 413) {
+    res.status(413).json({
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32002,
+        message: "Request body is too large. Keep MCP requests below 9 MiB and chunk large file/content operations.",
+      },
+    });
+    return;
+  }
+  if (bodyError instanceof SyntaxError || bodyError?.status === 400) {
+    res.status(400).json({
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32700, message: "Invalid JSON request body" },
+    });
+    return;
+  }
+  next(err);
+});
 // ChatGPT may call either "/" or "/mcp" — support both.
 // When MCP_TOKEN is set, only the tokenized endpoints "/<token>" and
 // "/mcp/<token>" are valid; unguarded paths are handled below.
@@ -165,13 +200,16 @@ if (MCP_TOKEN) {
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
-    name: "codex-mcp-server",
+    name: "chatgpt-local-coder",
     workspace: workspaceRoot,
     defaultCwd: getDefaultCwd(),
-    fullMachineAccess: true,
+    fullMachineAccess: getFullDiskAccess(),
+    permission: describePermissionProfile(),
     fullDiskAccess: getFullDiskAccess(),
     activeSessions: sessionManager.count(),
     sessionRecovery: SESSION_RECOVERY,
+    transportMode: MCP_JSON_RESPONSE ? "json" : "sse",
+    sseKeepAliveMs: MCP_JSON_RESPONSE ? null : MCP_SSE_KEEPALIVE_MS,
     mcpEndpoints: DISPLAY_MCP_PATHS,
     instructions: summarizeInstructionContext(instructionContext),
   });
@@ -296,18 +334,46 @@ for (const mcpPath of MCP_PATHS) {
 
 sessionManager.startCleanup();
 
+let server: ReturnType<typeof app.listen> | undefined;
 const adminServer = startAdminServer({
   port: ADMIN_PORT,
   host: "127.0.0.1",
   mcpPort: PORT,
   pid: process.pid,
+  transportMode: MCP_JSON_RESPONSE ? "json" : "sse",
+  keepAliveMs: MCP_SSE_KEEPALIVE_MS,
   manager: upstreamManager,
   sessionCount: () => sessionManager.count(),
   instructionSummary: () => summarizeInstructionContext(instructionContext),
   instructionsPreview: () => instructionContext.instructionsText,
 });
+adminServer.on("error", (err: NodeJS.ErrnoException) => {
+  shutdown("admin server error", 1, err);
+});
 
-const server = app.listen(PORT, HOST, () => {
+let terminalDashboard: ReturnType<typeof startTerminalDashboard> = {
+  active: false,
+  renderNow: () => {},
+  stop: () => {},
+};
+
+server = app.listen(PORT, HOST, () => {
+  terminalDashboard = startTerminalDashboard({
+    mcpPort: PORT,
+    adminPort: ADMIN_PORT,
+    workspace: workspaceRoot,
+    toolProfile: getChatGptToolProfile(),
+    authEnabled: Boolean(MCP_TOKEN),
+    permission: describePermissionProfile(),
+    transportMode: MCP_JSON_RESPONSE ? "json" : "sse",
+    keepAliveMs: MCP_SSE_KEEPALIVE_MS,
+    sessionCount: () => sessionManager.count(),
+  });
+  if (terminalDashboard.active) {
+    terminalDashboard.renderNow();
+    return;
+  }
+
   console.log("");
   console.log("========================================");
   console.log("  ChatGPT Local Coder MCP");
@@ -318,8 +384,9 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`  Health:    http://${HOST}:${PORT}/health`);
   console.log(`  Admin UI:  http://127.0.0.1:${ADMIN_PORT}/ui`);
   console.log(`  Default cwd: ${workspaceRoot}`);
-  console.log(`  Full machine access: ON (no path restrictions)`);
+  console.log(`  Permission: ${describePermissionProfile()}`);
   console.log(`  Session recovery: ${SESSION_RECOVERY ? "ON" : "OFF"}`);
+  console.log(`  Transport: ${MCP_JSON_RESPONSE ? "JSON response" : `SSE keepalive ${MCP_SSE_KEEPALIVE_MS / 1000}s`}`);
   console.log(`  Auth:      ${MCP_TOKEN ? "ON (MCP_TOKEN in URL path)" : "OFF — set MCP_TOKEN in .env!"}`);
   console.log(`  PID:       ${process.pid}`);
   console.log("========================================");
@@ -337,21 +404,53 @@ server.on("error", (err: NodeJS.ErrnoException) => {
   } else {
     console.error("\n[ERROR] Could not start the server:", err.message, "\n");
   }
-  process.exit(1);
+  shutdown("MCP server error", 1, err);
 });
 
-process.on("SIGINT", () => {
-  console.log("\n[STOP] Server is shutting down...");
+let shuttingDown = false;
+function shutdown(signal: string, exitCode = 0, fatalError?: unknown): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  process.exitCode = exitCode;
+  terminalDashboard.stop();
+  if (fatalError !== undefined) {
+    console.error(`\n[FATAL] ${signal}:`, fatalError);
+  }
+  console.log(`\n[STOP] Server is shutting down (${signal})...`);
   sessionManager.stopCleanup();
+  const hardExit = setTimeout(() => process.exit(exitCode || 1), 7_500);
+  hardExit.unref?.();
   void Promise.allSettled([
     upstreamManager.shutdown(),
     shutdownLspSessions(),
     shutdownPtySessions(),
+    shutdownManagedProcesses(),
+    shutdownSubagents(),
   ]).finally(() => {
-    adminServer.close();
-    server.close(() => process.exit(0));
+    try {
+      adminServer.close();
+    } catch {}
+    if (!server) {
+      clearTimeout(hardExit);
+      process.exit(exitCode);
+      return;
+    }
+    try {
+      server.close(() => {
+        clearTimeout(hardExit);
+        process.exit(exitCode);
+      });
+    } catch {
+      clearTimeout(hardExit);
+      process.exit(exitCode);
+    }
   });
-});
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("uncaughtException", (error) => shutdown("uncaughtException", 1, error));
+process.on("unhandledRejection", (reason) => shutdown("unhandledRejection", 1, reason));
 
 // Keep the process alive when stdin closes on Windows.
 if (process.stdin.isTTY) {

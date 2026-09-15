@@ -2,6 +2,8 @@
  * Integration test: MCP session init, tool call, stale-session recovery.
  * Requires server running on PORT (default 3000).
  */
+import { parseMcpResponseText } from "./mcp-test-response.mjs";
+
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const BASE = `http://127.0.0.1:${PORT}`;
 
@@ -28,13 +30,23 @@ async function mcpPost(path, body, sessionId, extraHeaders = {}) {
 
   const res = await fetch(`${BASE}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
   const text = await res.text();
-  let json;
+  let json = null;
   try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
+    json = parseMcpResponseText(text, res.headers.get("content-type") || "");
+  } catch {}
   return { status: res.status, headers: res.headers, text, json };
+}
+
+async function mcpDelete(path, sessionId) {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "DELETE",
+    headers: {
+      Accept: "application/json, text/event-stream",
+      "mcp-session-id": sessionId,
+      "mcp-protocol-version": "2025-03-26",
+    },
+  });
+  return { status: res.status, text: await res.text() };
 }
 
 async function run(name, fn) {
@@ -68,11 +80,12 @@ async function initialize(path = "/mcp") {
   return { sessionId, json };
 }
 
+let health;
 await run("health endpoint", async () => {
   const res = await fetch(`${BASE}/health`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  if (data.status !== "ok") throw new Error(JSON.stringify(data));
+  health = await res.json();
+  if (health.status !== "ok") throw new Error(JSON.stringify(health));
 });
 
 let sessionId;
@@ -112,6 +125,74 @@ await run("stale session auto-recovery", async () => {
     throw new Error(`expected recovery HTTP 200, got ${status}: ${JSON.stringify(json)}`);
   }
   if (!json?.result) throw new Error(`recovery missing result: ${JSON.stringify(json)}`);
+});
+
+await run("parallel stale requests share one recovery", async () => {
+  const fakeId = "00000000-0000-4000-8000-000000000077";
+  const headers = { "mcp-protocol-version": "2025-03-26" };
+  const request = (id, marker) => mcpPost(
+    "/mcp",
+    {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name: "run_command", arguments: { command: `echo ${marker}` } },
+    },
+    fakeId,
+    headers
+  );
+
+  const [a, b] = await Promise.all([
+    request(31, "parallel-recovery-a"),
+    request(32, "parallel-recovery-b"),
+  ]);
+  for (const [label, result] of [["a", a], ["b", b]]) {
+    if (result.status !== 200 || !result.json?.result) {
+      throw new Error(`${label} recovery failed: HTTP ${result.status} ${JSON.stringify(result.json)}`);
+    }
+  }
+});
+
+await run("client DELETE can recover immediately without grace-window poisoning", async () => {
+  const dedicated = await initialize("/mcp");
+  const deleted = await mcpDelete("/mcp", dedicated.sessionId);
+  if (deleted.status < 200 || deleted.status >= 300) {
+    throw new Error(`DELETE failed HTTP ${deleted.status}: ${deleted.text}`);
+  }
+  const recovered = await mcpPost(
+    "/mcp",
+    {
+      jsonrpc: "2.0",
+      id: 33,
+      method: "tools/call",
+      params: { name: "run_command", arguments: { command: "echo delete-recovery-ok" } },
+    },
+    dedicated.sessionId,
+    { "mcp-protocol-version": "2025-03-26" }
+  );
+  if (recovered.status !== 200 || !recovered.json?.result) {
+    throw new Error(`post-DELETE recovery failed: HTTP ${recovered.status} ${recovered.text.slice(0, 500)}`);
+  }
+});
+
+await run("oversized JSON request fails locally with bounded 413 response", async () => {
+  const huge = "x".repeat(9 * 1024 * 1024);
+  const res = await fetch(`${BASE}/mcp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 34,
+      method: "tools/call",
+      params: { name: "write_file", arguments: { path: "oversized.txt", content: huge } },
+    }),
+  });
+  const text = await res.text();
+  if (res.status !== 413) throw new Error(`expected HTTP 413, got ${res.status}: ${text.slice(0, 300)}`);
+  const json = JSON.parse(text);
+  if (!String(json?.error?.message || "").includes("below 9 MiB")) {
+    throw new Error(`unexpected 413 body: ${text.slice(0, 300)}`);
+  }
 });
 
 await run("re-initialize with stale session header", async () => {
@@ -156,6 +237,51 @@ await run("run_command after re-init", async () => {
   if (!text.includes("mcp-ok") && !json?.result?.content) {
     throw new Error(`unexpected result: ${text.slice(0, 300)}`);
   }
+});
+
+await run("long tool call stays alive with SSE keepalives", async () => {
+  if (health?.transportMode !== "sse") throw new Error(`expected SSE transport, got ${health?.transportMode}`);
+  if (!Number.isFinite(health?.sseKeepAliveMs) || health.sseKeepAliveMs > 2_000) {
+    throw new Error(`test server keepalive must be <=2s, got ${health?.sseKeepAliveMs}`);
+  }
+
+  const headers = {
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+    "mcp-session-id": sessionId,
+    "mcp-protocol-version": "2025-03-26",
+  };
+  const command = process.platform === "win32"
+    ? "Start-Sleep -Seconds 3; Write-Output MCP_KEEPALIVE_OK"
+    : "sleep 3; echo MCP_KEEPALIVE_OK";
+  const res = await fetch(`${BASE}/mcp`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 6,
+      method: "tools/call",
+      params: { name: "run_command", arguments: { command } },
+    }),
+  });
+  if (res.status !== 200 || !res.body) throw new Error(`HTTP ${res.status}`);
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) throw new Error(`expected SSE Content-Type, got ${contentType}`);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let keepalives = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+    keepalives = (text.match(/: keepalive/g) || []).length;
+  }
+  text += decoder.decode();
+  const json = parseMcpResponseText(text, contentType);
+  if (keepalives < 1) throw new Error(`no SSE keepalive observed: ${JSON.stringify(text.slice(0, 500))}`);
+  if (!JSON.stringify(json).includes("MCP_KEEPALIVE_OK")) throw new Error(`missing final tool result: ${JSON.stringify(json)}`);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

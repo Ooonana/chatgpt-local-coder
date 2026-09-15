@@ -6,14 +6,14 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "node:child_process";
+import { parseMcpResponseText } from "./mcp-test-response.mjs";
+import { getFreePorts } from "./free-port.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
 const scratch = process.env.GOAL_SCRATCH || path.join(root, ".tool-test-tmp", "bridge-integration");
 
-const mcpPort = 4100 + Math.floor(Math.random() * 200);
-const adminPort = mcpPort + 1;
-const mockPort = mcpPort + 2;
+const [mcpPort, adminPort, mockPort] = await getFreePorts(3);
 const tmpDir = path.join(scratch, `run-${mcpPort}`);
 
 function spawnNode(script, env = {}) {
@@ -54,9 +54,9 @@ async function mcpPost(base, body, sessionId, extraHeaders = {}) {
   const text = await res.text();
   let json = null;
   try {
-    json = text ? JSON.parse(text) : null;
+    json = text ? parseMcpResponseText(text, res.headers.get("content-type") || "") : null;
   } catch {
-    throw new Error(`invalid JSON from ${base}/mcp: ${text.slice(0, 300)}`);
+    throw new Error(`invalid MCP response from ${base}/mcp: ${text.slice(0, 300)}`);
   }
   return { status: res.status, headers: res.headers, json, text };
 }
@@ -102,7 +102,14 @@ const mockHttp = spawnNode(path.join(root, "scripts/mock-http-mcp.mjs"), { MOCK_
 const hub = spawnNode(path.join(root, "dist/index.js"), {
   PORT: String(mcpPort),
   ADMIN_PORT: String(adminPort),
+  MCP_TOKEN: "",
+  ADMIN_TOKEN: "",
+  LOCAL_CODER_TUI: "off",
+  CHATGPT_TOOL_PROFILE: "full",
   MCP_UPSTREAM_CONFIG: configPath,
+  PERMISSIONS_CONFIG: path.join(tmpDir, "permissions.json"),
+  LOCAL_HOOKS_CONFIG: path.join(tmpDir, "hooks.json"),
+  SUBAGENT_CONFIG: path.join(tmpDir, "subagents.json"),
   WORKSPACE_PATH: root,
 });
 
@@ -217,7 +224,9 @@ try {
 
   const proxied = await callTool(`http://127.0.0.1:${mcpPort}`, sessionId, "mockhttp__add", { a: 1, b: 2 });
   const proxiedPayload = JSON.parse(proxied.result.content[0].text);
-  if (!proxiedPayload.ok) throw new Error(JSON.stringify(proxiedPayload));
+  if (proxiedPayload !== 3) {
+    throw new Error(`transparent proxy result mismatch: ${JSON.stringify(proxiedPayload)}`);
+  }
 
   const adminHtml = await (await fetch(`http://127.0.0.1:${adminPort}/ui/`)).text();
   if (!adminHtml.includes("Import") || !adminHtml.includes("Claude Code") || !adminHtml.includes("OpenCode")) {

@@ -7,7 +7,10 @@ import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+// Image data is base64-encoded in the MCP response (~4/3 expansion). Keep the
+// raw file below 5 MiB so the complete tool result remains comfortably below
+// the secure tunnel's 10 MiB body limit.
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 const MIME_BY_EXTENSION: Record<string, string> = {
   ".png": "image/png",
@@ -23,7 +26,7 @@ export function registerImageTools(server: McpServer): void {
     {
       title: "View Local Image",
       description:
-        "Load a local PNG/JPEG/WEBP/GIF and return it as MCP image content so ChatGPT can inspect an arbitrary image path on this machine. Prefer this over read_file_base64 for visual analysis.",
+        "Load a local PNG/JPEG/WEBP/GIF up to 5 MiB and return it as MCP image content so ChatGPT can inspect an arbitrary image path on this machine. Prefer this over read_file_base64 for visual analysis.",
       inputSchema: {
         path: z.string(),
       },

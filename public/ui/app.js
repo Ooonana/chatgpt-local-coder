@@ -6,6 +6,10 @@ const ENV_KEYS = [
   "CHATGPT_AUTO_APPROVE",
   "CHATGPT_TOOL_PROFILE",
   "SHELL_TIMEOUT",
+  "MCP_SESSION_RECOVERY",
+  "MCP_SESSION_DELETE_GRACE_MS",
+  "MCP_JSON_RESPONSE",
+  "MCP_SSE_KEEPALIVE_MS",
   "CHECKPOINT_ENABLED",
   "MCP_UPSTREAM_CONFIG",
   "POST_EDIT_HOOKS_CONFIG",
@@ -33,6 +37,8 @@ let activityPollTimer = null;
 let activityEventSource = null;
 let activitySeenIds = new Set();
 let activityPaused = false;
+let dashboardRuntimeTimer = null;
+let dashboardHealthCache = null;
 
 function toast(msg, isError = false) {
   const el = document.getElementById("toast");
@@ -67,8 +73,84 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
+function formatElapsed(ms) {
+  const value = Math.max(0, Number(ms) || 0);
+  if (value < 1000) return `${Math.round(value)}ms`;
+  if (value < 60_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}s`;
+  const minutes = Math.floor(value / 60_000);
+  const seconds = Math.floor((value % 60_000) / 1000);
+  if (minutes < 60) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+function lastRuntimeActivityMs(runtime) {
+  let latest = Number.NEGATIVE_INFINITY;
+  for (const item of runtime?.active || []) latest = Math.max(latest, Number(item.started_ms) || 0);
+  const recent = runtime?.recent?.[0]?.finished_at ? Date.parse(runtime.recent[0].finished_at) : Number.NaN;
+  if (Number.isFinite(recent)) latest = Math.max(latest, recent);
+  return Number.isFinite(latest) && latest > 0 ? latest : null;
+}
+
+function runtimeKind(kind) {
+  const value = String(kind || "MCP").toLowerCase();
+  return `<span class="runtime-kind ${esc(value)}">${esc(String(kind || "MCP"))}</span>`;
+}
+
+function renderRuntimeOverview(runtimeInfo) {
+  const runtime = runtimeInfo.runtime || {};
+  const now = Date.now();
+  const active = Array.isArray(runtime.active) ? runtime.active : [];
+  const recent = Array.isArray(runtime.recent) ? runtime.recent : [];
+  const workers = [runtimeInfo.processes, runtimeInfo.ptys, runtimeInfo.subagents]
+    .flatMap((items) => Array.isArray(items) ? items : [])
+    .filter((item) => item.running).length;
+  const latest = lastRuntimeActivityMs(runtime);
+
+  const lastTool = latest == null ? "Last tool —" : `Last tool ${formatElapsed(now - latest)} ago`;
+  document.getElementById("overview-last-tool").textContent = lastTool;
+  document.getElementById("overview-updated").textContent = `Updated ${new Date().toLocaleTimeString([], { hour12: false })}`;
+  document.getElementById("dash-active-count").textContent = String(active.length);
+  const dot = document.getElementById("overview-dot");
+  dot.className = `status-dot ${active.length ? "busy" : "online"}`;
+  document.getElementById("overview-state").textContent = active.length ? "Working" : "Online";
+
+  const activeStat = document.getElementById("stat-active-tools");
+  const workerStat = document.getElementById("stat-workers");
+  const callsStat = document.getElementById("stat-calls");
+  const errorsStat = document.getElementById("stat-errors");
+  if (activeStat) activeStat.textContent = String(active.length);
+  if (workerStat) workerStat.textContent = String(workers);
+  if (callsStat) callsStat.textContent = String(runtime.total_calls ?? 0);
+  if (errorsStat) errorsStat.textContent = String(runtime.total_errors ?? 0);
+
+  const activeEl = document.getElementById("dash-active");
+  activeEl.innerHTML = active.length
+    ? active.slice(0, 8).map((item) => `<div class="runtime-row">
+        ${runtimeKind(item.kind)}
+        <span class="runtime-tool" title="${esc(item.tool)}">${esc(item.tool)}</span>
+        <span class="runtime-summary" title="${esc(item.summary)}">${esc(item.summary || "processing")}</span>
+        <span class="runtime-time">${formatElapsed(now - item.started_ms)}</span>
+      </div>`).join("")
+    : '<div class="runtime-empty">Idle — waiting for ChatGPT tool calls.</div>';
+
+  const recentEl = document.getElementById("dash-recent");
+  recentEl.innerHTML = recent.length
+    ? recent.slice(0, 8).map((item) => {
+        const stateClass = item.status === "ok" ? "runtime-state-ok" : "runtime-state-error";
+        const summary = item.status === "error" ? (item.error || item.summary) : item.summary;
+        return `<div class="runtime-row">
+          ${runtimeKind(item.kind)}
+          <span class="runtime-tool ${stateClass}" title="${esc(item.tool)}">${esc(item.tool)}</span>
+          <span class="runtime-summary" title="${esc(summary)}">${esc(summary || item.status)}</span>
+          <span class="runtime-time">${formatElapsed(item.duration_ms)}</span>
+        </div>`;
+      }).join("")
+    : '<div class="runtime-empty">No completed tool calls in this server process yet.</div>';
+}
+
 function serversTable(rows, { actions = true } = {}) {
-  const controls = actions ? '<div class="btn-group" style="margin-bottom:12px"><button class="btn ghost" data-action="computer-use">Computer Use</button><button class="btn ghost" data-action="codex-hooks">Codex hooks</button><button class="btn ghost" data-action="local-tools">Local tools</button></div>' : '';
+  const controls = actions ? '<div class="btn-group" style="margin-bottom:12px"><button class="btn ghost" data-action="computer-use">Computer Use</button><button class="btn ghost" data-action="permissions">Permissions</button><button class="btn ghost" data-action="local-hooks">Local hooks</button><button class="btn ghost" data-action="subagents">Subagents</button><button class="btn ghost" data-action="codex-hooks">Codex hooks</button><button class="btn ghost" data-action="local-tools">Local tools</button></div>' : '';
   if (!rows.length) return controls + '<div class="empty">No upstream servers configured. Add one or import a configuration.</div>';
   const head = `<table><thead><tr>
     <th>Server</th><th>Transport</th><th>Status</th><th>Expose</th><th>Tools</th>
@@ -99,14 +181,30 @@ function serversTable(rows, { actions = true } = {}) {
 }
 
 async function loadDashboard() {
-  const health = await api("/health");
-  document.getElementById("conn-status").textContent = `MCP :${health.mcp_port} · ${health.active_sessions} sessions`;
+  const [health, runtimeInfo] = await Promise.all([api("/health"), api("/api/runtime")]);
+  dashboardHealthCache = health;
+  const transport = health.transport_mode === "sse"
+    ? `SSE · ${Math.round((health.sse_keepalive_ms || 0) / 1000)}s`
+    : "JSON";
+  const activeTools = runtimeInfo.runtime?.active?.length ?? 0;
+  const workers = [runtimeInfo.processes, runtimeInfo.ptys, runtimeInfo.subagents]
+    .flatMap((items) => Array.isArray(items) ? items : [])
+    .filter((item) => item.running).length;
+  const policy = String(health.permission || "open").split(":", 1)[0];
+  document.getElementById("conn-status").textContent = `MCP :${health.mcp_port} · ${transport} · ${health.active_sessions} sessions`;
   const instr = health.instructions || {};
   const memCount = instr.memory_files?.length ?? 0;
   const gitBranch = instr.git?.branch || (instr.git?.is_repo === false ? "—" : "?");
+  document.getElementById("overview-transport").textContent = `${transport} · :${health.mcp_port}`;
   document.getElementById("stat-grid").innerHTML = `
     <div class="stat"><div class="stat-label">MCP Port</div><div class="stat-value">${health.mcp_port}</div></div>
+    <div class="stat"><div class="stat-label">Transport</div><div class="stat-value">${esc(transport)}</div></div>
     <div class="stat"><div class="stat-label">Sessions</div><div class="stat-value">${health.active_sessions}</div></div>
+    <div class="stat"><div class="stat-label">Active tools</div><div class="stat-value" id="stat-active-tools">${activeTools}</div></div>
+    <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" id="stat-workers">${workers}</div></div>
+    <div class="stat"><div class="stat-label">Tool calls</div><div class="stat-value" id="stat-calls">${runtimeInfo.runtime?.total_calls ?? 0}</div></div>
+    <div class="stat"><div class="stat-label">Errors</div><div class="stat-value" id="stat-errors">${runtimeInfo.runtime?.total_errors ?? 0}</div></div>
+    <div class="stat"><div class="stat-label">Policy</div><div class="stat-value">${esc(policy)}</div></div>
     <div class="stat"><div class="stat-label">Project memory</div><div class="stat-value">${memCount} file(s)</div>
       <div class="stat-sub">${instr.instruction_bytes ? Math.round(instr.instruction_bytes / 1024) + " KB instructions" : ""}</div></div>
     <div class="stat"><div class="stat-label">Git branch</div><div class="stat-value" style="font-size:0.85rem">${esc(gitBranch)}</div></div>
@@ -114,6 +212,34 @@ async function loadDashboard() {
       <div class="stat-sub">${esc(health.default_cwd)}</div></div>`;
   document.getElementById("dash-servers").innerHTML = serversTable(health.upstream || [], { actions: false });
   document.getElementById("status-json").textContent = JSON.stringify(health, null, 2);
+  renderRuntimeOverview(runtimeInfo);
+}
+
+async function refreshDashboardRuntime() {
+  if (document.hidden || !document.getElementById("dashboard").classList.contains("active")) return;
+  try {
+    const runtimeInfo = await api("/api/runtime");
+    renderRuntimeOverview(runtimeInfo);
+    if (dashboardHealthCache) {
+      document.getElementById("conn-status").textContent =
+        `MCP :${dashboardHealthCache.mcp_port} · ${dashboardHealthCache.transport_mode?.toUpperCase()} · ${dashboardHealthCache.active_sessions} sessions`;
+    }
+  } catch {
+    const dot = document.getElementById("overview-dot");
+    dot.className = "status-dot error";
+    document.getElementById("overview-state").textContent = "Disconnected";
+  }
+}
+
+function startDashboardRuntimeLoop() {
+  if (dashboardRuntimeTimer) return;
+  dashboardRuntimeTimer = setInterval(() => refreshDashboardRuntime(), 1000);
+}
+
+function stopDashboardRuntimeLoop() {
+  if (!dashboardRuntimeTimer) return;
+  clearInterval(dashboardRuntimeTimer);
+  dashboardRuntimeTimer = null;
 }
 
 async function loadProject() {
@@ -150,6 +276,12 @@ function bindServerActions(container, config) {
           await loadServers();
         } else if (action === "computer-use") {
           await openComputerUseDialog();
+        } else if (action === "permissions") {
+          await openConfigEditor("permissions");
+        } else if (action === "local-hooks") {
+          await openConfigEditor("local-hooks");
+        } else if (action === "subagents") {
+          await openConfigEditor("subagents");
         } else if (action === "codex-hooks") {
           const r = await api("/api/codex-hooks");
           document.getElementById("codex-hooks-list").innerHTML = r.hooks.length
@@ -478,6 +610,48 @@ document.getElementById("save-computer-use").addEventListener("click", async () 
   toast(enabled ? "Computer Use enabled. Open a new MCP chat for the skill to appear." : "Computer Use disabled.");
 });
 
+const CONFIG_EDITORS = {
+  permissions: { endpoint: "/api/permissions", dialog: "permissions-dialog", editor: "permissions-json" },
+  "local-hooks": { endpoint: "/api/hooks", dialog: "local-hooks-dialog", editor: "local-hooks-json" },
+  subagents: { endpoint: "/api/subagents", dialog: "subagents-dialog", editor: "subagents-json" },
+};
+
+async function openConfigEditor(kind) {
+  const meta = CONFIG_EDITORS[kind];
+  const data = await api(meta.endpoint);
+  document.getElementById(meta.editor).value = JSON.stringify(data.config || {}, null, 2);
+  if (kind === "subagents") {
+    const keys = data.env_keys || [];
+    document.getElementById("subagents-env-keys").textContent = keys.length
+      ? `Configured environment keys (values hidden): ${keys.join(", ")}`
+      : "No subagent environment keys are configured.";
+  }
+  document.getElementById(meta.dialog).showModal();
+}
+
+async function saveConfigEditor(kind) {
+  const meta = CONFIG_EDITORS[kind];
+  let config;
+  try {
+    config = JSON.parse(document.getElementById(meta.editor).value || "{}");
+  } catch (error) {
+    throw new Error(`Invalid JSON: ${error.message}`);
+  }
+  const result = await api(meta.endpoint, { method: "PUT", body: JSON.stringify({ config }) });
+  document.getElementById(meta.dialog).close();
+  toast(`Saved ${kind}.`);
+  return result;
+}
+
+for (const [kind, meta] of Object.entries(CONFIG_EDITORS)) {
+  const closeId = `close-${kind}`;
+  const saveId = `save-${kind}`;
+  document.getElementById(closeId).addEventListener("click", () => document.getElementById(meta.dialog).close());
+  document.getElementById(saveId).addEventListener("click", () => {
+    saveConfigEditor(kind).catch((error) => toast(error.message, true));
+  });
+}
+
 document.getElementById("close-codex-hooks").addEventListener("click", () => document.getElementById("codex-hooks-dialog").close());
 document.getElementById("save-codex-hooks").addEventListener("click", async () => {
   const enabled = [...document.querySelectorAll("[data-codex-hook]:checked")].map((input) => input.dataset.codexHook);
@@ -494,6 +668,11 @@ document.querySelectorAll(".nav-item").forEach((btn) => {
     document.getElementById(btn.dataset.tab).classList.add("active");
     document.getElementById("page-title").textContent = TITLES[btn.dataset.tab] || btn.dataset.tab;
     stopActivityStream();
+    stopDashboardRuntimeLoop();
+    if (btn.dataset.tab === "dashboard") {
+      refreshDashboardRuntime();
+      startDashboardRuntimeLoop();
+    }
     if (btn.dataset.tab === "activity") onActivityTabActive();
     if (btn.dataset.tab === "project") loadProject().catch((e) => toast(e.message, true));
   });
@@ -551,7 +730,9 @@ async function refreshAll() {
 
 document.getElementById("refresh-all").addEventListener("click", () => refreshAll().catch((e) => toast(e.message, true)));
 
-refreshAll().catch((err) => toast(err.message, true));
+refreshAll()
+  .then(() => startDashboardRuntimeLoop())
+  .catch((err) => toast(err.message, true));
 
 async function openLocalTools() {
   const data = await api("/api/local-tools");

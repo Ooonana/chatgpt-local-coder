@@ -13,17 +13,73 @@ interface GitRunResult {
   exit_code: number;
 }
 
+const MAX_GIT_OUTPUT_CHARS = 500_000;
+const GIT_TIMEOUT_MS = (() => {
+  const parsed = Number(process.env.GIT_TIMEOUT_MS || 120_000);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 120_000;
+  return Math.min(Math.max(Math.trunc(parsed), 5_000), 10 * 60 * 1000);
+})();
+
+function appendBounded(current: string, chunk: Buffer): string {
+  const next = current + chunk.toString();
+  return next.length > MAX_GIT_OUTPUT_CHARS ? next.slice(-MAX_GIT_OUTPUT_CHARS) : next;
+}
+
+async function killGitTree(child: ReturnType<typeof spawn>): Promise<void> {
+  if (!child.pid) {
+    child.kill("SIGKILL");
+    return;
+  }
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      child.kill("SIGKILL");
+      return;
+    }
+  }
+  await new Promise<void>((resolve) => {
+    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+    killer.once("error", () => {
+      child.kill("SIGKILL");
+      resolve();
+    });
+    killer.once("close", () => resolve());
+  });
+}
+
 function runGit(args: string[], cwd: string): Promise<GitRunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, { cwd, windowsHide: true });
+    const child = spawn("git", args, {
+      cwd,
+      windowsHide: true,
+      detached: process.platform !== "win32",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+    let settled = false;
+    child.stdout.on("data", (d: Buffer) => (stdout = appendBounded(stdout, d)));
+    child.stderr.on("data", (d: Buffer) => (stderr = appendBounded(stderr, d)));
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      void killGitTree(child).finally(() => reject(new Error(`git timed out after ${GIT_TIMEOUT_MS}ms`)));
+    }, GIT_TIMEOUT_MS);
+    timer.unref?.();
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code ?? 1 });
     });
-    child.on("error", () => reject(new Error("git not found. Install Git for Windows.")));
+    child.on("error", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error("git not found. Install Git for Windows."));
+    });
   });
 }
 
@@ -66,7 +122,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
 
   server.registerTool("git_log", {
     title: "Git Log", description: "Show recent commit history.",
-    inputSchema: { path: z.string().optional(), count: z.number().optional().default(10) },
+    inputSchema: { path: z.string().optional(), count: z.number().int().positive().max(200).optional().default(10) },
 
     annotations: toolAnnotations("read"),
   }, async ({ path: repoPath, count }) => {
@@ -162,7 +218,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   server.registerTool("git_commit", {
     title: "Git Commit", description: "Create a commit (stages all first unless stage_only=false).",
     inputSchema: {
-      message: z.string(),
+      message: z.string().max(100_000),
       path: z.string().optional(),
       stage_all: z.boolean().optional().default(true),
     },
@@ -227,7 +283,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
       "Restore tracked file(s) in the current repo to the last committed version. Local workspace only.",
     inputSchema: {
       path: z.string().optional(),
-      files: z.array(z.string()).min(1).describe("Repo-relative file paths to restore"),
+      files: z.array(z.string()).min(1).max(2_000).describe("Repo-relative file paths to restore"),
       source: z
         .string()
         .optional()

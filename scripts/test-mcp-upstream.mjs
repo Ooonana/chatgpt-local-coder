@@ -3,6 +3,8 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
   importCursorMcpConfig,
   loadUpstreamConfig,
@@ -14,6 +16,9 @@ import {
 import { McpUpstreamManager } from "../dist/lib/mcp-upstream-manager.js";
 import { refreshProxiedTools, jsonSchemaToZodShape } from "../dist/lib/mcp-tool-proxy.js";
 import { registerMcpBridgeTools } from "../dist/tools/mcp-bridge.js";
+import { createMcpServer } from "../dist/server-factory.js";
+import { savePermissionConfig } from "../dist/lib/permissions.js";
+import { getFreePort } from "./free-port.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -146,7 +151,7 @@ await run("parse and import cursor mcp config", async () => {
   }
 });
 
-const httpPort = 3901 + Math.floor(Math.random() * 200);
+const httpPort = await getFreePort();
 const mockHttp = spawnMockHttp(httpPort);
 try {
   await waitForHealth(`http://127.0.0.1:${httpPort}/health`);
@@ -199,6 +204,74 @@ try {
     if (!proxied.includes("mockhttp__add")) throw new Error(JSON.stringify(proxied));
     const names = manager.getProxiedToolNames(manager.getServerConfig("mockhttp"), await manager.listTools("mockhttp"));
     if (!names.includes("mockhttp__add")) throw new Error(JSON.stringify(names));
+  });
+
+  await run("restrictive profiles block unknown/mutating upstream calls until explicitly allowed", async () => {
+    const permissionsPath = path.join(tmpDir, "permissions.json");
+    process.env.PERMISSIONS_CONFIG = permissionsPath;
+    process.env.CHATGPT_TOOL_PROFILE = "full";
+    savePermissionConfig({ profile: "read_only", path_roots: [root] });
+
+    const manager = new McpUpstreamManager(configPath);
+    await manager.init();
+    await manager.updateConfig({
+      version: 1,
+      servers: [
+        {
+          id: "mockhttp",
+          name: "Mock HTTP",
+          enabled: true,
+          transport: "http",
+          url: `http://127.0.0.1:${httpPort}/mcp`,
+          expose: "allowlist",
+          tools: ["add"],
+          tool_prefix: "mockhttp",
+        },
+      ],
+    });
+
+    const hub = createMcpServer(root, 15, [root], true, manager);
+    await refreshProxiedTools(hub, manager);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "upstream-permission-test", version: "1.0.0" }, { capabilities: {} });
+    await hub.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    const expectBlocked = async (call) => {
+      try {
+        const result = await call();
+        const text = JSON.stringify(result);
+        if (/unrestricted runtime|must be explicitly enabled/i.test(text)) return;
+        throw new Error(`expected permission block, got ${text}`);
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
+        if (/unrestricted runtime|must be explicitly enabled/i.test(text)) return;
+        throw error;
+      }
+    };
+
+    try {
+      await expectBlocked(() => client.callTool({ name: "mcp_call", arguments: { server_id: "mockhttp", tool: "add", arguments: { a: 1, b: 2 } } }));
+      await expectBlocked(() => client.callTool({ name: "mockhttp__add", arguments: { a: 1, b: 2 } }));
+
+      savePermissionConfig({
+        profile: "custom",
+        path_roots: [root],
+        allow_write: false,
+        allow_commands: false,
+        allow_unsafe_runtimes: true,
+      });
+
+      const rawBridge = await client.callTool({ name: "mcp_call", arguments: { server_id: "mockhttp", tool: "add", arguments: { a: 2, b: 3 } } });
+      if (!JSON.stringify(rawBridge).includes("5")) throw new Error(`mcp_call was not allowed by explicit unsafe-runtime opt-in: ${JSON.stringify(rawBridge)}`);
+      const direct = await client.callTool({ name: "mockhttp__add", arguments: { a: 3, b: 4 } });
+      if (!JSON.stringify(direct).includes("7")) throw new Error(`direct proxy was not allowed by explicit unsafe-runtime opt-in: ${JSON.stringify(direct)}`);
+    } finally {
+      savePermissionConfig({ profile: "open" });
+      await client.close().catch(() => undefined);
+      await hub.close().catch(() => undefined);
+      await manager.shutdown().catch(() => undefined);
+    }
   });
 } finally {
   mockHttp.kill("SIGTERM");

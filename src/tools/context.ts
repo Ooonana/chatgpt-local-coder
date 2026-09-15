@@ -4,7 +4,13 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
 import { audit, getAuditPath } from "../lib/audit.js";
-import { describePermissionProfile, getPermissionProfile } from "../lib/permissions.js";
+import {
+  describePermissionProfile,
+  getPermissionConfig,
+  getPermissionProfile,
+  getEffectivePathRoots,
+  requireWriteAllowed,
+} from "../lib/permissions.js";
 import { getDefaultCwd, getFullDiskAccess, getMachineRoots } from "../lib/path-security.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { MCP_QUICKSTART } from "../lib/quickstart.js";
@@ -151,6 +157,8 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
       return toolResult("agent_status", {
         permission_profile: getPermissionProfile(),
         permission_description: describePermissionProfile(),
+        permission_config: getPermissionConfig(),
+        permission_roots: getEffectivePathRoots(),
         full_machine_access: getFullDiskAccess(),
         default_cwd: getDefaultCwd(),
         machine_roots: getMachineRoots(),
@@ -180,6 +188,7 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
       annotations: toolAnnotations("edit"),
     },
     async ({ note }) => {
+      requireWriteAllowed();
       const file = await appendAutoMemory(workspaceRoot, note);
       await audit({ tool: "remember", action: "append", target: file, status: "ok" });
       return toolResult("remember", { saved_to: file, note }, { summary: "saved to auto memory" });

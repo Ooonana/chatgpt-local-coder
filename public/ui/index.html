@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Codex MCP Admin</title>
+  <title>ChatGPT Local Coder Admin</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -12,7 +12,7 @@
       <div class="brand">
         <span class="brand-mark">◆</span>
         <div>
-          <div class="brand-title">Codex MCP</div>
+          <div class="brand-title">Local Coder</div>
           <div class="brand-sub">Admin · localhost</div>
         </div>
       </div>
@@ -39,7 +39,34 @@
       </header>
 
       <section id="dashboard" class="view active">
+        <div class="overview-hero">
+          <div>
+            <div class="overview-eyebrow">Local runtime</div>
+            <div class="overview-title-row">
+              <span id="overview-dot" class="status-dot online"></span>
+              <strong id="overview-state">Online</strong>
+              <span id="overview-last-tool" class="overview-last-tool">Last tool —</span>
+            </div>
+          </div>
+          <div class="overview-meta">
+            <span id="overview-transport" class="runtime-chip">—</span>
+            <span id="overview-updated" class="runtime-chip subtle">Updated —</span>
+          </div>
+        </div>
         <div class="stat-grid" id="stat-grid"></div>
+        <div class="overview-split">
+          <div class="panel runtime-panel">
+            <div class="panel-head">
+              <h2>Active now</h2>
+              <span id="dash-active-count" class="badge">0</span>
+            </div>
+            <div id="dash-active" class="runtime-list"></div>
+          </div>
+          <div class="panel runtime-panel">
+            <div class="panel-head"><h2>Recent tool calls</h2></div>
+            <div id="dash-recent" class="runtime-list"></div>
+          </div>
+        </div>
         <div class="panel">
           <div class="panel-head"><h2>Upstream servers</h2></div>
           <div id="dash-servers" class="table-wrap"></div>
@@ -175,6 +202,12 @@
   <dialog id="codex-hooks-dialog" class="modal"><div class="modal-body"><div class="modal-head"><h3>Codex hooks</h3><button type="button" class="btn icon" id="close-codex-hooks" aria-label="Close">×</button></div><p class="muted">Automatically scans enabled Codex plugins. Only <code>SessionStart</code> hooks can currently run through ChatGPT MCP; prompt and subagent events are shown for visibility but cannot run here.</p><div id="codex-hooks-list" class="tools-list"></div><menu class="modal-foot"><button type="button" class="btn primary" id="save-codex-hooks">Save</button></menu></div></dialog>
 
   <dialog id="local-tools-dialog" class="modal"><div class="modal-body"><div class="modal-head"><h3>Local tools</h3><button type="button" class="btn icon" id="close-local-tools" aria-label="Close">×</button></div><p class="muted">Force-enable tools outside the <code>slim</code> profile, or disable any local tool. This does not affect upstream MCP tools.</p><div id="local-tools-list" class="tools-list"></div><menu class="modal-foot"><button type="button" class="btn primary" id="save-local-tools">Save</button></menu></div></dialog>
+
+  <dialog id="permissions-dialog" class="modal"><div class="modal-body"><div class="modal-head"><h3>Permissions</h3><button type="button" class="btn icon" id="close-permissions" aria-label="Close">×</button></div><p class="muted">Application-level Local Coder policy. <code>open</code> preserves full local access; restricted profiles are not an OS sandbox.</p><textarea id="permissions-json" class="code-block" spellcheck="false" style="width:100%;min-height:300px;resize:vertical"></textarea><menu class="modal-foot"><button type="button" class="btn primary" id="save-permissions">Save</button></menu></div></dialog>
+
+  <dialog id="local-hooks-dialog" class="modal"><div class="modal-body"><div class="modal-head"><h3>Local hooks</h3><button type="button" class="btn icon" id="close-local-hooks" aria-label="Close">×</button></div><p class="muted">Native session/tool/subagent hooks. Blocking hooks can deny an operation; hook commands still obey the active permission policy.</p><textarea id="local-hooks-json" class="code-block" spellcheck="false" style="width:100%;min-height:300px;resize:vertical"></textarea><menu class="modal-foot"><button type="button" class="btn primary" id="save-local-hooks">Save</button></menu></div></dialog>
+
+  <dialog id="subagents-dialog" class="modal"><div class="modal-body"><div class="modal-head"><h3>Subagents</h3><button type="button" class="btn icon" id="close-subagents" aria-label="Close">×</button></div><p class="muted">Configure an external model-capable runner. This cannot reuse the parent ChatGPT app subscription. Secret environment values are never returned by this editor.</p><div id="subagents-env-keys" class="muted" style="margin-bottom:8px"></div><textarea id="subagents-json" class="code-block" spellcheck="false" style="width:100%;min-height:300px;resize:vertical"></textarea><menu class="modal-foot"><button type="button" class="btn primary" id="save-subagents">Save</button></menu></div></dialog>
 
   <dialog id="tools-dialog" class="modal">
     <div class="modal-body">

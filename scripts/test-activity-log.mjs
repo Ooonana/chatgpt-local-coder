@@ -26,6 +26,21 @@ assert.equal(mcp.client, "chatgpt");
 assert.equal(mcp.duration_ms, 42);
 assert.equal(mcp.summary, "/tmp/x");
 
+// Large MCP arguments must not be retained in full by the long-lived activity feed.
+const hugeContent = "x".repeat(100_000);
+logMcpRequest(
+  { method: "tools/call", params: { name: "write_file", arguments: { path: "/tmp/huge", content: hugeContent } } },
+  "sess-large",
+  10,
+  200
+);
+const bounded = getRecentActivity(5).find((e) => e.session_id === "sess-large");
+assert.ok(bounded, "expected bounded activity entry");
+const retainedContent = bounded.details?.arguments?.content;
+assert.equal(typeof retainedContent, "string");
+assert.ok(retainedContent.length < 5_000, `activity retained too much content: ${retainedContent.length}`);
+assert.match(retainedContent, /truncated/);
+
 // filter since
 const all = getRecentActivity(500);
 const since = all[1]?.id;

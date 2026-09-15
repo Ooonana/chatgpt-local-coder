@@ -3,6 +3,7 @@ import os from "os";
 import path from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
+import { requireCommandAllowed } from "./permissions.js";
 
 type HookEvent = "session_start" | "user_prompt_submit" | "subagent_start";
 
@@ -134,6 +135,7 @@ export async function saveCodexHooks(enabledIds: unknown): Promise<CodexHook[]> 
 }
 
 function execute(command: string, timeoutMs: number, input?: string): Promise<string> {
+  requireCommandAllowed(command);
   const shell = process.platform === "win32" ? "powershell.exe" : "bash";
   const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
   return new Promise((resolve) => {

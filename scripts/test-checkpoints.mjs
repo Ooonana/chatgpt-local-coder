@@ -7,6 +7,7 @@ import {
   listCheckpoints,
   previewRestore,
   restoreToCheckpoint,
+  getCheckpointConfig,
 } from "../dist/lib/checkpoint.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -110,6 +111,46 @@ await run("restores move by snapshotting source and destination", async () => {
   const destText = await fs.readFile(dest, "utf-8");
   if (srcText !== "from-src\n") throw new Error(`src: ${srcText}`);
   if (destText !== "old-dest\n") throw new Error(`dest: ${destText}`);
+});
+
+await run("checkpoint total-byte budget skips excess snapshots", async () => {
+  await clearCheckpoints();
+  process.env.CHECKPOINT_MAX_FILE_BYTES = "4096";
+  process.env.CHECKPOINT_MAX_TOTAL_BYTES = "1024";
+  const a = path.join(tmpDir, "budget-a.txt");
+  const b = path.join(tmpDir, "budget-b.txt");
+  await fs.writeFile(a, "a".repeat(800));
+  await fs.writeFile(b, "b".repeat(800));
+  const id = await checkpointBefore("budget-test", [a, b]);
+  if (!id) throw new Error("checkpoint id missing");
+  const plan = await previewRestore(id);
+  if (plan.skipped_snapshots.length !== 1) {
+    throw new Error(`expected one skipped snapshot, got ${JSON.stringify(plan.skipped_snapshots)}`);
+  }
+  if (!String(plan.skipped_snapshots[0].reason || "").includes("total byte budget")) {
+    throw new Error(`unexpected skip reason: ${JSON.stringify(plan.skipped_snapshots)}`);
+  }
+  delete process.env.CHECKPOINT_MAX_FILE_BYTES;
+  delete process.env.CHECKPOINT_MAX_TOTAL_BYTES;
+});
+
+await run("checkpoint configuration clamps unsafe overrides", async () => {
+  process.env.CHECKPOINT_MAX_COUNT = "999999999";
+  process.env.CHECKPOINT_RETENTION_DAYS = "999999999";
+  process.env.CHECKPOINT_MAX_FILE_BYTES = "999999999999";
+  process.env.CHECKPOINT_MAX_TOTAL_BYTES = "999999999999";
+  process.env.CHECKPOINT_MAX_DIRECTORY_ENTRIES = "999999999";
+  const config = getCheckpointConfig();
+  if (config.max_count !== 5_000) throw new Error(`max_count not clamped: ${config.max_count}`);
+  if (config.retention_days !== 3_650) throw new Error(`retention_days not clamped: ${config.retention_days}`);
+  if (config.max_file_bytes !== 64 * 1024 * 1024) throw new Error(`max_file_bytes not clamped: ${config.max_file_bytes}`);
+  if (config.max_total_bytes !== 256 * 1024 * 1024) throw new Error(`max_total_bytes not clamped: ${config.max_total_bytes}`);
+  if (config.max_directory_entries !== 100_000) throw new Error(`max_directory_entries not clamped: ${config.max_directory_entries}`);
+  process.env.CHECKPOINT_MAX_COUNT = "50";
+  delete process.env.CHECKPOINT_RETENTION_DAYS;
+  delete process.env.CHECKPOINT_MAX_FILE_BYTES;
+  delete process.env.CHECKPOINT_MAX_TOTAL_BYTES;
+  delete process.env.CHECKPOINT_MAX_DIRECTORY_ENTRIES;
 });
 
 await fs.rm(tmpDir, { recursive: true, force: true });

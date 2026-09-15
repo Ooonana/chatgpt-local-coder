@@ -11,9 +11,10 @@ The default project's memory and Git state are already injected into MCP instruc
 
 ## Access model
 
-- **Full machine access** is enabled by default: any local path and shell command may be used.
+- The default `open` permission profile allows full local paths, commands, and configured runtimes (subject to OS ACLs). `workspace`, `read_only`, and `custom` profiles can restrict this.
 - Absolute paths are supported, for example `C:\`, `D:\Projects\...`, `/Users/you/projects/...`, and `/home/you/...`.
-- `WORKSPACE_PATH` sets the default cwd for relative paths, shell commands, and Git. It is not a sandbox boundary.
+- `WORKSPACE_PATH` sets the default cwd for relative paths, shell commands, and Git. By itself it is not a sandbox boundary; restrictive Local Coder permission profiles can enforce configured roots at the application layer.
+- Read-only upstream MCP tools can remain available under restrictive profiles; mutating or annotation-unknown upstream calls are treated as unsafe runtimes and require explicit permission.
 - `CHATGPT_AUTO_APPROVE=true` marks routine local operations to reduce unnecessary confirmation prompts.
 
 ## ChatGPT connector behavior
@@ -65,11 +66,13 @@ The default `slim` profile includes common file/directory helpers, regex editing
 | Project rules | `project_context`, `load_path_rules` | Loads project and path-scoped instructions. |
 | Skills | `list_skills`, `load_skill` | Load matching project/plugin skills before use. |
 | Persistent task state | `agent_task` | Stores objective, plan, notes, workspace, and status across MCP sessions. It is **not** a subagent. |
+| External subagent | `subagent` | Runs a separately configured model-capable process, optionally in an isolated Git worktree. It cannot reuse the parent ChatGPT subscription. |
+| Delegate discovery | `delegate_status` | Detects supported Claude/Codex/Grok/OpenCode CLIs without launching them. |
 | Isolated Git work | `git_worktree` | Useful for parallel or experimental branches without switching the main checkout. |
 | Upstream MCP | `<server>__<tool>` | Enabled upstream tools are exposed directly when possible. |
 | Upstream diagnostics | `mcp_servers`, `mcp_tools`, `mcp_call` | Low-level bridge/fallback; some are full-profile only. |
 
-Real delegated subagents are still not implemented. Web browsing, general uploaded-file understanding, data analysis, and browser/site tooling can be supplied by the ChatGPT host instead of being duplicated in Local Coder.
+Real delegated subagents are available through the external-runner `subagent` tool when explicitly configured. Web browsing, general uploaded-file understanding, data analysis, and browser/site tooling can still be supplied by the ChatGPT host instead of being duplicated in Local Coder.
 
 ## Recommended coding workflow
 
@@ -93,6 +96,8 @@ Real delegated subagents are still not implemented. Web browsing, general upload
 | Stage/commit | `git_add`, `git_commit` |
 | Restore tracked files | `git_restore` |
 | Persist a long task | `agent_task` |
+| Delegate to configured external model runner | `subagent` |
+| Detect compatible local agent CLIs | `delegate_status` |
 | Undo Local Coder file edits | `rewind` |
 
 For non-trivial changes: explore first, read every file you will edit, apply the smallest practical patch, then run relevant build/tests. Preserve unrelated user changes in a dirty working tree.
@@ -142,9 +147,10 @@ Shell commands that directly modify files are not captured by rewind.
 **Windows**
 
 ```powershell
-.\start.ps1 -Force          # Terminal 1: MCP server
-.\openai-tunnel.ps1         # Terminal 2: OpenAI Secure MCP Tunnel
+.\start.ps1                 # build + restart MCP + live TUI + Admin UI + tunnel if configured
 ```
+
+`-Force` remains accepted for compatibility. Use `-NoTunnel` only when you explicitly want the local MCP server without managing the OpenAI tunnel.
 
 First tunnel setup:
 
@@ -155,7 +161,7 @@ First tunnel setup:
 **macOS / Linux**
 
 ```bash
-npm start
+npm start                    # build + MCP server + live TUI + Admin UI
 npm run tunnel
 # or another HTTPS tunnel, for example:
 ssh -p 443 -R0:localhost:3000 a.pinggy.io
@@ -167,11 +173,13 @@ Health check: `http://127.0.0.1:3000/health`
 
 Admin UI: `http://127.0.0.1:<ADMIN_PORT>/ui` (default port: `3001`)
 
+The terminal dashboard is enabled automatically in an interactive terminal and shows current time, uptime, sessions, live/active tool calls, call kind (`READ` / `EDIT` / `EXEC` / `MCP`), running background processes/PTYs/subagents, recent completions, durations, per-tool usage, CPU, RSS, and heap. Set `LOCAL_CODER_TUI=off` for traditional scrolling logs.
+
 ## Troubleshooting
 
 | Problem | Action |
 |---|---|
-| Access denied | Verify the path and OS permissions. Full machine access does not bypass OS ACLs. |
+| Access denied | Verify the active Local Coder permission profile, configured roots, and OS permissions. Even the default `open` profile does not bypass OS ACLs. |
 | Patch context not found | Re-read the file and add enough unchanged context around the hunk. |
 | ChatGPT asks on every call | Review connector permissions and `CHATGPT_AUTO_APPROVE`. |
 | Connection failed | Ensure both server and tunnel are running, and use the correct HTTPS connector URL. |

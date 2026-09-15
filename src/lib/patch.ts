@@ -1,6 +1,8 @@
 import fs from "fs/promises";
 import path from "path";
 
+const MAX_EDITABLE_FILE_BYTES = 16 * 1024 * 1024;
+
 /**
  * Apply unified diff / Codex-style patches to text.
  * Supports:
@@ -287,6 +289,13 @@ export async function applyMultiFilePatch(
         continue;
       }
 
+      const stat = await fs.stat(op.path);
+      if (!stat.isFile()) throw new Error("Patch target is not a regular file");
+      if (stat.size > MAX_EDITABLE_FILE_BYTES) {
+        throw new Error(
+          `Patch target is too large to edit safely (${stat.size} bytes; max ${MAX_EDITABLE_FILE_BYTES})`
+        );
+      }
       const original = await fs.readFile(op.path, "utf-8");
       const next = applyUnifiedPatchToText(original, op.patch || "");
       const diff = buildSimpleDiff(original, next);

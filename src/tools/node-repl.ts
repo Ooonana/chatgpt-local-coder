@@ -10,6 +10,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 import { isComputerUseEnabled } from "../lib/plugin-config.js";
+import { requireUnsafeRuntimeAllowed } from "../lib/permissions.js";
 
 interface ReplState {
   context: vm.Context;
@@ -106,6 +107,7 @@ export function registerNodeReplTool(server: McpServer, workspaceRoot: string): 
         return toolResult("node_repl", { persistent: true, computer_use_available: state.skyAvailable, computer_use_error: state.skyError });
       }
       if (!code?.trim()) throw new Error("code is required for node_repl eval");
+      requireUnsafeRuntimeAllowed("node_repl");
       if (!state.context.sky && state.skyAvailable) {
         const loaded = await loadSky();
         if (loaded.sky) state.context.sky = loaded.sky;

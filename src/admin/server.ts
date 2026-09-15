@@ -13,6 +13,8 @@ export interface AdminServerOptions {
   port: number;
   mcpPort: number;
   pid: number;
+  transportMode: "sse" | "json";
+  keepAliveMs: number;
   manager: McpUpstreamManager;
   sessionCount: () => number;
   instructionSummary?: () => Record<string, unknown>;
@@ -65,6 +67,8 @@ export function startAdminServer(options: AdminServerOptions): Server {
   app.use(createAdminRouter(options.manager, {
     mcpPort: options.mcpPort,
     pid: options.pid,
+    transportMode: options.transportMode,
+    keepAliveMs: options.keepAliveMs,
     sessionCount: options.sessionCount,
     instructionSummary: options.instructionSummary,
     instructionsPreview: options.instructionsPreview,

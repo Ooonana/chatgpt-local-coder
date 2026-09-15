@@ -6,7 +6,7 @@
 
 [![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-6366f1?style=flat-square)](https://modelcontextprotocol.io)
 [![ChatGPT](https://img.shields.io/badge/ChatGPT-Developer%20Mode-10a37f?style=flat-square)](https://platform.openai.com/docs/guides/developer-mode)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178c6?style=flat-square)](https://www.typescriptlang.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-7.0-3178c6?style=flat-square)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 [![Windows](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078d4?style=flat-square)](https://nodejs.org)
 
@@ -16,7 +16,7 @@
 
 ---
 
-ChatGPT Local Coder is a **self-hosted MCP server** that gives ChatGPT (and any MCP client) full access to your machine — read and edit code, run `npm test`, manage git, apply unified diffs, and explore projects with `glob` / `grep`.
+ChatGPT Local Coder is a **self-hosted MCP server** that gives ChatGPT (and any MCP client) local coding tools for files, shell commands, Git, patches, and project exploration. The default `open` permission profile allows full local access; restrictive profiles are available when you want Local Coder itself to limit paths or actions.
 
 No separate coding client. No vendor lock-in. Run one Node process on your PC, expose it through a tunnel, and code from a regular ChatGPT chat with the connector enabled.
 
@@ -40,14 +40,14 @@ No separate coding client. No vendor lock-in. Run one Node process on your PC, e
 | Run tests / builds | ❌ | ✅ `run_command`, `start_process` |
 | Git workflow | ❌ | ✅ `git_status`, `git_commit`, `git_push`, … |
 | Explore codebase | Limited | ✅ `glob`, `grep`, `list_directory` |
-| Full disk access | ❌ | ✅ Any path on your machine |
+| Full disk access | ❌ | ✅ Any path by default with the `open` profile |
 | Session recovery | — | ✅ Auto-recover after server restart |
 
 Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/developer-mode)** with optimized tool annotations (fewer permission popups) and **[OpenAI Secure MCP Tunnel](https://platform.openai.com/docs/guides/secure-mcp-tunnel)** support (stable URL, no connector re-wiring every restart).
 
 ## 🚀 Quick Start
 
-**Requirements:** [Node.js](https://nodejs.org) 18+, npm, Git (optional, for git tools)
+**Requirements:** [Node.js](https://nodejs.org) 22.22.2+, npm, Git (optional, for git tools/worktree isolation)
 
 **Windows**
 
@@ -56,8 +56,7 @@ git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
 cd chatgpt-local-coder
 copy .env.example .env          # edit WORKSPACE_PATH + MCP_TOKEN
 npm install
-npm run build
-.\start.ps1
+.\start.ps1                  # builds/restarts MCP + Admin UI + TUI; starts/reuses OpenAI tunnel when configured
 ```
 
 **macOS / Linux**
@@ -66,17 +65,23 @@ npm run build
 git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
 cd chatgpt-local-coder
 cp .env.example .env
-npm install && npm run build
+npm install
 
 # Set your project root and an auth token
 node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"   # paste into MCP_TOKEN
 
-npm start
+npm start                    # prestart builds automatically, then starts MCP + Admin UI + TUI
 ```
 
 > The `.ps1` scripts are **Windows-only**. On macOS/Linux use `npm start` and the shell tunnel commands below — everything else is cross-platform.
 
 Server runs at `http://127.0.0.1:3000` — health check: `http://127.0.0.1:3000/health`
+
+### Live terminal dashboard
+
+Interactive launches use a clean alternate-screen TUI instead of scrolling request logs. It shows the current time and uptime, sessions, active tool calls and their kind (`READ`, `EDIT`, `EXEC`, `MCP`), elapsed time, background processes/PTYs/subagents, recent completions, per-tool usage, CPU, RSS, and heap memory. Resize-safe rendering is bounded to the terminal viewport; non-interactive/CI/redirected output automatically falls back to normal logs.
+
+Set `LOCAL_CODER_TUI=off` to force traditional logs, or `LOCAL_CODER_TUI=on` to request the dashboard when stdout is a TTY.
 
 Set `WORKSPACE_PATH` to your project root (absolute path). With `MCP_TOKEN` set, the MCP endpoint becomes `/mcp/<token>` — that full path is what goes in the connector.
 
@@ -136,15 +141,14 @@ Example prompts (after tagging):
 Stable tunnel ID — connector URL never changes.
 
 ```powershell
-# Terminal 1
-.\start.ps1 -Force
-
-# Terminal 2 — first time only
+# First time only
 .\openai-tunnel.ps1 -Init    # enter tunnel_id + Runtime API key from OpenAI Platform
 
-# Every time after
-.\openai-tunnel.ps1
+# Every time after — one command
+.\start.ps1                  # restarts MCP and starts/reuses the tunnel automatically
 ```
+
+`-Force` is still accepted (`.\start.ps1 -Force`). Use `.\start.ps1 -NoTunnel` only when you intentionally want the local server without the OpenAI tunnel.
 
 Get credentials: [OpenAI Platform → Tunnels](https://platform.openai.com/settings/organization/tunnels)
 
@@ -158,7 +162,7 @@ Free, but URL changes on every restart (update connector each time).
 
 ```powershell
 # Windows — Terminal 1
-.\start.ps1
+.\start.ps1 -NoTunnel
 # Terminal 2
 .\tunnel.ps1    # copy https://….trycloudflare.com into connector URL
 ```
@@ -272,6 +276,13 @@ The default slim profile intentionally exposes high-value local development help
 
 `agent_task` stores coordination state only; it does not start another model or hidden subagent.
 
+### External delegation
+
+| Tool | Description |
+|------|-------------|
+| `subagent` | Run/manage an explicitly configured external model-capable runner, with optional Git-worktree isolation. It does **not** reuse the parent ChatGPT subscription. |
+| `delegate_status` | Detect supported Claude, Codex, Grok, and OpenCode CLIs without launching them. |
+
 ### Claude Code ↔ MCP mapping
 
 | Claude Code | This server |
@@ -293,8 +304,11 @@ HOST=127.0.0.1
 MCP_TOKEN=                      # generate one — see below
 WORKSPACE_PATH=C:\Users\You\projects\my-app     # macOS: /Users/you/projects/my-app
 CHATGPT_AUTO_APPROVE=true
+LOCAL_CODER_TUI=auto
 SHELL_TIMEOUT=120
 MCP_SESSION_RECOVERY=true
+MCP_JSON_RESPONSE=false
+MCP_SSE_KEEPALIVE_MS=10000
 ADMIN_PORT=3011
 
 # OpenAI Secure Tunnel (optional)
@@ -310,13 +324,20 @@ OPENAI_TUNNEL_API_KEY=
 | `ADMIN_PORT` | `3001` | [Admin UI](#-admin-ui) port (localhost-only, always on). Change it if something else uses 3001 — Docker Desktop often does |
 | `ADMIN_TOKEN` | *(empty)* | Bearer token for the Admin UI. Empty = loopback check only |
 | `CHATGPT_AUTO_APPROVE` | `true` | Tool annotations to reduce ChatGPT popups |
+| `LOCAL_CODER_TUI` | `auto` | `auto` uses the clean dashboard only in an interactive TTY; `off` keeps scrolling logs; `on` requests TUI when stdout is a TTY |
 | `MCP_SESSION_RECOVERY` | `true` | Auto-recover stale sessions after restart |
+| `MCP_JSON_RESPONSE` | `false` | Keep `false` for SSE tool responses with heartbeat frames. Set `true` only as a compatibility fallback for clients that require one JSON response at the end |
+| `MCP_SSE_KEEPALIVE_MS` | `10000` | SSE heartbeat interval for long MCP calls. The server clamps this to 1–60 seconds |
 | `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
-| `FULL_DISK_ACCESS` | `true` | Access any path on the machine |
+| `PERMISSIONS_CONFIG` | `profiles/permissions.json` | Optional permission-profile file (`open`, `workspace`, `read_only`, or `custom`). Missing file defaults to `open` |
 
 > Variables already set in your shell **win over `.env`** (`dotenv` does not override). If a change to `.env` seems ignored, check `env | grep WORKSPACE_PATH` first.
 
-> **Full machine access** is enabled by default. `WORKSPACE_PATH` only sets the default cwd — absolute paths like `D:\Projects\…` work everywhere.
+> The default `open` permission profile provides full local access (subject to OS ACLs). `WORKSPACE_PATH` sets the default cwd; restricted permission profiles can turn configured roots into an application-level boundary.
+
+> Long tool calls use Streamable HTTP/SSE by default and emit heartbeat comment frames every 10 seconds. This reduces silent tunnel/client timeouts; long-running work should still prefer `start_process` or `subagent spawn` plus short polling instead of keeping one tool call open for minutes.
+
+> Upstream MCP tools that explicitly advertise themselves as read-only remain usable under restrictive profiles. Mutating or annotation-unknown upstream calls are treated as **unsafe runtimes** and require `open` or an explicit `custom.allow_unsafe_runtimes=true` policy.
 
 ## 🖥️ Admin UI
 
@@ -375,12 +396,12 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 
 ## 🔒 Security
 
-This server grants **full access to your machine** — files, shell, git. Only expose it through a tunnel you control. Never share your connector URL or tunnel API keys.
+The default `open` permission profile grants **full local access** through Local Coder — files, shell, Git, and configured runtimes. Only expose it through a tunnel you control. Never share your connector URL or tunnel API keys.
 
 - Binds `127.0.0.1` only (`HOST`) — not reachable from your LAN. The tunnel connects to localhost, so it still works
 - `MCP_TOKEN` guards the endpoint at `/mcp/<token>`; `/mcp` and `/` return 404. **Set it** — without it, anyone who learns your tunnel URL gets a shell
 - The connector URL contains the token — treat it as a credential, and stop the tunnel when you are done
-- `WORKSPACE_PATH` only sets the *default* cwd; it does **not** restrict access (`FULL_DISK_ACCESS` is on)
+- Under the default `open` permission profile, `WORKSPACE_PATH` only sets the default cwd. Use `workspace`, `read_only`, or `custom` permission profiles when Local Coder itself should restrict paths/commands. This is application-level policy, not an OS sandbox
 - The [Admin UI](#-admin-ui) is always running and can write `.env` — tunnel **only** port 3000, never `ADMIN_PORT`, and set `ADMIN_TOKEN`
 - `.env` and secrets are gitignored
 - Audit log: `.mcp-audit.log` (optional, configurable)
@@ -396,6 +417,7 @@ This server grants **full access to your machine** — files, shell, git. Only e
 | **Permission popup every call** | Settings → Apps → set connector to *Ask before important changes*. Don't use popup "Always allow". |
 | **Tool blocked by OpenAI safety** | Not a server bug. Retry with `run_command` (response may include `run_command_fallback`). Affects `git_push`, `git_checkout`, `delete_directory` occasionally. |
 | **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |
+| **Long tool-heavy turn looks frozen / tunnel log shows HTTP 413** | A tool result exceeded the secure tunnel body limit. Latest Local Coder rejects oversized results before transport; use `read_text_file` offset/limit, smaller base64 chunks, or a shallower tree/search. |
 | **Tunnel URL keeps changing** | Switch to OpenAI Secure Tunnel (`openai-tunnel.ps1`). |
 | **Connector stuck "loading" forever when you click Create** | Make sure you are on the latest build (`npm run build`) — older builds deadlocked on the SSE stream and never answered `tools/list`. Also confirm the URL includes `/mcp/<MCP_TOKEN>`. |
 | **404 on the connector URL** | You omitted the token. Use `https://<tunnel>/mcp/<MCP_TOKEN>`, not `/mcp`. |

@@ -4,8 +4,6 @@ function isLocalAddress(ip: string | undefined): boolean {
   if (!ip) return false;
   const normalized = ip.replace(/^::ffff:/i, "").toLowerCase();
   if (normalized === "127.0.0.1" || normalized === "::1") return true;
-  // IPv4-mapped and unspecified bind addresses when connecting locally
-  if (normalized === "0.0.0.0" || normalized === "::") return true;
   return false;
 }
 

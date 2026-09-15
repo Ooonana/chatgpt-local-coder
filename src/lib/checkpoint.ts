@@ -40,7 +40,16 @@ const INDEX_VERSION = 1 as const;
 const DEFAULT_MAX_COUNT = 500;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
+const DEFAULT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAX_DIRECTORY_ENTRIES = 5_000;
 const MAX_DIRECTORY_DEPTH = 32;
+
+interface SnapshotBudget {
+  entries: number;
+  bytes: number;
+  maxEntries: number;
+  maxBytes: number;
+}
 
 function isEnabled(): boolean {
   const raw = (process.env.CHECKPOINT_ENABLED ?? "true").trim().toLowerCase();
@@ -51,19 +60,46 @@ function getStoreRoot(): string {
   return process.env.CHECKPOINT_PATH || path.resolve(process.cwd(), ".mcp-checkpoints");
 }
 
+function boundedPositiveInt(raw: string | undefined, fallback: number, min: number, max: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
 function getMaxCount(): number {
-  const n = parseInt(process.env.CHECKPOINT_MAX_COUNT || String(DEFAULT_MAX_COUNT), 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_COUNT;
+  return boundedPositiveInt(process.env.CHECKPOINT_MAX_COUNT, DEFAULT_MAX_COUNT, 1, 5_000);
 }
 
 function getRetentionDays(): number {
-  const n = parseInt(process.env.CHECKPOINT_RETENTION_DAYS || String(DEFAULT_RETENTION_DAYS), 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_RETENTION_DAYS;
+  return boundedPositiveInt(process.env.CHECKPOINT_RETENTION_DAYS, DEFAULT_RETENTION_DAYS, 1, 3_650);
 }
 
 function getMaxFileBytes(): number {
-  const n = parseInt(process.env.CHECKPOINT_MAX_FILE_BYTES || String(DEFAULT_MAX_FILE_BYTES), 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_FILE_BYTES;
+  return boundedPositiveInt(
+    process.env.CHECKPOINT_MAX_FILE_BYTES,
+    DEFAULT_MAX_FILE_BYTES,
+    1_024,
+    64 * 1024 * 1024
+  );
+}
+
+function getMaxTotalBytes(): number {
+  return boundedPositiveInt(
+    process.env.CHECKPOINT_MAX_TOTAL_BYTES,
+    DEFAULT_MAX_TOTAL_BYTES,
+    1_024,
+    256 * 1024 * 1024
+  );
+}
+
+function getMaxDirectoryEntries(): number {
+  return boundedPositiveInt(
+    process.env.CHECKPOINT_MAX_DIRECTORY_ENTRIES,
+    DEFAULT_MAX_DIRECTORY_ENTRIES,
+    1,
+    100_000
+  );
 }
 
 function checkpointDir(id: string): string {
@@ -116,12 +152,17 @@ async function readManifest(id: string): Promise<CheckpointManifest | null> {
   }
 }
 
-async function snapshotFile(filePath: string): Promise<CheckpointFileSnapshot> {
+async function snapshotFile(filePath: string, budget?: SnapshotBudget): Promise<CheckpointFileSnapshot> {
   const resolved = path.resolve(filePath);
   try {
     const stat = await fs.stat(resolved);
     if (stat.isDirectory()) {
-      return snapshotDirectory(resolved, 0);
+      return snapshotDirectory(resolved, 0, budget ?? {
+        entries: 0,
+        bytes: 0,
+        maxEntries: getMaxDirectoryEntries(),
+        maxBytes: getMaxTotalBytes(),
+      });
     }
     if (stat.size > getMaxFileBytes()) {
       return {
@@ -131,7 +172,16 @@ async function snapshotFile(filePath: string): Promise<CheckpointFileSnapshot> {
         skip_reason: `file exceeds CHECKPOINT_MAX_FILE_BYTES (${stat.size} bytes)`,
       };
     }
+    if (budget && budget.bytes + stat.size > budget.maxBytes) {
+      return {
+        path: resolved,
+        existed: true,
+        skipped: true,
+        skip_reason: `checkpoint total byte budget exceeded (${budget.maxBytes} bytes)`,
+      };
+    }
     const buffer = await fs.readFile(resolved);
+    if (budget) budget.bytes += buffer.length;
     if (isUtf8(buffer)) {
       return { path: resolved, existed: true, encoding: "utf-8", content: buffer.toString("utf-8") };
     }
@@ -144,7 +194,11 @@ async function snapshotFile(filePath: string): Promise<CheckpointFileSnapshot> {
   }
 }
 
-async function snapshotDirectory(dirPath: string, depth: number): Promise<CheckpointFileSnapshot> {
+async function snapshotDirectory(
+  dirPath: string,
+  depth: number,
+  budget: SnapshotBudget
+): Promise<CheckpointFileSnapshot> {
   if (depth > MAX_DIRECTORY_DEPTH) {
     return {
       path: dirPath,
@@ -160,10 +214,20 @@ async function snapshotDirectory(dirPath: string, depth: number): Promise<Checkp
   const entries = await fs.readdir(dirPath, { withFileTypes: true });
   for (const entry of entries) {
     const full = path.join(dirPath, entry.name);
+    if (budget.entries >= budget.maxEntries) {
+      children.push({
+        path: full,
+        existed: true,
+        skipped: true,
+        skip_reason: `checkpoint directory entry budget exceeded (${budget.maxEntries})`,
+      });
+      break;
+    }
+    budget.entries++;
     if (entry.isDirectory()) {
-      children.push(await snapshotDirectory(full, depth + 1));
+      children.push(await snapshotDirectory(full, depth + 1, budget));
     } else if (entry.isFile()) {
-      children.push(await snapshotFile(full));
+      children.push(await snapshotFile(full, budget));
     }
   }
 
@@ -258,6 +322,8 @@ export function getCheckpointConfig(): Record<string, unknown> {
     max_count: getMaxCount(),
     retention_days: getRetentionDays(),
     max_file_bytes: getMaxFileBytes(),
+    max_total_bytes: getMaxTotalBytes(),
+    max_directory_entries: getMaxDirectoryEntries(),
     note: "Only file-editing MCP tools are tracked. Shell/bash file changes are not captured.",
   };
 }
@@ -273,8 +339,14 @@ export async function checkpointBefore(
   if (uniquePaths.length === 0) return null;
 
   const snapshots: CheckpointFileSnapshot[] = [];
+  const budget: SnapshotBudget = {
+    entries: 0,
+    bytes: 0,
+    maxEntries: getMaxDirectoryEntries(),
+    maxBytes: getMaxTotalBytes(),
+  };
   for (const filePath of uniquePaths) {
-    snapshots.push(await snapshotFile(filePath));
+    snapshots.push(await snapshotFile(filePath, budget));
   }
 
   const id = `cp_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
