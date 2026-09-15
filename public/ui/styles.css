@@ -151,6 +151,9 @@ body {
 .runtime-kind.edit { color: var(--amber); }
 .runtime-kind.exec { color: var(--blue); }
 .runtime-kind.mcp { color: #bc9cff; }
+.runtime-kind.task { color: var(--green); }
+.runtime-kind.operation { color: #9fb7ff; }
+.runtime-kind.loop { color: var(--amber); }
 .runtime-tool { font-family: var(--mono); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .runtime-summary { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .runtime-time { color: var(--faint); font-family: var(--mono); font-size: 0.7rem; white-space: nowrap; }

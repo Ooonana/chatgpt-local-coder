@@ -23,6 +23,7 @@ await fs.mkdir(tmp, { recursive: true });
 process.env.PERMISSIONS_CONFIG = path.join(tmp, "permissions.json");
 process.env.LOCAL_HOOKS_CONFIG = path.join(tmp, "hooks.json");
 process.env.SUBAGENT_CONFIG = path.join(tmp, "subagents.json");
+process.env.MCP_OPERATION_STATE_DIR = path.join(tmp, "operations");
 
 const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 const server = createMcpServer(root, 15, [root], true);
@@ -35,7 +36,7 @@ const call = async (name, args) => client.callTool({ name, arguments: args });
 await run("new tools are exposed in slim", async () => {
   const listed = await client.listTools();
   const names = new Set(listed.tools.map((tool) => tool.name));
-  for (const name of ["run_commands_parallel", "view_image", "lsp", "pty", "shell_reset", "directory_tree", "git_log", "subagent", "delegate_status"]) {
+  for (const name of ["run_commands_parallel", "view_image", "lsp", "pty", "shell_reset", "directory_tree", "git_log", "subagent", "delegate_status", "read_files", "inspect_project", "verify_project", "process_history"]) {
     if (!names.has(name)) throw new Error(`${name} not exposed`);
   }
   for (const name of ["delete_directory", "git_reset", "git_push", "mcp_call"]) {

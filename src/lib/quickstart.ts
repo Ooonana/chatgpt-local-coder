@@ -4,25 +4,29 @@ export const MCP_QUICKSTART = `
 ## Tool workflow (when agent_status is called)
 1. Project memory + git state are already in MCP instructions from WORKSPACE_PATH.
 2. Call project_context(path) only for a different repo than WORKSPACE_PATH.
-3. Explore with glob (file names) and grep (content), then read_text_file.
-4. Edit with apply_patch (preferred), multi_edit, or write_file for new files.
-5. Run builds/tests with run_command (short), run_commands_parallel (independent commands), or start_process + process_status/process_output (long). Batch independent operations to reduce ChatGPT/MCP round trips. Use pty for truly interactive terminal programs.
-6. For resumable multi-step work, persist objective/plan/findings with agent_task. For isolated Git experiments, use git_worktree.
-7. Undo file edits with rewind (list → preview → restore). Shell/bash file changes are not tracked.
+3. Explore with inspect_project first, then repo_intel for symbol/reference/impact questions; use glob/grep/read_files/read_text_file for lower-level inspection.
+4. For substantial implementation/fix/refactor work, create/resume agent_task and begin coding_loop. Use the returned transaction_id on supported edits, verify through coding_loop, repair in the same transaction, then finish or rollback. For small atomic edits, use edit_transaction directly.
+5. Run builds/tests with coding_loop/verify_project when appropriate, run_command for short commands, run_commands_parallel for independent commands, or start_process + process_status/process_output for long jobs. Use pty for truly interactive terminal programs.
+6. For interrupted substantial work, check coding_loop_status and resume the existing loop instead of rediscovering state. For isolated Git work, prefer coding_loop isolation=worktree; use git_worktree directly when no coding loop is needed.
+7. Undo unrelated ordinary file edits with rewind (list → preview → restore). For transaction-owned edits, use edit_transaction/coding_loop rollback instead. Shell/bash file changes are not tracked.
 
 ## Output format
 All tools return JSON: { ok, tool, summary, data }
 
 ## Tool cheat sheet
-- glob / grep / read_text_file: explore (offset+limit for partial reads; keep large results chunked)
-- apply_patch: single-file @@ hunks OR multi-file *** Begin Patch format
+- coding_loop / coding_loop_status: persistent inspect→edit→verify→repair→finish state machine around regular ChatGPT; supports bounded retries and optional worktree isolation
+- agent_task: persist/resume a multi-step coding objective, structured plan, notes, and status
+- inspect_project / repo_intel: repository reconnaissance plus symbol/reference/impact intelligence
+- edit_transaction: durable preview/verify/accept/conflict-safe rollback boundary for atomic edits
+- glob / grep / read_files / read_text_file: lower-level exploration (keep large results bounded)
+- apply_patch: preferred patch editor; single-file @@ hunks OR multi-file *** Begin Patch format; pass transaction_id when a coding loop/transaction is active
+- verify_project: discover/run bounded repository verification recipes
 - run_command: persistent shell (cd persists); shell_status / shell_reset
 - run_commands_parallel: run independent commands concurrently without mutating persistent cwd
 - start_process / process_status / process_output / process_input / stop_process: background process lifecycle
 - pty: real PTY/ConPTY for TUIs, debuggers, interactive installers, and terminal-native CLIs
 - lsp: semantic hover/definition/references/symbols/diagnostics; TypeScript/JS + Python bundled
 - view_image: return an arbitrary local image path as MCP image content for host visual analysis
-- agent_task: persist/resume a multi-step coding objective, plan, notes, and status
 - subagent: manage a separately configured model-capable runner; it does not reuse the parent ChatGPT subscription
 - delegate_status: detect supported Claude/Codex/Grok/OpenCode CLIs without starting them
 - git_status / git_diff / git_worktree / git_add / git_commit / git_restore

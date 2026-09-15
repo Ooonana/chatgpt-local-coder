@@ -57,12 +57,21 @@ test("runtime overview surfaces are present", () => {
     "dash-active-count",
     "dash-active",
     "dash-recent",
+    "dash-task-count",
+    "dash-agent-task",
+    "dash-operation-count",
+    "dash-operations",
+    "dash-loop-count",
+    "dash-loops",
+    "dash-transaction-count",
+    "dash-transactions",
   ]) {
     if (!html.includes(`id="${id}"`)) throw new Error(`missing ${id}`);
   }
   for (const className of [".overview-hero", ".overview-split", ".runtime-row", ".status-dot.busy"]) {
     if (!css.includes(className)) throw new Error(`missing CSS ${className}`);
   }
+  if (!js.includes("coding_loops")) throw new Error("runtime overview does not render coding loops");
 });
 
 test("responsive UI keeps dedicated mobile layouts", () => {

@@ -56,6 +56,9 @@ const isolatedEnv = {
   LOCAL_HOOKS_CONFIG: path.join(scratch, "hooks.json"),
   SUBAGENT_CONFIG: path.join(scratch, "subagents.json"),
   MCP_UPSTREAM_CONFIG: path.join(scratch, "upstream.json"),
+  MCP_EDIT_TRANSACTION_STATE_DIR: path.join(scratch, "edit-transactions"),
+  MCP_CODING_LOOP_STATE_DIR: path.join(scratch, "coding-loops"),
+  MCP_CODING_LOOP_WORKTREE_ROOT: path.join(scratch, "worktrees"),
   MCP_JSON_RESPONSE: "false",
   MCP_SSE_KEEPALIVE_MS: "1000",
 };
@@ -93,7 +96,7 @@ try {
 
   const uiRes = await fetch(`http://127.0.0.1:${adminPort}/ui`);
   const uiHtml = await uiRes.text();
-  if (!uiRes.ok || !uiHtml.includes('id="overview-last-tool"') || !uiHtml.includes('id="dash-active"')) {
+  if (!uiRes.ok || !uiHtml.includes('id="overview-last-tool"') || !uiHtml.includes('id="dash-active"') || !uiHtml.includes('id="dash-transactions"') || !uiHtml.includes('id="dash-loops"')) {
     throw new Error("admin UI page missing live runtime overview");
   }
   const uiJsRes = await fetch(`http://127.0.0.1:${adminPort}/ui/app.js`);
@@ -105,6 +108,12 @@ try {
     throw new Error("admin UI stylesheet not served");
   }
   console.log("OK  admin UI live overview assets");
+
+  const runtime = await (await fetch(`http://127.0.0.1:${adminPort}/api/runtime`)).json();
+  if (!Array.isArray(runtime.agent_tasks) || !Array.isArray(runtime.operations) || !Array.isArray(runtime.edit_transactions) || !Array.isArray(runtime.coding_loops) || !Array.isArray(runtime.state_errors)) {
+    throw new Error("admin runtime missing persistent agent task/operation/transaction/coding-loop state");
+  }
+  console.log("OK  admin agent runtime state");
 
   const permissions = await (await fetch(`http://127.0.0.1:${adminPort}/api/permissions`)).json();
   if (permissions.config?.profile !== "open") throw new Error("admin permissions endpoint incorrect");
@@ -148,7 +157,23 @@ try {
   const listJson = parseMcpResponseText(listText, listRes.headers.get("content-type") || "");
   const tools = listJson?.result?.tools || [];
   const names = new Set(tools.map((tool) => tool.name));
-  for (const required of ["apply_patch", "run_commands_parallel", "pty", "lsp", "view_image", "subagent", "delegate_status"]) {
+  for (const required of [
+    "apply_patch",
+    "read_files",
+    "inspect_project",
+    "verify_project",
+    "repo_intel",
+    "edit_transaction",
+    "coding_loop",
+    "coding_loop_status",
+    "process_history",
+    "run_commands_parallel",
+    "pty",
+    "lsp",
+    "view_image",
+    "subagent",
+    "delegate_status",
+  ]) {
     if (!names.has(required)) throw new Error(`${required} missing from tools/list`);
   }
   console.log(`OK  tools/list: ${tools.length} tools, ${Math.round(Buffer.byteLength(listText, "utf-8") / 1024)}KB`);

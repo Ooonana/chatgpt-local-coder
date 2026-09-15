@@ -32,6 +32,10 @@ import {
   saveSubagentConfig,
 } from "../lib/subagent-manager.js";
 import { getRuntimeSnapshot } from "../lib/runtime-state.js";
+import { getAgentTaskProgress, listAgentTasks } from "../lib/agent-task-store.js";
+import { listOperationHistory } from "../lib/operation-store.js";
+import { listEditTransactions } from "../lib/edit-transaction-store.js";
+import { listCodingLoops } from "../lib/coding-loop-store.js";
 import { getManagedProcessSnapshot } from "../tools/shell.js";
 import { getPtySessionSnapshot } from "../tools/pty.js";
 import {
@@ -119,15 +123,68 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     });
   });
 
-  router.get("/api/runtime", (_req, res) => {
+  router.get("/api/runtime", async (_req, res) => {
     const memory = process.memoryUsage();
     const subagents = listSubagents().map(({ stdout: _stdout, stderr: _stderr, ...item }) => item);
+    const processes = getManagedProcessSnapshot();
+    const activeProcessIds = new Set(processes.filter((item) => item.running).map((item) => item.id));
+    const [tasksResult, operationsResult, transactionsResult, loopsResult] = await Promise.allSettled([
+      listAgentTasks(),
+      listOperationHistory({ limit: 12, active_ids: activeProcessIds }),
+      listEditTransactions(12),
+      listCodingLoops(12),
+    ]);
+    const tasks = tasksResult.status === "fulfilled" ? tasksResult.value : [];
+    const operations = operationsResult.status === "fulfilled" ? operationsResult.value : [];
+    const editTransactions = transactionsResult.status === "fulfilled" ? transactionsResult.value : [];
+    const codingLoops = loopsResult.status === "fulfilled" ? loopsResult.value : [];
     res.json({
       ok: true,
       runtime: getRuntimeSnapshot(),
-      processes: getManagedProcessSnapshot(),
+      processes,
       ptys: getPtySessionSnapshot(),
       subagents,
+      agent_tasks: tasks.slice(0, 8).map((task) => ({ ...task, progress: getAgentTaskProgress(task) })),
+      operations,
+      edit_transactions: editTransactions.map((transaction) => ({
+        id: transaction.id,
+        label: transaction.label,
+        workspace: transaction.workspace,
+        status: transaction.status,
+        created_at: transaction.created_at,
+        updated_at: transaction.updated_at,
+        files: transaction.snapshots.length,
+        edits: transaction.edits.length,
+        verification: transaction.verification
+          ? {
+              at: transaction.verification.at,
+              preset: transaction.verification.preset,
+              passed: transaction.verification.passed,
+              failed: transaction.verification.failed,
+            }
+          : null,
+      })),
+      coding_loops: codingLoops.map((loop) => ({
+        id: loop.id,
+        goal: loop.goal,
+        task_id: loop.task_id,
+        status: loop.status,
+        phase: loop.phase,
+        workspace: loop.workspace,
+        source_workspace: loop.source_workspace,
+        transaction_id: loop.transaction_id,
+        attempts: loop.attempts.length,
+        max_attempts: loop.max_attempts,
+        last_attempt: loop.attempts.at(-1) ?? null,
+        isolation: loop.isolation,
+        updated_at: loop.updated_at,
+      })),
+      state_errors: [
+        ...(tasksResult.status === "rejected" ? [`agent_tasks: ${String(tasksResult.reason)}`] : []),
+        ...(operationsResult.status === "rejected" ? [`operations: ${String(operationsResult.reason)}`] : []),
+        ...(transactionsResult.status === "rejected" ? [`edit_transactions: ${String(transactionsResult.reason)}`] : []),
+        ...(loopsResult.status === "rejected" ? [`coding_loops: ${String(loopsResult.reason)}`] : []),
+      ],
       memory: {
         rss_bytes: memory.rss,
         heap_used_bytes: memory.heapUsed,

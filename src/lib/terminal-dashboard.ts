@@ -3,6 +3,7 @@ import { setActivityConsoleEnabled } from "./activity-log.js";
 import { getManagedProcessSnapshot } from "../tools/shell.js";
 import { getPtySessionSnapshot } from "../tools/pty.js";
 import { listSubagents } from "./subagent-manager.js";
+import { listCodingLoops, type CodingLoopRecord } from "./coding-loop-store.js";
 
 type LogLevel = "info" | "warn" | "error";
 
@@ -45,6 +46,7 @@ export interface DashboardRenderModel {
   processes: ReturnType<typeof getManagedProcessSnapshot>;
   ptys: ReturnType<typeof getPtySessionSnapshot>;
   subagents: ReturnType<typeof listSubagents>;
+  codingLoops?: CodingLoopRecord[];
   messages: SystemMessage[];
   color: boolean;
 }
@@ -56,9 +58,34 @@ const CURSOR_HIDE = `${CSI}?25l`;
 const CURSOR_SHOW = `${CSI}?25h`;
 const CLEAR = `${CSI}2J${CSI}H`;
 const ANSI_RE = /\x1B\[[0-?]*[ -\/]*[@-~]/g;
+const DEFAULT_DASHBOARD_ROWS = 30;
+const MIN_DASHBOARD_ROWS = 20;
+const MAX_DASHBOARD_ROWS = 60;
 
 function ansi(code: string, text: string, enabled: boolean): string {
   return enabled ? `\x1b[${code}m${text}\x1b[0m` : text;
+}
+
+function tone(text: string, color: boolean, code = "36"): string {
+  return ansi(code, text, color);
+}
+
+function metric(label: string, value: string, color: boolean, valueCode = "36;1"): string {
+  return `${ansi("2", label, color)} ${ansi(valueCode, value, color)}`;
+}
+
+function healthColor(percent: number): string {
+  if (percent >= 70) return "31;1";
+  if (percent >= 35) return "33;1";
+  return "32;1";
+}
+
+export function preferredTerminalDashboardRows(raw = process.env.LOCAL_CODER_TUI_HEIGHT): number | null {
+  const value = (raw ?? String(DEFAULT_DASHBOARD_ROWS)).trim().toLowerCase();
+  if (["auto", "full", "off", "0", "false", "no"].includes(value)) return null;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_DASHBOARD_ROWS;
+  return Math.max(MIN_DASHBOARD_ROWS, Math.min(MAX_DASHBOARD_ROWS, parsed));
 }
 
 function codePointWidth(char: string): number {
@@ -138,16 +165,17 @@ function shortWorkspace(workspace: string): string {
   return normalized.split(/[\\/]/).pop() || normalized;
 }
 
-function section(title: string, width: number): string {
+function section(title: string, width: number, color = false, code = "36;1"): string {
   if (width < 4) return crop("-", width);
   const safeTitle = crop(title, Math.max(1, width - 7));
   const label = `─ ${safeTitle} `;
-  return `├${label}${"─".repeat(Math.max(0, width - measureTerminalCells(label) - 2))}┤`;
+  const line = `├${label}${"─".repeat(Math.max(0, width - measureTerminalCells(label) - 2))}┤`;
+  return tone(line, color, code);
 }
 
-function row(content: string, width: number): string {
+function row(content: string, width: number, color = false): string {
   if (width < 3) return crop(content, width);
-  return `│${pad(` ${content}`, Math.max(0, width - 2))}│`;
+  return `${tone("│", color, "2;36")}${pad(` ${content}`, Math.max(0, width - 2))}${tone("│", color, "2;36")}`;
 }
 
 function toolStatusSymbol(status: "ok" | "error", color: boolean): string {
@@ -183,19 +211,29 @@ function compactDashboard(model: DashboardRenderModel, width: number, height: nu
     model.ptys.filter((item) => item.running).length +
     model.subagents.filter((item) => item.running).length;
   const active = model.runtime.active[0];
+  const activeLoops = (model.codingLoops || []).filter((loop) => loop.status === "active");
   const lastTool = lastToolLabel(model.runtime, nowMs);
   const lines = [
     `Local Coder ONLINE ${clock(model.now)}`,
-    `MCP:${model.mcpPort} S:${model.sessionCount} ${model.transportMode.toUpperCase()} A:${model.runtime.active.length}`,
+    `MCP:${model.mcpPort} S:${model.sessionCount} ${model.transportMode.toUpperCase()} A:${model.runtime.active.length} L:${activeLoops.length}`,
     `calls:${model.runtime.total_calls} err:${model.runtime.total_errors} work:${running} ${lastTool}`,
     active ? `${spinner(nowMs, false)} ${active.tool} ${formatDuration(nowMs - active.started_ms)}` : "idle",
   ];
   return lines.slice(0, height).map((line) => crop(line, width)).join("\n");
 }
 
-function finishFrame(lines: string[], width: number, height: number): string {
+function finishFrame(lines: string[], width: number, height: number, color = false): string {
   if (height <= 0 || width <= 0) return "";
-  if (lines.length <= height) return lines.join("\n");
+  if (lines.length < height) {
+    const bottom = lines.at(-1) || "";
+    const hasBottomBorder = bottom.replace(ANSI_RE, "").startsWith("└");
+    const body = hasBottomBorder ? lines.slice(0, -1) : [...lines];
+    const footer = hasBottomBorder ? bottom : tone(`└${"─".repeat(Math.max(0, width - 2))}┘`, color, "36");
+    while (body.length < height - 1) body.push(row("", width, color));
+    body.push(footer);
+    return body.join("\n");
+  }
+  if (lines.length === height) return lines.join("\n");
   if (height === 1) return crop(lines[0] || "", width);
   const clipped = lines.slice(0, height - 1);
   clipped.push(width >= 3 ? `└${"─".repeat(Math.max(0, width - 2))}┘` : crop("-", width));
@@ -211,30 +249,56 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
   const nowMs = model.now.getTime();
   const uptime = formatDuration(Math.max(0, nowMs - model.startedAtMs));
   const online = ansi("32;1", "● ONLINE", model.color);
+  const activeLoops = (model.codingLoops || []).filter((loop) => loop.status === "active");
 
   const titleLeft = ` Local Coder `;
   const titleRight = ` ${online} `;
   if (width >= measureTerminalCells(titleLeft) + measureTerminalCells(titleRight) + 4) {
     const titleFill = Math.max(0, width - measureTerminalCells(titleLeft) - measureTerminalCells(titleRight) - 2);
-    lines.push(`┌${titleLeft}${"─".repeat(titleFill)}${titleRight}┐`);
+    lines.push(`${tone("┌", model.color, "36")}${ansi("1;36", titleLeft, model.color)}${tone("─".repeat(titleFill), model.color, "2;36")}${titleRight}${tone("┐", model.color, "36")}`);
   } else {
-    lines.push(`┌${pad(" Local Coder", width - 2)}┐`);
+    lines.push(`${tone("┌", model.color, "36")}${ansi("1;36", pad(" Local Coder", width - 2), model.color)}${tone("┐", model.color, "36")}`);
   }
-  lines.push(row(`${clock(model.now)}  uptime ${uptime}  ${lastToolLabel(model.runtime, nowMs)}  PID ${process.pid}  CPU ${model.cpuPercent.toFixed(1)}%  RSS ${formatBytes(model.rssBytes)}  heap ${formatBytes(model.heapBytes)}`, width));
+  lines.push(row([
+    metric("TIME", clock(model.now), model.color, "37;1"),
+    metric("UP", uptime, model.color, "36;1"),
+    ansi("2", lastToolLabel(model.runtime, nowMs), model.color),
+    metric("PID", String(process.pid), model.color, "35;1"),
+    metric("CPU", `${model.cpuPercent.toFixed(1)}%`, model.color, healthColor(model.cpuPercent)),
+    metric("RSS", formatBytes(model.rssBytes), model.color, "35;1"),
+    metric("HEAP", formatBytes(model.heapBytes), model.color, "34;1"),
+  ].join("  "), width, model.color));
 
-  lines.push(section("Connection", width));
+  lines.push(section("Connection", width, model.color, "36;1"));
   const keepAlive = model.transportMode === "sse" ? ` keepalive ${Math.round(model.keepAliveMs / 1000)}s` : "";
-  lines.push(row(`MCP :${model.mcpPort}  ${model.transportMode.toUpperCase()}${keepAlive}  sessions ${model.sessionCount}  auth ${model.authEnabled ? "ON" : "OFF"}  profile ${model.toolProfile}`, width));
-  lines.push(row(`workspace ${shortWorkspace(model.workspace)}  policy ${model.permission.split(":", 1)[0]}  Admin :${model.adminPort}`, width));
+  lines.push(row([
+    metric("MCP", `:${model.mcpPort}`, model.color, "36;1"),
+    ansi("35;1", `${model.transportMode.toUpperCase()}${keepAlive}`, model.color),
+    metric("SESSIONS", String(model.sessionCount), model.color, "34;1"),
+    metric("AUTH", model.authEnabled ? "ON" : "OFF", model.color, model.authEnabled ? "32;1" : "33;1"),
+    metric("PROFILE", model.toolProfile, model.color, "33;1"),
+  ].join("  "), width, model.color));
+  lines.push(row([
+    metric("WORKSPACE", shortWorkspace(model.workspace), model.color, "37;1"),
+    metric("POLICY", model.permission.split(":", 1)[0], model.color, model.permission.startsWith("open") ? "32;1" : "33;1"),
+    metric("LOOPS", String(activeLoops.length), model.color, activeLoops.length ? "35;1" : "36"),
+    metric("ADMIN", `:${model.adminPort}`, model.color, "36;1"),
+  ].join("  "), width, model.color));
 
-  lines.push(section(`Active tools (${model.runtime.active.length})`, width));
-  const activeSlots = height >= 28 ? 4 : height >= 20 ? 3 : 1;
+  if (activeLoops.length && height >= 20) {
+    const loop = activeLoops[0];
+    const attempt = `${loop.attempts.length}/${loop.max_attempts}`;
+    lines.push(row(`${ansi("35;1", "LOOP", model.color)} ${ansi("1", loop.phase.toUpperCase(), model.color)} ${ansi("33;1", attempt, model.color)}  ${loop.goal}`, width, model.color));
+  }
+
+  lines.push(section(`Active tools (${model.runtime.active.length})`, width, model.color, "34;1"));
+  const activeSlots = height >= 30 ? 5 : height >= 24 ? 4 : height >= 20 ? 3 : 1;
   if (!model.runtime.active.length) {
-    lines.push(row(`${ansi("2", "idle", model.color)} — waiting for tool calls`, width));
+    lines.push(row(`${ansi("2", "idle", model.color)}  ${ansi("36", "·", model.color)}  waiting for tool calls`, width, model.color));
   } else {
     for (const call of model.runtime.active.slice(0, activeSlots)) {
       const elapsed = formatDuration(nowMs - call.started_ms).padStart(6);
-      lines.push(row(`${spinner(nowMs, model.color)} ${kindLabel(call.kind, model.color)} ${call.tool.padEnd(22).slice(0, 22)} ${elapsed}  ${call.summary}`, width));
+      lines.push(row(`${spinner(nowMs, model.color)} ${kindLabel(call.kind, model.color)} ${ansi("1", call.tool.padEnd(22).slice(0, 22), model.color)} ${ansi("33", elapsed, model.color)}  ${call.summary}`, width, model.color));
     }
     if (model.runtime.active.length > activeSlots) {
       lines.push(row(`… ${model.runtime.active.length - activeSlots} more active call(s)`, width));
@@ -245,7 +309,7 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
   const runningPtys = model.ptys.filter((item) => item.running);
   const runningAgents = model.subagents.filter((item) => item.running);
   const runningCount = runningProcesses.length + runningPtys.length + runningAgents.length;
-  if (height >= 15) lines.push(section(`Workers (${runningCount})`, width));
+  if (height >= 15) lines.push(section(`Workers (${runningCount})`, width, model.color, "35;1"));
   const runningRows: string[] = [];
   for (const item of runningProcesses) {
     runningRows.push(`BG    ${String(item.pid ?? "-").padEnd(7)} ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${item.command}`);
@@ -257,27 +321,27 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
     runningRows.push(`AGENT ${String(item.pid ?? "-").padEnd(7)} ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${item.label || item.objective}`);
   }
   if (height >= 15) {
-    const workerSlots = height >= 28 ? 4 : height >= 20 ? 2 : 1;
-    if (!runningRows.length) lines.push(row(`${ansi("2", "none", model.color)} — no background process, PTY, or subagent`, width));
-    else for (const item of runningRows.slice(0, workerSlots)) lines.push(row(item, width));
+    const workerSlots = height >= 30 ? 4 : height >= 24 ? 3 : height >= 20 ? 2 : 1;
+    if (!runningRows.length) lines.push(row(`${ansi("2", "none", model.color)}  ${ansi("35", "·", model.color)}  no background process, PTY, or subagent`, width, model.color));
+    else for (const item of runningRows.slice(0, workerSlots)) lines.push(row(item, width, model.color));
     if (runningRows.length > workerSlots) lines.push(row(`… ${runningRows.length - workerSlots} more running item(s)`, width));
   }
 
-  lines.push(section("Activity", width));
+  lines.push(section("Activity", width, model.color, "32;1"));
   const footerReserve = height >= 18 ? 4 : 2;
-  const recentSlots = Math.max(1, Math.min(height >= 28 ? 7 : 4, height - lines.length - footerReserve));
+  const recentSlots = Math.max(1, Math.min(height >= 30 ? 8 : height >= 24 ? 6 : 4, height - lines.length - footerReserve));
   const recent = model.runtime.recent.slice(0, recentSlots);
   if (!recent.length) lines.push(row(`${ansi("2", "no completed calls yet", model.color)}`, width));
   for (const item of recent) {
     const time = new Date(item.finished_at).toLocaleTimeString("en-GB", { hour12: false });
     const summary = item.status === "error" ? item.error || item.summary : item.summary;
-    lines.push(row(`${toolStatusSymbol(item.status, model.color)} ${time} ${kindLabel(item.kind, model.color)} ${item.tool.padEnd(21).slice(0, 21)} ${formatDuration(item.duration_ms).padStart(6)}  ${summary}`, width));
+    lines.push(row(`${toolStatusSymbol(item.status, model.color)} ${ansi("2", time, model.color)} ${kindLabel(item.kind, model.color)} ${ansi("1", item.tool.padEnd(21).slice(0, 21), model.color)} ${ansi("33", formatDuration(item.duration_ms).padStart(6), model.color)}  ${summary}`, width, model.color));
   }
 
   if (height >= 18) {
-    lines.push(section("Usage", width));
+    lines.push(section("Usage", width, model.color, "33;1"));
     const usage = model.runtime.usage.slice(0, 6).map((item) => `${item.tool} ${item.calls}`).join("  ·  ");
-    lines.push(row(usage || "No tool usage yet", width));
+    lines.push(row(usage ? ansi("36", usage, model.color) : ansi("2", "No tool usage yet", model.color), width, model.color));
   }
 
   const latestProblem = [...model.messages].reverse().find(
@@ -285,13 +349,13 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
   );
   if (latestProblem) {
     const label = latestProblem.level === "error" ? ansi("31;1", "ERROR", model.color) : ansi("33;1", "WARN", model.color);
-    lines.push(row(`${label} ${latestProblem.text}`, width));
+    lines.push(row(`${label} ${latestProblem.text}`, width, model.color));
   } else {
     const permission = model.permission.split(":", 1)[0];
-    lines.push(row(`policy ${permission}  ·  ${lastToolLabel(model.runtime, nowMs)}  ·  calls ${model.runtime.total_calls}/${model.runtime.total_errors} err  ·  Ctrl+C stop`, width));
+    lines.push(row(`${metric("POLICY", permission, model.color, permission === "open" ? "32;1" : "33;1")}  ${ansi("36", "·", model.color)}  ${ansi("2", lastToolLabel(model.runtime, nowMs), model.color)}  ${ansi("36", "·", model.color)}  ${metric("CALLS", `${model.runtime.total_calls}/${model.runtime.total_errors} err`, model.color, model.runtime.total_errors ? "31;1" : "32;1")}  ${ansi("36", "·", model.color)}  ${ansi("2", "Ctrl+C stop", model.color)}`, width, model.color));
   }
-  lines.push(`└${"─".repeat(inner)}┘`);
-  return finishFrame(lines, width, height);
+  lines.push(tone(`└${"─".repeat(inner)}┘`, model.color, "36"));
+  return finishFrame(lines, width, height, model.color);
 }
 
 function formatConsoleArgs(args: unknown[]): string {
@@ -339,6 +403,8 @@ export function startTerminalDashboard(options: DashboardOptions): {
   const startedAtMs = Date.now();
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
+  let codingLoopTimer: NodeJS.Timeout | undefined;
+  let codingLoops: CodingLoopRecord[] = [];
   let resizeTimer: NodeJS.Timeout | undefined;
   let renderQueued = false;
   let previousCpu = process.cpuUsage();
@@ -346,6 +412,7 @@ export function startTerminalDashboard(options: DashboardOptions): {
   let cpuPercent = 0;
   let lastWidth = process.stdout.columns && process.stdout.columns > 0 ? process.stdout.columns : 100;
   let lastHeight = process.stdout.rows && process.stdout.rows > 0 ? process.stdout.rows : 30;
+  const preferredRows = preferredTerminalDashboardRows();
 
   const capture = (level: LogLevel, args: unknown[]) => {
     const text = formatConsoleArgs(args);
@@ -377,11 +444,12 @@ export function startTerminalDashboard(options: DashboardOptions): {
     const memory = process.memoryUsage();
     if (process.stdout.columns && process.stdout.columns > 0) lastWidth = process.stdout.columns;
     if (process.stdout.rows && process.stdout.rows > 0) lastHeight = process.stdout.rows;
+    const dashboardHeight = preferredRows === null ? lastHeight : Math.min(lastHeight, preferredRows);
     const frame = renderDashboardFrame({
       now: new Date(),
       startedAtMs,
       width: lastWidth,
-      height: lastHeight,
+      height: dashboardHeight,
       mcpPort: options.mcpPort,
       adminPort: options.adminPort,
       workspace: options.workspace,
@@ -398,6 +466,7 @@ export function startTerminalDashboard(options: DashboardOptions): {
       processes: getManagedProcessSnapshot(),
       ptys: getPtySessionSnapshot(),
       subagents: listSubagents(),
+      codingLoops,
       messages,
       color,
     });
@@ -411,13 +480,25 @@ export function startTerminalDashboard(options: DashboardOptions): {
   }
 
   const unsubscribe = subscribeRuntimeState(queueRender);
+  const refreshCodingLoops = async () => {
+    try {
+      codingLoops = await listCodingLoops(8);
+      queueRender();
+    } catch {}
+  };
+  void refreshCodingLoops();
+  codingLoopTimer = setInterval(() => void refreshCodingLoops(), 2000);
+  codingLoopTimer.unref?.();
   const resize = () => {
     if (resizeTimer) clearTimeout(resizeTimer);
     resizeTimer = setTimeout(queueRender, 40);
     resizeTimer.unref?.();
   };
   process.stdout.on("resize", resize);
-  process.stdout.write(`${ALT_ON}${CURSOR_HIDE}`);
+  const resizeRequest = preferredRows !== null && lastHeight < preferredRows
+    ? `${CSI}8;${preferredRows};${Math.max(40, lastWidth)}t`
+    : "";
+  process.stdout.write(`${ALT_ON}${CURSOR_HIDE}${resizeRequest}`);
   render();
   timer = setInterval(render, 500);
   timer.unref?.();
@@ -426,6 +507,7 @@ export function startTerminalDashboard(options: DashboardOptions): {
     if (stopped) return;
     stopped = true;
     if (timer) clearInterval(timer);
+    if (codingLoopTimer) clearInterval(codingLoopTimer);
     if (resizeTimer) clearTimeout(resizeTimer);
     unsubscribe();
     process.stdout.off("resize", resize);

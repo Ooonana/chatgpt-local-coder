@@ -54,7 +54,7 @@ try {
   }
   ok("core tools exposed in slim");
 
-  for (const t of ["start_process", "process_status", "process_output", "process_input", "stop_process", "clear_processes"]) {
+  for (const t of ["start_process", "process_status", "process_history", "process_output", "process_input", "stop_process", "clear_processes"]) {
     if (!shouldExposeTool(t, "slim")) throw new Error(`${t} missing from slim`);
     if (!LOCAL_TOOL_CATALOG.includes(t)) throw new Error(`${t} missing from local catalog`);
   }
@@ -69,7 +69,10 @@ try {
   }
   ok("high-value local developer tools exposed in slim");
 
-  for (const t of ["git_worktree", "agent_task", "subagent"]) {
+  for (const t of [
+    "git_worktree", "agent_task", "read_files", "inspect_project", "verify_project",
+    "repo_intel", "edit_transaction", "coding_loop_status", "coding_loop", "subagent",
+  ]) {
     if (!shouldExposeTool(t, "slim")) throw new Error(`${t} missing from slim`);
     if (!LOCAL_TOOL_CATALOG.includes(t)) throw new Error(`${t} missing from local catalog`);
   }

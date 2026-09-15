@@ -14,9 +14,18 @@ import {
   getWinShell,
   transpileCompoundOperators,
 } from "../lib/persistent-shell.js";
+import {
+  getOperationRecord,
+  listOperationHistory,
+  recordOperationFinish,
+  recordOperationStart,
+} from "../lib/operation-store.js";
+import { getAgentTask } from "../lib/agent-task-store.js";
 
 interface ManagedProcess {
   id: string;
+  label?: string;
+  taskId?: string;
   command: string;
   cwd: string;
   startedAt: string;
@@ -26,6 +35,10 @@ interface ManagedProcess {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   spawnError?: string;
+  stopRequested?: boolean;
+  startWrite?: Promise<void>;
+  historyWrite?: Promise<void>;
+  historyError?: string;
 }
 
 interface OneShotCommandResult {
@@ -47,6 +60,8 @@ const MAX_COMMAND_CHARS = 500_000;
 export function getManagedProcessSnapshot() {
   return [...processes.values()].map((item) => ({
     id: item.id,
+    label: item.label,
+    task_id: item.taskId,
     pid: item.child.pid,
     command: item.command,
     cwd: item.cwd,
@@ -200,6 +215,7 @@ export async function shutdownManagedProcesses(): Promise<void> {
   const active = [...processes.values()].filter(
     (item) => item.exitCode === null && item.signal === null && !item.spawnError
   );
+  for (const item of active) item.stopRequested = true;
   await Promise.allSettled(active.map((item) => terminateProcessTree(item, true)));
   await Promise.all(active.map((item) => waitForManagedProcessExit(item)));
 }
@@ -344,14 +360,23 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     "start_process",
     {
       title: "Start Background Process",
-      description: "Start a long-running command in the background. Use process_output/process_status/stop_process afterwards.",
-      inputSchema: { command: z.string().max(MAX_COMMAND_CHARS), working_directory: z.string().optional() },
+      description: "Start a named long-running operation in the background. Optionally link it to a persistent agent_task; use process_output/process_status/process_history/stop_process afterwards.",
+      inputSchema: {
+        command: z.string().max(MAX_COMMAND_CHARS),
+        working_directory: z.string().optional(),
+        label: z.string().max(160).optional(),
+        task_id: z.string().optional(),
+      },
 
       annotations: toolAnnotations("command"),
     },
-    async ({ command, working_directory }) => {
+    async ({ command, working_directory, label, task_id }) => {
       const cwd = working_directory ? await validatePath(working_directory) : getShellStatus().cwd || defaultCwd;
       requireCommandAllowed(command, cwd);
+      if (task_id) {
+        const task = await getAgentTask(task_id);
+        if (!task) throw new Error(`Unknown agent task id: ${task_id}`);
+      }
       const { shell, args } = getShellInvocation(command);
 
       const child = spawn(shell, args, {
@@ -385,6 +410,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const item: ManagedProcess = {
         id,
+        label: label?.trim() || undefined,
+        taskId: task_id,
         command,
         cwd,
         startedAt: new Date().toISOString(),
@@ -402,13 +429,53 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         if (item.exitCode === null) item.exitCode = 1;
         appendLog(item.stderr, Buffer.from(`\n[process error] ${error.message}\n`));
       });
+      item.startWrite = recordOperationStart({
+        id,
+        label: item.label,
+        task_id: item.taskId,
+        command,
+        cwd,
+        pid: child.pid,
+        status: "running",
+        started_at: item.startedAt,
+      });
       child.on("close", (code, signal) => {
         item.exitCode = code ?? item.exitCode ?? (item.spawnError ? 1 : null);
         item.signal = signal;
+        const status = item.spawnError || (item.exitCode !== null && item.exitCode !== 0)
+          ? "failed"
+          : item.stopRequested || signal
+            ? "stopped"
+            : "completed";
+        item.historyWrite = (async () => {
+          // A very fast process can exit before the durable start record has
+          // finished writing. Serialize finish behind start so it can never be
+          // lost merely because the child completed during persistence.
+          await item.startWrite;
+          await recordOperationFinish(item.id, {
+            status,
+            finished_at: new Date().toISOString(),
+            exit_code: item.exitCode,
+            signal: item.signal,
+            spawn_error: item.spawnError,
+            stdout_tail: item.stdout.join(""),
+            stderr_tail: item.stderr.join(""),
+          });
+        })().catch((error) => {
+          item.historyError = error instanceof Error ? error.message : String(error);
+        });
       });
+      try {
+        await item.startWrite;
+      } catch (error) {
+        item.stopRequested = true;
+        processes.delete(id);
+        await terminateProcessTree(item, true).catch(() => undefined);
+        throw new Error(`Failed to persist background operation state: ${error instanceof Error ? error.message : String(error)}`);
+      }
       await audit({ tool: "start_process", action: "start", target: cwd, status: "ok", details: { id, command } });
-      return toolResult("start_process", { id, pid: child.pid, command, cwd, started_at: item.startedAt }, {
-        summary: `started ${id}`,
+      return toolResult("start_process", { id, label: item.label, task_id: item.taskId, pid: child.pid, command, cwd, started_at: item.startedAt }, {
+        summary: `started ${item.label || id}`,
       });
     }
   );
@@ -427,6 +494,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         .filter((p) => !id || p.id === id)
         .map((p) => ({
           id: p.id,
+          label: p.label,
+          task_id: p.taskId,
           pid: p.child.pid,
           command: p.command,
           cwd: p.cwd,
@@ -436,8 +505,45 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           exit_code: p.exitCode,
           signal: p.signal,
           spawn_error: p.spawnError ?? null,
+          history_error: p.historyError ?? null,
         }));
       return toolResult("process_status", { processes: processes_list }, { summary: `${processes_list.length} process(es)` });
+    }
+  );
+
+  server.registerTool(
+    "process_history",
+    {
+      title: "Process Operation History",
+      description:
+        "Read persistent background-operation history across ChatGPT/MCP sessions and server restarts. Stale records that were running before a restart are reported as interrupted.",
+      inputSchema: {
+        id: z.string().optional(),
+        task_id: z.string().optional(),
+        limit: z.number().int().positive().max(200).optional().default(50),
+      },
+      annotations: toolAnnotations("read"),
+    },
+    async ({ id, task_id, limit }) => {
+      if (id) {
+        const live = processes.get(id);
+        if (live?.historyWrite) await live.historyWrite;
+        if (live?.historyError) throw new Error(`Operation history persistence failed: ${live.historyError}`);
+      } else {
+        await Promise.all([...processes.values()].map((item) => item.historyWrite).filter(Boolean));
+      }
+      const activeIds = new Set(
+        [...processes.values()]
+          .filter((item) => item.exitCode === null && item.signal === null)
+          .map((item) => item.id)
+      );
+      if (id) {
+        const operation = await getOperationRecord(id, activeIds);
+        if (!operation) throw new Error(`Unknown operation id: ${id}`);
+        return toolResult("process_history", { operation }, { summary: `${operation.label || operation.id} — ${operation.effective_status}` });
+      }
+      const operations = await listOperationHistory({ limit, task_id, active_ids: activeIds });
+      return toolResult("process_history", { operations, count: operations.length }, { summary: `${operations.length} operation(s)` });
     }
   );
 
@@ -458,6 +564,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       if (!item) throw new Error(`Unknown process id: ${id}`);
       const data = {
         id,
+        label: item.label,
+        task_id: item.taskId,
         pid: item.child.pid,
         command: item.command,
         cwd: item.cwd,
@@ -466,6 +574,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         exit_code: item.exitCode,
         signal: item.signal,
         spawn_error: item.spawnError ?? null,
+        history_error: item.historyError ?? null,
         stdout: item.stdout.join("").slice(-tail_chars),
         stderr: item.stderr.join("").slice(-tail_chars),
       };
@@ -534,6 +643,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       if (item.exitCode !== null || item.signal !== null) {
         return toolResult("stop_process", { id, already_exited: true }, { summary: `${id} already exited` });
       }
+      item.stopRequested = true;
       await terminateProcessTree(item, force);
       await audit({ tool: "stop_process", action: "stop", target: item.cwd, status: "ok", details: { id, force } });
       return toolResult("stop_process", { id, force }, { summary: `stop sent to ${id}` });

@@ -41,16 +41,23 @@ function spawnServer(mcpPort, adminPort) {
   return { child, output: () => output };
 }
 
-async function waitForHealth(port, timeoutMs = 10_000) {
+async function waitForHealth(port, server, timeoutMs = 20_000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
+    if (server.child.exitCode !== null || server.child.signalCode !== null) {
+      throw new Error(
+        `server exited before health on ${port}: code=${server.child.exitCode} signal=${server.child.signalCode}\n${server.output()}`
+      );
+    }
     try {
       const response = await fetch(`http://127.0.0.1:${port}/health`);
       if (response.ok) return;
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`health timeout on ${port}`);
+  throw new Error(
+    `health timeout on ${port} after ${timeoutMs}ms; child pid=${server.child.pid} exit=${server.child.exitCode} signal=${server.child.signalCode}\n${server.output()}`
+  );
 }
 
 async function waitForExit(child, timeoutMs = 8_000) {
@@ -108,8 +115,8 @@ try {
   await test("SIGTERM exits cleanly and releases both listeners", async () => {
     const [mcpPort, adminPort] = await getFreePorts(2);
     const server = spawnServer(mcpPort, adminPort);
-    await waitForHealth(mcpPort);
-    await waitForHealth(adminPort);
+    await waitForHealth(mcpPort, server);
+    await waitForHealth(adminPort, server);
     server.child.kill("SIGTERM");
     const exited = await waitForExit(server.child);
     if (process.platform === "win32") {

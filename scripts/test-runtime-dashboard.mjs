@@ -85,11 +85,36 @@ await test("dashboard renders stable operational sections", async () => {
     heapBytes: 64 * 1024 * 1024,
     runtime: snapshot,
     processes: [{ id: "bg1", pid: 123, command: "npm run dev", cwd: "C:\\x", started_at: now.toISOString(), running: true, exit_code: null, signal: null }],
+    codingLoops: [{ status: "active", phase: "repair", attempts: [{}], max_attempts: 4, goal: "repair loop" }],
   }));
-  for (const label of ["Local Coder", "Connection", "Active tools", "Workers", "Activity", "Usage", "CPU 12.5%", "last tool 0ms ago", "SSE keepalive 10s", "npm run dev"]) {
+  for (const label of ["Local Coder", "Connection", "Active tools", "Workers", "Activity", "Usage", "CPU 12.5%", "last tool 0ms ago", "SSE keepalive 10s", "LOOPS 1", "LOOP REPAIR 1/4", "repair loop", "npm run dev"]) {
     assert.match(frame, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
   assertFits(frame, 110, 30);
+  assert.equal(frame.split("\n").length, 30, "desktop dashboard should fill its fixed canvas height");
+});
+
+await test("dashboard uses color accents without changing terminal width", async () => {
+  const now = new Date("2026-09-14T13:00:00.000Z");
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 120,
+    height: 30,
+    color: true,
+    cpuPercent: 42,
+  }));
+  assert.match(frame, /\x1b\[/, "expected ANSI color sequences");
+  assert.match(frame, /ONLINE/);
+  assert.match(frame, /PROFILE/);
+  assert.equal(frame.split("\n").length, 30);
+  assertFits(frame, 120, 30);
+});
+
+await test("dashboard height preference defaults to 30 rows and stays bounded", async () => {
+  assert.equal(dashboard.preferredTerminalDashboardRows(undefined), 30);
+  assert.equal(dashboard.preferredTerminalDashboardRows("36"), 36);
+  assert.equal(dashboard.preferredTerminalDashboardRows("8"), 20);
+  assert.equal(dashboard.preferredTerminalDashboardRows("200"), 60);
+  assert.equal(dashboard.preferredTerminalDashboardRows("auto"), null);
 });
 
 await test("dashboard shows elapsed time since last tool activity", async () => {

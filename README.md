@@ -39,7 +39,9 @@ No separate coding client. No vendor lock-in. Run one Node process on your PC, e
 | Edit your repo | ❌ | ✅ `apply_patch`, `edit_file`, `multi_edit` |
 | Run tests / builds | ❌ | ✅ `run_command`, `start_process` |
 | Git workflow | ❌ | ✅ `git_status`, `git_commit`, `git_push`, … |
-| Explore codebase | Limited | ✅ `glob`, `grep`, `list_directory` |
+| Explore codebase | Limited | ✅ `inspect_project`, `repo_intel`, `glob`, `grep`, `lsp` |
+| Review/rollback a change set | ❌ | ✅ `edit_transaction` with preview, verify, accept/rollback |
+| Resumable coding-agent loop | ❌ | ✅ `coding_loop` with persistent context, bounded repair attempts, transaction ownership, and optional worktree isolation |
 | Full disk access | ❌ | ✅ Any path by default with the `open` profile |
 | Session recovery | — | ✅ Auto-recover after server restart |
 
@@ -79,9 +81,9 @@ Server runs at `http://127.0.0.1:3000` — health check: `http://127.0.0.1:3000/
 
 ### Live terminal dashboard
 
-Interactive launches use a clean alternate-screen TUI instead of scrolling request logs. It shows the current time and uptime, sessions, active tool calls and their kind (`READ`, `EDIT`, `EXEC`, `MCP`), elapsed time, background processes/PTYs/subagents, recent completions, per-tool usage, CPU, RSS, and heap memory. Resize-safe rendering is bounded to the terminal viewport; non-interactive/CI/redirected output automatically falls back to normal logs.
+Interactive launches use a clean alternate-screen TUI instead of scrolling request logs. The desktop view uses a stable **30-row canvas by default**, requests a one-time resize upward when the terminal is shorter, and uses color-coded connection, health, tool-kind, worker, activity, and usage surfaces. It shows the current time and uptime, sessions, active tool calls and their kind (`READ`, `EDIT`, `EXEC`, `MCP`), elapsed time, coding-loop state, background processes/PTYs/subagents, recent completions, per-tool usage, CPU, RSS, and heap memory. Narrow/tiny terminals still fall back to the compact resize-safe layouts; non-interactive/CI/redirected output automatically falls back to normal logs.
 
-Set `LOCAL_CODER_TUI=off` to force traditional logs, or `LOCAL_CODER_TUI=on` to request the dashboard when stdout is a TTY.
+Set `LOCAL_CODER_TUI=off` to force traditional logs, or `LOCAL_CODER_TUI=on` to request the dashboard when stdout is a TTY. `LOCAL_CODER_TUI_HEIGHT=30` controls the preferred desktop height (20–60 rows); set it to `auto` or `0` to follow the terminal height without requesting a resize.
 
 Set `WORKSPACE_PATH` to your project root (absolute path). With `MCP_TOKEN` set, the MCP endpoint becomes `/mcp/<token>` — that full path is what goes in the connector.
 
@@ -104,7 +106,7 @@ See [Tunnel options](#-tunnel-options) below. You need a **public HTTPS** URL po
 | Field | Value |
 |-------|-------|
 | **Name** | `Local Coder` |
-| **Description** | `Local coding agent. First call agent_status + project_context. Use glob/grep to explore, apply_patch to edit, run_command for shell.` |
+| **Description** | `Local coding-agent runtime for regular ChatGPT. Use inspect_project + agent_task for non-trivial work, apply_patch to edit, and verify_project to verify.` |
 | **URL** | `https://<your-tunnel>/mcp/<MCP_TOKEN>` — see below |
 | **Authentication** | None (the token is already in the URL) |
 
@@ -216,6 +218,7 @@ Native tools use structured JSON responses `{ ok, tool, summary, data }`. The so
 | Tool | Description |
 |------|-------------|
 | `read_text_file` | Read source files (offset + limit) |
+| `read_files` | Read up to 24 independent files/ranges in one bounded MCP call |
 | `write_file` | Create or overwrite files |
 | `edit_file` | Find-and-replace edits |
 | `multi_edit` | Multiple edits in one file |
@@ -238,7 +241,8 @@ Native tools use structured JSON responses `{ ok, tool, summary, data }`. The so
 | `run_commands_parallel` | Run independent commands concurrently in isolated shell processes |
 | `shell_status` / `shell_reset` | Persistent shell session |
 | `start_process` | Long-running / background commands |
-| `process_status` / `process_output` | Inspect background jobs and logs |
+| `process_status` / `process_output` | Inspect live background jobs and logs |
+| `process_history` | Persistent named operation history across MCP/server restarts; stale running jobs are reported as interrupted |
 | `process_input` | Send piped stdin to prompts/REPLs (`append_newline`, optional EOF); not a full PTY |
 | `stop_process` | Stop the background process tree (important for dev servers on Windows) |
 | `pty` | Real PTY/ConPTY session for TUIs, debuggers, interactive installers, and terminal-native CLIs |
@@ -247,6 +251,7 @@ Native tools use structured JSON responses `{ ok, tool, summary, data }`. The so
 
 | Tool | Description |
 |------|-------------|
+| `repo_intel` | High-level repository symbol search, references, and impact analysis. Uses LSP first and bounded lexical coverage/fallback |
 | `lsp` | Hover, definition, references, document/workspace symbols, and diagnostics. TypeScript/JS + Python are bundled; clangd/rust-analyzer/gopls are detected when installed |
 | `view_image` | Return a local PNG/JPEG/WEBP/GIF path as MCP image content for ChatGPT visual analysis |
 
@@ -272,9 +277,39 @@ The default slim profile intentionally exposes high-value local development help
 
 | Tool | Description |
 |------|-------------|
-| `agent_task` | Persist/resume a multi-step coding objective, workspace, plan, notes, and status across MCP sessions |
+| `agent_task` | Persist/resume a multi-step coding objective with structured `pending` / `in_progress` / `completed` / `blocked` / `skipped` plan steps |
+| `inspect_project` | One-call repository reconnaissance: manifests, scripts, package manager, Git state, top-level layout, and language/file distribution |
+| `verify_project` | Discover or run a deterministic bounded verification recipe and return compact pass/fail evidence |
+| `edit_transaction` | Begin a durable touched-file transaction, preview its aggregate diff, run verification, then accept or conflict-safe rollback |
+| `coding_loop` | Durable Codex-like implementation loop: begin/resume/refresh/verify/finish/rollback/cleanup with bounded repair attempts and optional Git-worktree isolation |
+| `coding_loop_status` | Read recent or specific persistent coding-loop state without requesting a mutating tool |
 
-`agent_task` stores coordination state only; it does not start another model or hidden subagent.
+The agent loop is deliberately split between **regular ChatGPT** and Local Coder: ChatGPT performs reasoning and decides the next action; Local Coder persists the objective/plan/progress, local operations, verification evidence, files, shell, Git, and code intelligence. `agent_task` therefore adds durable coding-agent structure without starting another model or hidden subagent.
+
+For a non-trivial task the intended flow is:
+
+```text
+inspect_project → agent_task(start/resume) → coding_loop(begin) → edit(transaction_id) → coding_loop(verify) → repair/verify → finish or rollback
+```
+
+`coding_loop` does **not** run another AI model. Regular ChatGPT still reasons, chooses edits, and interprets failures; Local Coder supplies the durable state machine around it. Each loop owns one `edit_transaction`, records compact verification evidence, limits repair attempts, and can resume after an MCP/chat reconnect. A failed loop only receives more attempts through an explicit `resume` with an extended budget.
+
+With `isolation=worktree`, the loop creates an isolated Git checkout, returns a branch/path handoff on completion, and never auto-merges into the source checkout. `cleanup` removes the worktree separately and leaves the branch for review. By default a dirty source checkout is rejected because uncommitted changes are not part of the new worktree.
+
+`start_process` also accepts an optional label and `task_id`, allowing long builds/dev servers to appear as durable operations associated with the persistent task.
+
+Projects can override the auto-discovered verification recipe with `.local-coder/verification.json`:
+
+```json
+{
+  "version": 1,
+  "quick": ["npm run build"],
+  "full": [
+    { "label": "build", "command": "npm run build", "timeout_seconds": 180 },
+    { "label": "tests", "command": "npm test", "timeout_seconds": 600 }
+  ]
+}
+```
 
 ### External delegation
 
@@ -329,6 +364,13 @@ OPENAI_TUNNEL_API_KEY=
 | `MCP_JSON_RESPONSE` | `false` | Keep `false` for SSE tool responses with heartbeat frames. Set `true` only as a compatibility fallback for clients that require one JSON response at the end |
 | `MCP_SSE_KEEPALIVE_MS` | `10000` | SSE heartbeat interval for long MCP calls. The server clamps this to 1–60 seconds |
 | `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
+| `MCP_AGENT_TASK_STATE_DIR` | `.mcp-state/agent-tasks` | Durable regular-ChatGPT coding-task/plan state |
+| `MCP_OPERATION_STATE_DIR` | `.mcp-state/operations` | Durable background-operation history and bounded output tails |
+| `MCP_EDIT_TRANSACTION_STATE_DIR` | `.mcp-state/edit-transactions` | Durable transaction metadata and baseline snapshots for transaction-aware edits |
+| `MCP_EDIT_TRANSACTION_MAX_FILE_BYTES` | `16777216` | Per-file baseline snapshot limit for edit transactions |
+| `MCP_EDIT_TRANSACTION_MAX_TOTAL_BYTES` | `67108864` | Total baseline snapshot limit for one edit transaction |
+| `MCP_CODING_LOOP_STATE_DIR` | `.mcp-state/coding-loops` | Durable coding-loop context, retry, phase, isolation, and verification-attempt state |
+| `MCP_CODING_LOOP_WORKTREE_ROOT` | OS temp directory | Optional root for `coding_loop isolation=worktree`; restricted profiles should choose a path inside an allowed root |
 | `PERMISSIONS_CONFIG` | `profiles/permissions.json` | Optional permission-profile file (`open`, `workspace`, `read_only`, or `custom`). Missing file defaults to `open` |
 
 > Variables already set in your shell **win over `.env`** (`dotenv` does not override). If a change to `.env` seems ignored, check `env | grep WORKSPACE_PATH` first.
@@ -351,7 +393,7 @@ The exact URL is printed in the startup banner. Stopping the server stops the ad
 
 | Tab | What it does |
 |-----|--------------|
-| **Overview** | PID, active ChatGPT sessions, default cwd, upstream health |
+| **Overview** | Live ChatGPT tool calls plus persistent agent plan/progress, coding loops, background operation history, edit transactions, PID/sessions/workers, and upstream health |
 | **MCP Servers** | Enable/disable upstream MCP servers, test connections, inspect their tools |
 | **Import** | Pull existing MCP config from Cursor / Claude Code / OpenCode |
 | **Activity** | Live tool-call log from ChatGPT (SSE stream) |
@@ -371,13 +413,24 @@ src/
 ├── server-factory.ts        # Tool registration
 ├── lib/
 │   ├── mcp-session-manager.ts   # Session recovery, TTL
-│   ├── patch.ts             # apply_patch engine
-│   └── persistent-shell.ts  # Stateful shell
+│   ├── agent-task-store.ts      # Persistent structured coding plan state
+│   ├── operation-store.ts       # Persistent background-operation history
+│   ├── edit-transaction-store.ts # Durable transaction baselines + rollback
+│   ├── coding-loop-store.ts      # Persistent coding-loop phases, attempts, context + worktree handoff
+│   ├── repository-intelligence.ts # Symbol/reference/impact intelligence
+│   ├── project-inspection.ts    # Compact repository reconnaissance
+│   ├── verification.ts          # Verification recipes + output compaction
+│   ├── patch.ts                 # apply_patch engine
+│   └── persistent-shell.ts      # Stateful shell
 └── tools/
-    ├── filesystem.ts        # filesystem/search/edit tools
-    ├── shell.ts             # shell + background process tools
+    ├── filesystem.ts        # filesystem/search/edit + batch reads
+    ├── shell.ts             # shell + durable background operations
     ├── git.ts               # Git + worktree tools
-    ├── agent-task.ts        # persistent multi-step task state
+    ├── agent-task.ts        # persistent structured plan state
+    ├── agent-runtime.ts     # inspect_project + verify_project
+    ├── repository-intelligence.ts # repo_intel
+    ├── edit-transaction.ts  # transactional edit lifecycle
+    ├── coding-loop.ts       # resumable Codex-like execution loop around regular ChatGPT
     └── context.ts           # agent_status, project_context
 ```
 

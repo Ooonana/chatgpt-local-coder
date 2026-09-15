@@ -12,6 +12,7 @@ import { enrichAfterEdit } from "../lib/edit-enrichment.js";
 import { toolResult } from "../lib/tool-result.js";
 import { globFiles } from "../lib/glob-search.js";
 import { grepSearch } from "../lib/grep-search.js";
+import { captureTransactionPaths, recordTransactionEdit, withEditTransactionLock } from "../lib/edit-transaction-store.js";
 
 const MAX_TEXT_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_EDITABLE_TEXT_BYTES = 16 * 1024 * 1024;
@@ -23,6 +24,9 @@ const MAX_PATCH_CHARS = 2_000_000;
 const MAX_TREE_ENTRIES = 20_000;
 const MAX_SEARCH_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_DIRECTORY_LIST_ENTRIES = 5_000;
+const MAX_BATCH_READ_FILES = 24;
+const MAX_BATCH_READ_TOTAL_CHARS = 600_000;
+const MAX_BATCH_READ_FILE_BYTES = 16 * 1024 * 1024;
 
 async function readEditableTextFile(filePath: string): Promise<string> {
   const stat = await fs.stat(filePath);
@@ -154,6 +158,95 @@ export function registerFilesystemTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "read_files",
+    {
+      title: "Read Multiple Text Files",
+      description:
+        "Read several local text files/ranges in one MCP call to reduce agent round trips. Results are individually error-isolated and the combined payload is bounded.",
+      inputSchema: {
+        files: z.array(z.object({
+          path: z.string(),
+          offset: z.number().int().positive().optional().describe("1-based start line"),
+          limit: z.number().int().positive().max(20_000).optional(),
+          head: z.number().int().positive().max(20_000).optional(),
+          tail: z.number().int().positive().max(20_000).optional(),
+          max_chars: z.number().int().positive().max(200_000).optional().default(80_000),
+        })).min(1).max(MAX_BATCH_READ_FILES),
+      },
+      annotations: toolAnnotations("read"),
+    },
+    async ({ files }) => {
+      const results: Array<{
+        path: string;
+        content?: string;
+        lines?: number;
+        truncated?: boolean;
+        error?: string;
+      }> = [];
+      let remaining = MAX_BATCH_READ_TOTAL_CHARS;
+
+      for (const spec of files) {
+        if (remaining <= 0) {
+          results.push({ path: spec.path, truncated: true, error: "batch output budget exhausted" });
+          continue;
+        }
+        try {
+          const validPath = await validatePath(spec.path);
+          const stat = await fs.stat(validPath);
+          if (!stat.isFile()) throw new Error("Path is not a regular file");
+          if (stat.size > MAX_BATCH_READ_FILE_BYTES) {
+            throw new Error(`Batch text read is limited to ${MAX_BATCH_READ_FILE_BYTES} bytes per file (${stat.size} bytes)`);
+          }
+          const content = await fs.readFile(validPath, "utf-8");
+          const lines = content.split("\n");
+          let selected: string;
+          let selectedLines = lines.length;
+
+          if (spec.offset !== undefined) {
+            const start = Math.max(0, spec.offset - 1);
+            const end = spec.limit !== undefined ? start + spec.limit : lines.length;
+            const slice = lines.slice(start, end);
+            selectedLines = slice.length;
+            selected = slice.map((line, idx) => `${String(start + idx + 1).padStart(6, " ")}|${line}`).join("\n");
+          } else if (spec.head !== undefined) {
+            const slice = lines.slice(0, spec.head);
+            selectedLines = slice.length;
+            selected = slice.join("\n");
+          } else if (spec.tail !== undefined) {
+            const slice = lines.slice(-spec.tail);
+            selectedLines = slice.length;
+            selected = slice.join("\n");
+          } else {
+            selected = content;
+          }
+
+          const budget = Math.min(spec.max_chars, remaining);
+          const truncated = selected.length > budget;
+          const bounded = truncated ? selected.slice(0, budget) : selected;
+          remaining -= bounded.length;
+          results.push({ path: validPath, content: bounded, lines: selectedLines, truncated });
+        } catch (error) {
+          results.push({ path: spec.path, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      const failed = results.filter((item) => item.error).length;
+      await audit({
+        tool: "read_files",
+        action: "read",
+        target: results[0]?.path || "batch",
+        status: failed === results.length ? "error" : "ok",
+        details: { count: results.length, failed, output_chars: MAX_BATCH_READ_TOTAL_CHARS - remaining },
+      });
+      return toolResult(
+        "read_files",
+        { results, count: results.length, failed, output_chars: MAX_BATCH_READ_TOTAL_CHARS - remaining },
+        { ok: failed < results.length, summary: `${results.length - failed}/${results.length} file(s) read` }
+      );
+    }
+  );
+
+  server.registerTool(
     "read_file_base64",
     {
       title: "Read File Base64",
@@ -200,23 +293,29 @@ export function registerFilesystemTools(server: McpServer): void {
     {
       title: "Write File",
       description: "Save text to a local file. Routine local file update.",
-      inputSchema: { path: z.string(), content: z.string().max(MAX_TEXT_INPUT_CHARS) },
+      inputSchema: {
+        path: z.string(),
+        content: z.string().max(MAX_TEXT_INPUT_CHARS),
+        transaction_id: z.string().optional(),
+      },
 
       annotations: toolAnnotations("edit"),
     },
-    async ({ path: filePath, content }) => {
+    async ({ path: filePath, content, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
+      if (transaction_id) await captureTransactionPaths(transaction_id, [validPath]);
       const checkpointId = await checkpointBefore("write_file", [validPath]);
       await fs.mkdir(path.dirname(validPath), { recursive: true });
       await fs.writeFile(validPath, content, "utf-8");
+      if (transaction_id) await recordTransactionEdit(transaction_id, "write_file", [validPath], checkpointId);
       await audit({ tool: "write_file", action: "write", target: validPath, status: "ok", details: { bytes: Buffer.byteLength(content) } });
       const data = await enrichAfterEdit(
-        { path: validPath, bytes: Buffer.byteLength(content), checkpoint_id: checkpointId },
+        { path: validPath, bytes: Buffer.byteLength(content), checkpoint_id: checkpointId, transaction_id: transaction_id ?? null },
         [validPath]
       );
       return toolResult("write_file", data);
-    }
+    })
   );
 
   server.registerTool(
@@ -224,20 +323,26 @@ export function registerFilesystemTools(server: McpServer): void {
     {
       title: "Write File Base64",
       description: "Create or overwrite a binary file from base64 content.",
-      inputSchema: { path: z.string(), content: z.string().max(MAX_BASE64_INPUT_CHARS) },
+      inputSchema: {
+        path: z.string(),
+        content: z.string().max(MAX_BASE64_INPUT_CHARS),
+        transaction_id: z.string().optional(),
+      },
 
       annotations: toolAnnotations("edit"),
     },
-    async ({ path: filePath, content }) => {
+    async ({ path: filePath, content, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
+      if (transaction_id) await captureTransactionPaths(transaction_id, [validPath]);
       const checkpointId = await checkpointBefore("write_file_base64", [validPath]);
       const buffer = Buffer.from(content, "base64");
       await fs.mkdir(path.dirname(validPath), { recursive: true });
       await fs.writeFile(validPath, buffer);
+      if (transaction_id) await recordTransactionEdit(transaction_id, "write_file_base64", [validPath], checkpointId);
       await audit({ tool: "write_file_base64", action: "write", target: validPath, status: "ok", details: { bytes: buffer.length } });
-      return toolResult("write_file_base64", { path: validPath, bytes: buffer.length, checkpoint_id: checkpointId });
-    }
+      return toolResult("write_file_base64", { path: validPath, bytes: buffer.length, checkpoint_id: checkpointId, transaction_id: transaction_id ?? null });
+    })
   );
 
   server.registerTool(
@@ -251,23 +356,26 @@ export function registerFilesystemTools(server: McpServer): void {
         new_text: z.string().max(MAX_EDIT_FRAGMENT_CHARS),
         replace_all: z.boolean().optional().default(false),
         dry_run: z.boolean().optional().default(false),
+        transaction_id: z.string().optional(),
       },
 
       annotations: toolAnnotations("edit"),
     },
-    async ({ path: filePath, old_text, new_text, replace_all, dry_run }) => {
+    async ({ path: filePath, old_text, new_text, replace_all, dry_run, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
       const content = await readEditableTextFile(validPath);
       if (!content.includes(old_text)) throw new Error("old_text not found in file. Ensure exact match.");
       const newContent = replace_all ? content.split(old_text).join(new_text) : content.replace(old_text, new_text);
       const diff = buildSimpleDiff(content, newContent);
+      if (transaction_id && !dry_run) await captureTransactionPaths(transaction_id, [validPath]);
       const checkpointId = await checkpointBefore("edit_file", [validPath], { dry_run });
       if (!dry_run) await fs.writeFile(validPath, newContent, "utf-8");
+      if (transaction_id && !dry_run) await recordTransactionEdit(transaction_id, "edit_file", [validPath], checkpointId);
       await audit({ tool: "edit_file", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok" });
-      const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId }, [validPath], dry_run);
+      const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId, transaction_id: transaction_id ?? null }, [validPath], dry_run);
       return toolResult("edit_file", data, { summary: dry_run ? `dry-run ${validPath}` : `edited ${validPath}` });
-    }
+    })
   );
 
   server.registerTool(
@@ -283,11 +391,12 @@ export function registerFilesystemTools(server: McpServer): void {
           replace_all: z.boolean().optional().default(false),
         })).min(1).max(20),
         dry_run: z.boolean().optional().default(false),
+        transaction_id: z.string().optional(),
       },
 
       annotations: toolAnnotations("edit"),
     },
-    async ({ path: filePath, edits, dry_run }) => {
+    async ({ path: filePath, edits, dry_run, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
       const original = await readEditableTextFile(validPath);
@@ -297,16 +406,18 @@ export function registerFilesystemTools(server: McpServer): void {
         next = edit.replace_all ? next.split(edit.old_text).join(edit.new_text) : next.replace(edit.old_text, edit.new_text);
       }
       const diff = buildSimpleDiff(original, next);
+      if (transaction_id && !dry_run) await captureTransactionPaths(transaction_id, [validPath]);
       const checkpointId = await checkpointBefore("multi_edit", [validPath], { dry_run });
       if (!dry_run) await fs.writeFile(validPath, next, "utf-8");
+      if (transaction_id && !dry_run) await recordTransactionEdit(transaction_id, "multi_edit", [validPath], checkpointId);
       await audit({ tool: "multi_edit", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok", details: { edits: edits.length } });
       const data = await enrichAfterEdit(
-        { path: validPath, diff, edits: edits.length, dry_run, checkpoint_id: checkpointId },
+        { path: validPath, diff, edits: edits.length, dry_run, checkpoint_id: checkpointId, transaction_id: transaction_id ?? null },
         [validPath],
         dry_run
       );
       return toolResult("multi_edit", data);
-    }
+    })
   );
 
   server.registerTool(
@@ -320,11 +431,12 @@ export function registerFilesystemTools(server: McpServer): void {
         replacement: z.string().max(MAX_EDIT_FRAGMENT_CHARS),
         flags: z.string().max(20).optional().default("g"),
         dry_run: z.boolean().optional().default(false),
+        transaction_id: z.string().optional(),
       },
 
       annotations: toolAnnotations("edit"),
     },
-    async ({ path: filePath, pattern, replacement, flags, dry_run }) => {
+    async ({ path: filePath, pattern, replacement, flags, dry_run, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
       const original = await readEditableTextFile(validPath);
@@ -332,11 +444,13 @@ export function registerFilesystemTools(server: McpServer): void {
       const next = original.replace(regex, replacement);
       if (next === original) throw new Error("Regex made no changes.");
       const diff = buildSimpleDiff(original, next);
+      if (transaction_id && !dry_run) await captureTransactionPaths(transaction_id, [validPath]);
       const checkpointId = await checkpointBefore("replace_regex", [validPath], { dry_run });
       if (!dry_run) await fs.writeFile(validPath, next, "utf-8");
+      if (transaction_id && !dry_run) await recordTransactionEdit(transaction_id, "replace_regex", [validPath], checkpointId);
       await audit({ tool: "replace_regex", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok" });
-      return toolResult("replace_regex", { path: validPath, diff, dry_run, checkpoint_id: checkpointId });
-    }
+      return toolResult("replace_regex", { path: validPath, diff, dry_run, checkpoint_id: checkpointId, transaction_id: transaction_id ?? null });
+    })
   );
 
   server.registerTool(
@@ -349,11 +463,12 @@ export function registerFilesystemTools(server: McpServer): void {
         path: z.string().optional().describe("Target file (single-file) or base directory (multi-file)"),
         patch: z.string().max(MAX_PATCH_CHARS),
         dry_run: z.boolean().optional().default(false),
+        transaction_id: z.string().optional(),
       },
 
       annotations: toolAnnotations("edit"),
     },
-    async ({ path: filePath, patch, dry_run }) => {
+    async ({ path: filePath, patch, dry_run, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
 
       if (isMultiFilePatch(patch)) {
@@ -366,8 +481,10 @@ export function registerFilesystemTools(server: McpServer): void {
         const patchPaths = await Promise.all(
           parseMultiFilePatch(patch, baseDir).map((op) => validatePath(op.path))
         );
+        if (transaction_id && !dry_run) await captureTransactionPaths(transaction_id, patchPaths);
         const checkpointId = await checkpointBefore("apply_patch", patchPaths, { dry_run });
         const results = await applyMultiFilePatch(patch, { base_dir: baseDir, dry_run });
+        if (transaction_id && !dry_run) await recordTransactionEdit(transaction_id, "apply_patch", patchPaths, checkpointId);
         const failed = results.filter((r) => !r.ok);
         await audit({
           tool: "apply_patch",
@@ -378,7 +495,7 @@ export function registerFilesystemTools(server: McpServer): void {
         });
         const okPaths = results.filter((r) => r.ok && r.path).map((r) => r.path as string);
         const payload = await enrichAfterEdit(
-          { files: results, dry_run, multi_file: true, checkpoint_id: checkpointId },
+          { files: results, dry_run, multi_file: true, checkpoint_id: checkpointId, transaction_id: transaction_id ?? null },
           okPaths,
           dry_run
         );
@@ -393,12 +510,14 @@ export function registerFilesystemTools(server: McpServer): void {
       const original = await readEditableTextFile(validPath);
       const next = applyUnifiedPatchToText(original, patch);
       const diff = buildSimpleDiff(original, next);
+      if (transaction_id && !dry_run) await captureTransactionPaths(transaction_id, [validPath]);
       const checkpointId = await checkpointBefore("apply_patch", [validPath], { dry_run });
       if (!dry_run) await fs.writeFile(validPath, next, "utf-8");
+      if (transaction_id && !dry_run) await recordTransactionEdit(transaction_id, "apply_patch", [validPath], checkpointId);
       await audit({ tool: "apply_patch", action: "patch", target: validPath, status: dry_run ? "dry-run" : "ok" });
-      const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId }, [validPath], dry_run);
+      const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId, transaction_id: transaction_id ?? null }, [validPath], dry_run);
       return toolResult("apply_patch", data);
-    }
+    })
   );
 
   server.registerTool(
@@ -511,20 +630,22 @@ export function registerFilesystemTools(server: McpServer): void {
     {
       title: "Delete File",
       description: "Delete a file from the filesystem.",
-      inputSchema: { path: z.string() },
+      inputSchema: { path: z.string(), transaction_id: z.string().optional() },
 
       annotations: toolAnnotations("edit"),
     },
-    async ({ path: filePath }) => {
+    async ({ path: filePath, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
       const stat = await fs.stat(validPath);
       if (!stat.isFile()) throw new Error("Path is not a file");
+      if (transaction_id) await captureTransactionPaths(transaction_id, [validPath]);
       const checkpointId = await checkpointBefore("delete_file", [validPath]);
       await fs.unlink(validPath);
+      if (transaction_id) await recordTransactionEdit(transaction_id, "delete_file", [validPath], checkpointId);
       await audit({ tool: "delete_file", action: "delete", target: validPath, status: "ok" });
-      return toolResult("delete_file", { path: validPath, checkpoint_id: checkpointId });
-    }
+      return toolResult("delete_file", { path: validPath, checkpoint_id: checkpointId, transaction_id: transaction_id ?? null });
+    })
   );
 
   server.registerTool(
@@ -576,22 +697,24 @@ export function registerFilesystemTools(server: McpServer): void {
     {
       title: "Copy File",
       description: "Copy a file to a new location.",
-      inputSchema: { source: z.string(), destination: z.string() },
+      inputSchema: { source: z.string(), destination: z.string(), transaction_id: z.string().optional() },
 
       annotations: toolAnnotations("edit"),
     },
-    async ({ source, destination }) => {
+    async ({ source, destination, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const src = await validatePath(source);
       const dest = await validatePath(destination);
       const stat = await fs.stat(src);
       if (!stat.isFile()) throw new Error("Source is not a file");
+      if (transaction_id) await captureTransactionPaths(transaction_id, [dest]);
       const checkpointId = await checkpointBefore("copy_file", [dest]);
       await fs.mkdir(path.dirname(dest), { recursive: true });
       await fs.copyFile(src, dest);
+      if (transaction_id) await recordTransactionEdit(transaction_id, "copy_file", [dest], checkpointId);
       await audit({ tool: "copy_file", action: "copy", target: dest, status: "ok", details: { source: src } });
-      return toolResult("copy_file", { source: src, destination: dest, checkpoint_id: checkpointId });
-    }
+      return toolResult("copy_file", { source: src, destination: dest, checkpoint_id: checkpointId, transaction_id: transaction_id ?? null });
+    })
   );
 
   server.registerTool(
@@ -599,20 +722,22 @@ export function registerFilesystemTools(server: McpServer): void {
     {
       title: "Move File",
       description: "Move or rename a file or directory.",
-      inputSchema: { source: z.string(), destination: z.string() },
+      inputSchema: { source: z.string(), destination: z.string(), transaction_id: z.string().optional() },
 
       annotations: toolAnnotations("edit"),
     },
-    async ({ source, destination }) => {
+    async ({ source, destination, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const src = await validatePath(source);
       const dest = await validatePath(destination);
+      if (transaction_id) await captureTransactionPaths(transaction_id, [src, dest]);
       const checkpointId = await checkpointBefore("move_file", [src, dest]);
       await fs.mkdir(path.dirname(dest), { recursive: true });
       await fs.rename(src, dest);
+      if (transaction_id) await recordTransactionEdit(transaction_id, "move_file", [src, dest], checkpointId);
       await audit({ tool: "move_file", action: "move", target: dest, status: "ok", details: { source: src } });
-      return toolResult("move_file", { source: src, destination: dest, checkpoint_id: checkpointId });
-    }
+      return toolResult("move_file", { source: src, destination: dest, checkpoint_id: checkpointId, transaction_id: transaction_id ?? null });
+    })
   );
 
   server.registerTool("search_files", { title: "Search Files", description: "Search file contents for a text pattern.", inputSchema: { path: z.string(), pattern: z.string().max(100_000), glob: z.string().optional().default("*"), max_results: z.number().int().positive().max(500).optional().default(50) }, annotations: toolAnnotations("read") }, async ({ path: searchPath, pattern, glob: globPattern, max_results }) => {

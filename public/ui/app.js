@@ -6,6 +6,11 @@ const ENV_KEYS = [
   "CHATGPT_AUTO_APPROVE",
   "CHATGPT_TOOL_PROFILE",
   "SHELL_TIMEOUT",
+  "MCP_AGENT_TASK_STATE_DIR",
+  "MCP_OPERATION_STATE_DIR",
+  "MCP_EDIT_TRANSACTION_STATE_DIR",
+  "MCP_CODING_LOOP_STATE_DIR",
+  "MCP_CODING_LOOP_WORKTREE_ROOT",
   "MCP_SESSION_RECOVERY",
   "MCP_SESSION_DELETE_GRACE_MS",
   "MCP_JSON_RESPONSE",
@@ -147,6 +152,91 @@ function renderRuntimeOverview(runtimeInfo) {
         </div>`;
       }).join("")
     : '<div class="runtime-empty">No completed tool calls in this server process yet.</div>';
+
+  const tasks = Array.isArray(runtimeInfo.agent_tasks) ? runtimeInfo.agent_tasks : [];
+  const resumable = tasks.filter((task) => task.status === "active" || task.status === "blocked");
+  document.getElementById("dash-task-count").textContent = String(resumable.length);
+  const taskEl = document.getElementById("dash-agent-task");
+  taskEl.innerHTML = resumable.length
+    ? resumable.slice(0, 4).map((task) => {
+        const progress = task.progress || {};
+        const step = progress.current_step || progress.next_step;
+        const stateClass = task.status === "blocked" ? "runtime-state-error" : "runtime-state-ok";
+        return `<div class="runtime-row agent-task-row">
+          <span class="runtime-kind task">TASK</span>
+          <span class="runtime-tool ${stateClass}" title="${esc(task.title)}">${esc(task.title)}</span>
+          <span class="runtime-summary" title="${esc(step?.title || task.objective)}">${esc(step?.title || task.objective)}</span>
+          <span class="runtime-time">${progress.percent ?? 0}%</span>
+        </div>`;
+      }).join("")
+    : '<div class="runtime-empty">No active persistent agent task.</div>';
+
+  const operations = Array.isArray(runtimeInfo.operations) ? runtimeInfo.operations : [];
+  document.getElementById("dash-operation-count").textContent = String(operations.length);
+  const operationsEl = document.getElementById("dash-operations");
+  operationsEl.innerHTML = operations.length
+    ? operations.slice(0, 8).map((operation) => {
+        const status = operation.effective_status || operation.status || "unknown";
+        const stateClass = ["completed", "running"].includes(status) ? "runtime-state-ok" : "runtime-state-error";
+        const finished = operation.finished_at ? Date.parse(operation.finished_at) : Number.NaN;
+        const started = Date.parse(operation.started_at || "");
+        const duration = Number.isFinite(finished) && Number.isFinite(started)
+          ? formatElapsed(finished - started)
+          : Number.isFinite(started) ? formatElapsed(now - started) : "—";
+        return `<div class="runtime-row operation-row">
+          <span class="runtime-kind operation">${esc(status.toUpperCase().slice(0, 5))}</span>
+          <span class="runtime-tool ${stateClass}" title="${esc(operation.command)}">${esc(operation.label || operation.id)}</span>
+          <span class="runtime-summary" title="${esc(operation.command)}">${esc(operation.command)}</span>
+          <span class="runtime-time">${duration}</span>
+        </div>`;
+      }).join("")
+    : '<div class="runtime-empty">No persistent background operations yet.</div>';
+
+  const loops = Array.isArray(runtimeInfo.coding_loops) ? runtimeInfo.coding_loops : [];
+  const activeLoops = loops.filter((loop) => loop.status === "active");
+  document.getElementById("dash-loop-count").textContent = String(activeLoops.length);
+  const loopsEl = document.getElementById("dash-loops");
+  loopsEl.innerHTML = loops.length
+    ? loops.slice(0, 8).map((loop) => {
+        const status = loop.status || "unknown";
+        const phase = loop.phase || status;
+        const stateClass = ["active", "completed"].includes(status) ? "runtime-state-ok" : "runtime-state-error";
+        const attempt = `${loop.attempts ?? 0}/${loop.max_attempts ?? 0}`;
+        const mode = loop.isolation?.mode === "worktree" ? "worktree" : "main";
+        const updated = Date.parse(loop.updated_at || "");
+        const age = Number.isFinite(updated) ? `${formatElapsed(now - updated)} ago` : "—";
+        const summary = `${phase} · attempt ${attempt} · ${mode}`;
+        return `<div class="runtime-row loop-row">
+          <span class="runtime-kind loop">LOOP</span>
+          <span class="runtime-tool ${stateClass}" title="${esc(loop.id)}">${esc(loop.goal || loop.id)}</span>
+          <span class="runtime-summary" title="${esc(summary)}">${esc(summary)}</span>
+          <span class="runtime-time">${age}</span>
+        </div>`;
+      }).join("")
+    : '<div class="runtime-empty">No coding loops yet.</div>';
+
+  const transactions = Array.isArray(runtimeInfo.edit_transactions) ? runtimeInfo.edit_transactions : [];
+  const activeTransactions = transactions.filter((transaction) => transaction.status === "active");
+  document.getElementById("dash-transaction-count").textContent = String(activeTransactions.length);
+  const transactionsEl = document.getElementById("dash-transactions");
+  transactionsEl.innerHTML = transactions.length
+    ? transactions.slice(0, 8).map((transaction) => {
+        const status = transaction.status || "unknown";
+        const stateClass = status === "active" || status === "accepted" ? "runtime-state-ok" : "runtime-state-error";
+        const verification = transaction.verification
+          ? `verify ${transaction.verification.passed}/${transaction.verification.passed + transaction.verification.failed}`
+          : "not verified";
+        const updated = Date.parse(transaction.updated_at || "");
+        const age = Number.isFinite(updated) ? `${formatElapsed(now - updated)} ago` : "—";
+        const summary = `${transaction.files || 0} file(s), ${transaction.edits || 0} edit(s), ${verification}`;
+        return `<div class="runtime-row transaction-row">
+          <span class="runtime-kind transaction">${esc(status.toUpperCase().slice(0, 5))}</span>
+          <span class="runtime-tool ${stateClass}" title="${esc(transaction.id)}">${esc(transaction.label || transaction.id)}</span>
+          <span class="runtime-summary" title="${esc(summary)}">${esc(summary)}</span>
+          <span class="runtime-time">${age}</span>
+        </div>`;
+      }).join("")
+    : '<div class="runtime-empty">No edit transactions yet.</div>';
 }
 
 function serversTable(rows, { actions = true } = {}) {
