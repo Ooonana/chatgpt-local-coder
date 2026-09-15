@@ -99,6 +99,7 @@ const MAX_LOOPS = 500;
 const MAX_NOTES = 100;
 const MAX_ATTEMPTS_RECORDED = 32;
 const loopLocks = new Map<string, Promise<void>>();
+let lastReadErrors: string[] = [];
 
 function stateRoot(): string {
   return path.resolve(process.env.MCP_CODING_LOOP_STATE_DIR || path.join(process.cwd(), ".mcp-state", "coding-loops"));
@@ -146,6 +147,10 @@ export function getCodingLoopConfig(): Record<string, unknown> {
     max_attempts_per_loop: 8,
     worktree_root: process.env.MCP_CODING_LOOP_WORKTREE_ROOT || null,
   };
+}
+
+export function getCodingLoopStateErrors(): string[] {
+  return [...lastReadErrors];
 }
 
 export async function withCodingLoopLock<T>(id: string | undefined, work: () => Promise<T>): Promise<T> {
@@ -201,15 +206,20 @@ async function readAllCodingLoops(): Promise<CodingLoopRecord[]> {
   await ensureStore();
   const entries = await fs.readdir(stateRoot(), { withFileTypes: true });
   const records: CodingLoopRecord[] = [];
+  const errors: string[] = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const id = entry.name.slice(0, -5);
+    if (!/^loop_[0-9a-f]{14}$/i.test(id)) continue;
     try {
-      const id = entry.name.slice(0, -5);
-      if (!/^loop_[0-9a-f]{14}$/i.test(id)) continue;
       const parsed = JSON.parse(await fs.readFile(recordPath(id), "utf-8")) as CodingLoopRecord;
       if (parsed?.version === VERSION && parsed.id === id) records.push(normalizeRecord(parsed));
-    } catch {}
+      else errors.push(`${entry.name}: invalid coding loop record`);
+    } catch (error) {
+      errors.push(`${entry.name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
+  lastReadErrors = errors.slice(0, 20);
   return records.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
 }
 

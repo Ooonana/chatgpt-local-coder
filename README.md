@@ -206,6 +206,18 @@ Free sessions expire after **60 minutes** and the URL changes each time, so you 
 
 Native tools use structured JSON responses `{ ok, tool, summary, data }`. The source-of-truth catalog is `src/lib/tool-profile.ts`; `scripts/test-tool-profile.mjs` verifies it matches the native `server.registerTool()` declarations.
 
+The default `slim` profile is intentionally optimized for regular ChatGPT: it currently exposes **47 high-value tools** while the `full` profile keeps all **68 native tools**. Redundant convenience tools hidden from `slim` remain available through `CHATGPT_TOOL_PROFILE=full`, Admin → **MCP Servers → Local tools**, or a `run_command` fallback. This keeps the default MCP discovery payload below the Phase 4 budget without removing local capability.
+
+### Agent production benchmark
+
+Run the production benchmark/fault suite with:
+
+```bash
+npm run benchmark:agent
+```
+
+It starts isolated real MCP servers and checks the intended Codex-like workflow rather than only unit-level functions: compound repo inspection/read round trips, repository intelligence, verification-output compaction, durable `coding_loop` restart/resume, fail → diagnose → repair → pass behavior, and malformed persistent-state resilience. Phase 4 guards the default profile at **≤50 slim tools**, **≤64 KiB `tools/list`**, **≤12,000 instruction characters**, and bounded high-level tool responses so future features cannot silently inflate ChatGPT context/transport cost.
+
 ### Onboarding *(call these first)*
 
 | Tool | Description |

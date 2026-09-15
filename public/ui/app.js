@@ -237,6 +237,15 @@ function renderRuntimeOverview(runtimeInfo) {
         </div>`;
       }).join("")
     : '<div class="runtime-empty">No edit transactions yet.</div>';
+
+  const stateErrors = Array.isArray(runtimeInfo.state_errors) ? runtimeInfo.state_errors : [];
+  const stateErrorsEl = document.getElementById("dash-state-errors");
+  if (stateErrorsEl) {
+    stateErrorsEl.hidden = stateErrors.length === 0;
+    stateErrorsEl.innerHTML = stateErrors.length
+      ? `<strong>Persistent state warning</strong><span>${esc(stateErrors.slice(0, 4).join(" · "))}${stateErrors.length > 4 ? ` · +${stateErrors.length - 4} more` : ""}</span>`
+      : "";
+  }
 }
 
 function serversTable(rows, { actions = true } = {}) {

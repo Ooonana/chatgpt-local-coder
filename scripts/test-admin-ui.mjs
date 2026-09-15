@@ -65,6 +65,7 @@ test("runtime overview surfaces are present", () => {
     "dash-loops",
     "dash-transaction-count",
     "dash-transactions",
+    "dash-state-errors",
   ]) {
     if (!html.includes(`id="${id}"`)) throw new Error(`missing ${id}`);
   }
@@ -72,6 +73,7 @@ test("runtime overview surfaces are present", () => {
     if (!css.includes(className)) throw new Error(`missing CSS ${className}`);
   }
   if (!js.includes("coding_loops")) throw new Error("runtime overview does not render coding loops");
+  if (!js.includes("state_errors")) throw new Error("runtime overview does not render persistent state warnings");
   if (!js.includes("recent.slice(0, 20)")) throw new Error("runtime overview does not retain the 20 latest completed calls");
   if (css.includes("radial-gradient(circle at top left")) throw new Error("overview hero still uses the colorful status wash");
 });

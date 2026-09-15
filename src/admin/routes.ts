@@ -35,7 +35,7 @@ import { getRuntimeSnapshot } from "../lib/runtime-state.js";
 import { getAgentTaskProgress, listAgentTasks } from "../lib/agent-task-store.js";
 import { listOperationHistory } from "../lib/operation-store.js";
 import { listEditTransactions } from "../lib/edit-transaction-store.js";
-import { listCodingLoops } from "../lib/coding-loop-store.js";
+import { getCodingLoopStateErrors, listCodingLoops } from "../lib/coding-loop-store.js";
 import { getManagedProcessSnapshot } from "../tools/shell.js";
 import { getPtySessionSnapshot } from "../tools/pty.js";
 import {
@@ -184,6 +184,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         ...(operationsResult.status === "rejected" ? [`operations: ${String(operationsResult.reason)}`] : []),
         ...(transactionsResult.status === "rejected" ? [`edit_transactions: ${String(transactionsResult.reason)}`] : []),
         ...(loopsResult.status === "rejected" ? [`coding_loops: ${String(loopsResult.reason)}`] : []),
+        ...(loopsResult.status === "fulfilled" ? getCodingLoopStateErrors().map((error) => `coding_loops: ${error}`) : []),
       ],
       memory: {
         rss_bytes: memory.rss,

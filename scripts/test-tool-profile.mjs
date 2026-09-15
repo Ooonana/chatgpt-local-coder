@@ -54,16 +54,14 @@ try {
   }
   ok("core tools exposed in slim");
 
-  for (const t of ["start_process", "process_status", "process_history", "process_output", "process_input", "stop_process", "clear_processes"]) {
+  for (const t of ["start_process", "process_status", "process_history", "process_output", "process_input", "stop_process"]) {
     if (!shouldExposeTool(t, "slim")) throw new Error(`${t} missing from slim`);
     if (!LOCAL_TOOL_CATALOG.includes(t)) throw new Error(`${t} missing from local catalog`);
   }
   ok("background process lifecycle exposed in slim");
 
   for (const t of [
-    "run_commands_parallel", "pty", "view_image", "lsp", "shell_reset",
-    "replace_regex", "directory_tree", "create_directory", "copy_file", "move_file", "delete_file",
-    "git_log", "git_branch", "git_stash",
+    "run_commands_parallel", "pty", "view_image", "lsp", "delete_file",
   ]) {
     if (!shouldExposeTool(t, "slim")) throw new Error(`${t} missing from slim`);
   }
@@ -78,6 +76,12 @@ try {
   }
   ok("agent isolation and task-state tools exposed in slim");
 
+  for (const t of [
+    "replace_regex", "directory_tree", "create_directory", "copy_file", "move_file",
+    "shell_reset", "clear_processes", "git_log", "git_branch", "git_stash",
+  ]) {
+    if (shouldExposeTool(t, "slim")) throw new Error(`${t} should be hidden in slim; use full/overrides or run_command fallback`);
+  }
   if (shouldExposeTool("mcp_call", "slim")) throw new Error("mcp_call should be hidden in slim");
   if (shouldExposeTool("delete_directory", "slim")) throw new Error("delete_directory hidden");
   if (shouldExposeTool("git_reset", "slim")) throw new Error("git_reset should be hidden in slim");

@@ -161,6 +161,20 @@ body {
 .runtime-state-ok { color: var(--green); }
 .runtime-state-error { color: var(--red); }
 .runtime-empty { padding: 1.2rem; color: var(--muted); font-size: 0.8rem; }
+.runtime-alert {
+  display: flex;
+  gap: 0.65rem;
+  align-items: baseline;
+  margin: 0 0 1rem;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid #5b4c31;
+  border-radius: var(--radius);
+  background: #17140f;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.runtime-alert strong { color: var(--amber); white-space: nowrap; font-size: 0.75rem; }
+.runtime-alert span { overflow-wrap: anywhere; }
 
 .panel {
   background: var(--surface);

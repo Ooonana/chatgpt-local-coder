@@ -36,10 +36,10 @@ const call = async (name, args) => client.callTool({ name, arguments: args });
 await run("new tools are exposed in slim", async () => {
   const listed = await client.listTools();
   const names = new Set(listed.tools.map((tool) => tool.name));
-  for (const name of ["run_commands_parallel", "view_image", "lsp", "pty", "shell_reset", "directory_tree", "git_log", "subagent", "delegate_status", "read_files", "inspect_project", "verify_project", "process_history"]) {
+  for (const name of ["run_commands_parallel", "view_image", "lsp", "pty", "subagent", "delegate_status", "read_files", "inspect_project", "verify_project", "process_history"]) {
     if (!names.has(name)) throw new Error(`${name} not exposed`);
   }
-  for (const name of ["delete_directory", "git_reset", "git_push", "mcp_call"]) {
+  for (const name of ["shell_reset", "directory_tree", "git_log", "delete_directory", "git_reset", "git_push", "mcp_call"]) {
     if (names.has(name)) throw new Error(`${name} should remain hidden in slim`);
   }
 });
