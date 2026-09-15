@@ -7,8 +7,9 @@ export const MCP_QUICKSTART = `
 3. Explore with inspect_project first, then repo_intel for symbol/reference/impact questions; use glob/grep/read_files/read_text_file for lower-level inspection.
 4. For substantial implementation/fix/refactor work, create/resume agent_task and begin coding_loop. Use the returned transaction_id on supported edits, verify through coding_loop, repair in the same transaction, then finish or rollback. For small atomic edits, use edit_transaction directly.
 5. Run builds/tests with coding_loop/verify_project when appropriate, run_command for short commands, run_commands_parallel for independent commands, or start_process + process_status/process_output for long jobs. Use pty for truly interactive terminal programs.
-6. For interrupted substantial work, check coding_loop_status and resume the existing loop instead of rediscovering state. For isolated Git work, prefer coding_loop isolation=worktree; use git_worktree directly when no coding loop is needed.
-7. Undo unrelated ordinary file edits with rewind (list → preview → restore). For transaction-owned edits, use edit_transaction/coding_loop rollback instead. Shell/bash file changes are not tracked.
+6. ChatGPT may not auto-compact long chats. After major decisions or a context_checkpoint_hint, save a compact context_capsule checkpoint. If the hint sets rollover_recommended=true, reach a safe boundary and continue in a fresh chat, then resume the capsule there; Local Coder cannot erase host chat history in place. After chat/context loss, resume the capsule first, then reconcile agent_task/coding_loop state instead of rediscovering work.
+7. For interrupted substantial work, check coding_loop_status and resume the existing loop instead of rediscovering state. For isolated Git work, prefer coding_loop isolation=worktree; use git_worktree directly when no coding loop is needed.
+8. Undo unrelated ordinary file edits with rewind (list → preview → restore). For transaction-owned edits, use edit_transaction/coding_loop rollback instead. Shell/bash file changes are not tracked.
 
 ## Output format
 All tools return JSON: { ok, tool, summary, data }
@@ -16,6 +17,7 @@ All tools return JSON: { ok, tool, summary, data }
 ## Tool cheat sheet
 - coding_loop / coding_loop_status: persistent inspect→edit→verify→repair→finish state machine around regular ChatGPT; supports bounded retries and optional worktree isolation
 - agent_task: persist/resume a multi-step coding objective, structured plan, notes, and status
+- context_capsule: compact semantic checkpoint + automatic machine-state snapshot for recovery when ChatGPT conversation context is lost
 - inspect_project / repo_intel: repository reconnaissance plus symbol/reference/impact intelligence
 - edit_transaction: durable preview/verify/accept/conflict-safe rollback boundary for atomic edits
 - glob / grep / read_files / read_text_file: lower-level exploration (keep large results bounded)

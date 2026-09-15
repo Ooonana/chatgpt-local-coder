@@ -10,6 +10,10 @@ const ENV_KEYS = [
   "MCP_OPERATION_STATE_DIR",
   "MCP_EDIT_TRANSACTION_STATE_DIR",
   "MCP_CODING_LOOP_STATE_DIR",
+  "MCP_CONTEXT_CAPSULE_STATE_DIR",
+  "MCP_CONTEXT_CAPSULE_TOOL_CALLS",
+  "MCP_CONTEXT_CAPSULE_RESULT_BYTES",
+  "MCP_CONTEXT_CAPSULE_ROLLOVER_CYCLES",
   "MCP_CODING_LOOP_WORKTREE_ROOT",
   "MCP_SESSION_RECOVERY",
   "MCP_SESSION_DELETE_GRACE_MS",
@@ -237,6 +241,26 @@ function renderRuntimeOverview(runtimeInfo) {
         </div>`;
       }).join("")
     : '<div class="runtime-empty">No edit transactions yet.</div>';
+
+  const capsules = Array.isArray(runtimeInfo.context_capsules) ? runtimeInfo.context_capsules : [];
+  document.getElementById("dash-capsule-count").textContent = String(capsules.length);
+  const capsulesEl = document.getElementById("dash-capsules");
+  capsulesEl.innerHTML = capsules.length
+    ? capsules.slice(0, 8).map((capsule) => {
+        const source = capsule.last_checkpoint_source || "unknown";
+        const stateClass = capsule.has_semantic_summary ? "runtime-state-ok" : "";
+        const phase = capsule.loop_phase || capsule.loop_status || capsule.task_status || "saved";
+        const updated = Date.parse(capsule.updated_at || "");
+        const age = Number.isFinite(updated) ? `${formatElapsed(now - updated)} ago` : "?";
+        const summary = `${source} · ${phase} · semantic ${capsule.has_semantic_summary ? "saved" : "pending"}`;
+        return `<div class="runtime-row capsule-row">
+          <span class="runtime-kind task">CTX</span>
+          <span class="runtime-tool ${stateClass}" title="${esc(capsule.id)}">${esc(capsule.objective || capsule.id)}</span>
+          <span class="runtime-summary" title="${esc(summary)}">${esc(summary)}</span>
+          <span class="runtime-time">${age}</span>
+        </div>`;
+      }).join("")
+    : '<div class="runtime-empty">No durable context capsule yet.</div>';
 
   const stateErrors = Array.isArray(runtimeInfo.state_errors) ? runtimeInfo.state_errors : [];
   const stateErrorsEl = document.getElementById("dash-state-errors");

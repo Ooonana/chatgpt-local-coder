@@ -69,7 +69,7 @@ try {
 
   for (const t of [
     "git_worktree", "agent_task", "read_files", "inspect_project", "verify_project",
-    "repo_intel", "edit_transaction", "coding_loop_status", "coding_loop", "subagent",
+    "repo_intel", "edit_transaction", "coding_loop_status", "coding_loop", "context_capsule", "subagent",
   ]) {
     if (!shouldExposeTool(t, "slim")) throw new Error(`${t} missing from slim`);
     if (!LOCAL_TOOL_CATALOG.includes(t)) throw new Error(`${t} missing from local catalog`);

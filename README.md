@@ -42,6 +42,7 @@ No separate coding client. No vendor lock-in. Run one Node process on your PC, e
 | Explore codebase | Limited | ✅ `inspect_project`, `repo_intel`, `glob`, `grep`, `lsp` |
 | Review/rollback a change set | ❌ | ✅ `edit_transaction` with preview, verify, accept/rollback |
 | Resumable coding-agent loop | ❌ | ✅ `coding_loop` with persistent context, bounded repair attempts, transaction ownership, and optional worktree isolation |
+| Survive lost/compacted chat context | ❌ | ✅ `context_capsule` persists compact reasoning handoff + live machine state across new chats/restarts |
 | Full disk access | ❌ | ✅ Any path by default with the `open` profile |
 | Session recovery | — | ✅ Auto-recover after server restart |
 
@@ -206,7 +207,7 @@ Free sessions expire after **60 minutes** and the URL changes each time, so you 
 
 Native tools use structured JSON responses `{ ok, tool, summary, data }`. The source-of-truth catalog is `src/lib/tool-profile.ts`; `scripts/test-tool-profile.mjs` verifies it matches the native `server.registerTool()` declarations.
 
-The default `slim` profile is intentionally optimized for regular ChatGPT: it currently exposes **47 high-value tools** while the `full` profile keeps all **68 native tools**. Redundant convenience tools hidden from `slim` remain available through `CHATGPT_TOOL_PROFILE=full`, Admin → **MCP Servers → Local tools**, or a `run_command` fallback. This keeps the default MCP discovery payload below the Phase 4 budget without removing local capability.
+The default `slim` profile is intentionally optimized for regular ChatGPT: it currently exposes **48 high-value tools** while the `full` profile keeps all **69 native tools**. Redundant convenience tools hidden from `slim` remain available through `CHATGPT_TOOL_PROFILE=full`, Admin → **MCP Servers → Local tools**, or a `run_command` fallback. This keeps the default MCP discovery payload below the Phase 4 budget without removing local capability.
 
 ### Agent production benchmark
 
@@ -216,7 +217,7 @@ Run the production benchmark/fault suite with:
 npm run benchmark:agent
 ```
 
-It starts isolated real MCP servers and checks the intended Codex-like workflow rather than only unit-level functions: compound repo inspection/read round trips, repository intelligence, verification-output compaction, durable `coding_loop` restart/resume, fail → diagnose → repair → pass behavior, and malformed persistent-state resilience. Phase 4 guards the default profile at **≤50 slim tools**, **≤64 KiB `tools/list`**, **≤12,000 instruction characters**, and bounded high-level tool responses so future features cannot silently inflate ChatGPT context/transport cost.
+It starts isolated real MCP servers and checks the intended Codex-like workflow rather than only unit-level functions: compound repo inspection/read round trips, repository intelligence, verification-output compaction, durable `coding_loop` restart/resume, `context_capsule` recovery after a simulated lost ChatGPT/MCP session, fail → diagnose → repair → pass behavior, and malformed persistent-state resilience. Phase 4 guards the default profile at **≤50 slim tools**, **≤64 KiB `tools/list`**, **≤12,000 instruction characters**, and bounded high-level tool responses so future features cannot silently inflate ChatGPT context/transport cost.
 
 ### Onboarding *(call these first)*
 
@@ -295,13 +296,25 @@ The default slim profile intentionally exposes high-value local development help
 | `edit_transaction` | Begin a durable touched-file transaction, preview its aggregate diff, run verification, then accept or conflict-safe rollback |
 | `coding_loop` | Durable Codex-like implementation loop: begin/resume/refresh/verify/finish/rollback/cleanup with bounded repair attempts and optional Git-worktree isolation |
 | `coding_loop_status` | Read recent or specific persistent coding-loop state without requesting a mutating tool |
+| `context_capsule` | Save/resume a bounded semantic working summary plus current task/loop/transaction/Git/activity state across chat loss or reconnects |
 
-The agent loop is deliberately split between **regular ChatGPT** and Local Coder: ChatGPT performs reasoning and decides the next action; Local Coder persists the objective/plan/progress, local operations, verification evidence, files, shell, Git, and code intelligence. `agent_task` therefore adds durable coding-agent structure without starting another model or hidden subagent.
+The agent loop is deliberately split between **regular ChatGPT** and Local Coder: ChatGPT performs reasoning and decides the next action; Local Coder persists the objective/plan/progress, local operations, verification evidence, files, shell, Git, code intelligence, and a compact resumable working-context capsule. `agent_task` therefore adds durable coding-agent structure without starting another model or hidden subagent.
+
+### ChatGPT context compaction / loss
+
+Local Coder does **not** assume the ChatGPT host will automatically compact a long coding conversation. It also cannot inspect ChatGPT's hidden token counter or retrieve a lost private transcript. Instead, `context_capsule` uses two complementary layers:
+
+- **automatic machine-state snapshots** at important task/loop/transaction boundaries and after a bounded tool-call/result-byte budget; these capture current Git/task/coding-loop/transaction/recent-tool state without model involvement;
+- **semantic checkpoints** written by regular ChatGPT after important decisions or when Local Coder returns a `context_checkpoint_hint`; these keep the compact summary, decisions, findings, blockers, next steps, and important files that cannot be reconstructed reliably from machine state alone.
+
+This cannot literally shrink an already-running ChatGPT conversation: MCP has no API to delete old host messages or inspect the exact hidden token budget. After several context-budget cycles (three by default), the hint sets `rollover_recommended=true`. At a safe boundary, checkpoint and continue in a fresh ChatGPT chat; the new chat resumes the capsule instead of rediscovering the project. That checkpoint-and-rollover path is Local Coder's application-level substitute for host auto-compaction.
+
+When a chat is new, corrupted, or missing prior reasoning, ChatGPT should call `context_capsule(action="resume")` first and then reconcile the returned live state before doing more repository discovery. `remember()` remains for long-lived project facts; `context_capsule` is the short-lived resumable working handoff for the current task.
 
 For a non-trivial task the intended flow is:
 
 ```text
-inspect_project → agent_task(start/resume) → coding_loop(begin) → edit(transaction_id) → coding_loop(verify) → repair/verify → finish or rollback
+inspect_project → agent_task(start/resume) → coding_loop(begin) → edit(transaction_id) → context_capsule(checkpoint) → coding_loop(verify) → repair/verify → finish or rollback
 ```
 
 `coding_loop` does **not** run another AI model. Regular ChatGPT still reasons, chooses edits, and interprets failures; Local Coder supplies the durable state machine around it. Each loop owns one `edit_transaction`, records compact verification evidence, limits repair attempts, and can resume after an MCP/chat reconnect. A failed loop only receives more attempts through an explicit `resume` with an extended budget.
@@ -382,6 +395,10 @@ OPENAI_TUNNEL_API_KEY=
 | `MCP_EDIT_TRANSACTION_MAX_FILE_BYTES` | `16777216` | Per-file baseline snapshot limit for edit transactions |
 | `MCP_EDIT_TRANSACTION_MAX_TOTAL_BYTES` | `67108864` | Total baseline snapshot limit for one edit transaction |
 | `MCP_CODING_LOOP_STATE_DIR` | `.mcp-state/coding-loops` | Durable coding-loop context, retry, phase, isolation, and verification-attempt state |
+| `MCP_CONTEXT_CAPSULE_STATE_DIR` | `.mcp-state/context-capsules` | Durable bounded semantic + live machine-state handoff used when ChatGPT conversation context is lost |
+| `MCP_CONTEXT_CAPSULE_TOOL_CALLS` | `12` | Tool-call budget between automatic machine-state snapshots; clamped to 4–100 |
+| `MCP_CONTEXT_CAPSULE_RESULT_BYTES` | `65536` | Accumulated tool-result byte budget between automatic machine-state snapshots; clamped to 8 KiB–1 MiB |
+| `MCP_CONTEXT_CAPSULE_ROLLOVER_CYCLES` | `3` | Consecutive context-budget cycles before Local Coder recommends a safe fresh-chat rollover; clamped to 2–20 |
 | `MCP_CODING_LOOP_WORKTREE_ROOT` | OS temp directory | Optional root for `coding_loop isolation=worktree`; restricted profiles should choose a path inside an allowed root |
 | `PERMISSIONS_CONFIG` | `profiles/permissions.json` | Optional permission-profile file (`open`, `workspace`, `read_only`, or `custom`). Missing file defaults to `open` |
 
@@ -405,7 +422,7 @@ The exact URL is printed in the startup banner. Stopping the server stops the ad
 
 | Tab | What it does |
 |-----|--------------|
-| **Overview** | Live ChatGPT tool calls plus persistent agent plan/progress, coding loops, background operation history, edit transactions, PID/sessions/workers, and upstream health |
+| **Overview** | Live ChatGPT tool calls plus persistent agent plan/progress, coding loops, context capsules, background operation history, edit transactions, PID/sessions/workers, and upstream health |
 | **MCP Servers** | Enable/disable upstream MCP servers, test connections, inspect their tools |
 | **Import** | Pull existing MCP config from Cursor / Claude Code / OpenCode |
 | **Activity** | Live tool-call log from ChatGPT (SSE stream) |
@@ -429,6 +446,7 @@ src/
 │   ├── operation-store.ts       # Persistent background-operation history
 │   ├── edit-transaction-store.ts # Durable transaction baselines + rollback
 │   ├── coding-loop-store.ts      # Persistent coding-loop phases, attempts, context + worktree handoff
+│   ├── context-capsule-store.ts  # Bounded semantic + machine-state recovery snapshots
 │   ├── repository-intelligence.ts # Symbol/reference/impact intelligence
 │   ├── project-inspection.ts    # Compact repository reconnaissance
 │   ├── verification.ts          # Verification recipes + output compaction
@@ -443,6 +461,7 @@ src/
     ├── repository-intelligence.ts # repo_intel
     ├── edit-transaction.ts  # transactional edit lifecycle
     ├── coding-loop.ts       # resumable Codex-like execution loop around regular ChatGPT
+    ├── context-capsule.ts   # compact checkpoint/resume for lost ChatGPT context
     └── context.ts           # agent_status, project_context
 ```
 

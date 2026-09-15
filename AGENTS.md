@@ -66,6 +66,7 @@ The default `slim` profile includes common file/directory helpers, regex editing
 | Project rules | `project_context`, `load_path_rules` | Loads project and path-scoped instructions. |
 | Skills | `list_skills`, `load_skill` | Load matching project/plugin skills before use. |
 | Persistent task state | `agent_task` | Stores objective, plan, notes, workspace, and status across MCP sessions. It is **not** a subagent. |
+| Resumable chat working state | `context_capsule` | Stores a bounded semantic handoff plus live task/loop/transaction/Git state when ChatGPT conversation context may be lost. |
 | External subagent | `subagent` | Runs a separately configured model-capable process, optionally in an isolated Git worktree. It cannot reuse the parent ChatGPT subscription. |
 | Delegate discovery | `delegate_status` | Detects supported Claude/Codex/Grok/OpenCode CLIs without launching them. |
 | Isolated Git work | `git_worktree` | Useful for parallel or experimental branches without switching the main checkout. |
@@ -96,11 +97,14 @@ Real delegated subagents are available through the external-runner `subagent` to
 | Stage/commit | `git_add`, `git_commit` |
 | Restore tracked files | `git_restore` |
 | Persist a long task | `agent_task` |
+| Preserve/resume long-chat working context | `context_capsule` |
 | Delegate to configured external model runner | `subagent` |
 | Detect compatible local agent CLIs | `delegate_status` |
 | Undo Local Coder file edits | `rewind` |
 
 For non-trivial changes: explore first, read every file you will edit, apply the smallest practical patch, then run relevant build/tests. Preserve unrelated user changes in a dirty working tree.
+
+Do not assume the ChatGPT host will auto-compact a long coding conversation. After important decisions or a returned `context_checkpoint_hint`, checkpoint a compact semantic summary/decisions/findings/blockers/next steps with `context_capsule`. If the hint sets `rollover_recommended=true`, finish the current safe boundary and continue in a fresh chat, then resume the capsule there. On a new/corrupted chat or when the user says continue and prior reasoning is missing, resume the capsule before rediscovering the repository. Local Coder can automatically snapshot machine state, but it cannot read hidden ChatGPT history, erase old host messages, or reconstruct unrecorded reasoning.
 
 ## `apply_patch` format
 

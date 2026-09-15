@@ -36,6 +36,11 @@ import { getAgentTaskProgress, listAgentTasks } from "../lib/agent-task-store.js
 import { listOperationHistory } from "../lib/operation-store.js";
 import { listEditTransactions } from "../lib/edit-transaction-store.js";
 import { getCodingLoopStateErrors, listCodingLoops } from "../lib/coding-loop-store.js";
+import {
+  compactContextCapsule,
+  getContextCapsuleStateErrors,
+  listContextCapsules,
+} from "../lib/context-capsule-store.js";
 import { getManagedProcessSnapshot } from "../tools/shell.js";
 import { getPtySessionSnapshot } from "../tools/pty.js";
 import {
@@ -128,16 +133,18 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     const subagents = listSubagents().map(({ stdout: _stdout, stderr: _stderr, ...item }) => item);
     const processes = getManagedProcessSnapshot();
     const activeProcessIds = new Set(processes.filter((item) => item.running).map((item) => item.id));
-    const [tasksResult, operationsResult, transactionsResult, loopsResult] = await Promise.allSettled([
+    const [tasksResult, operationsResult, transactionsResult, loopsResult, capsulesResult] = await Promise.allSettled([
       listAgentTasks(),
       listOperationHistory({ limit: 12, active_ids: activeProcessIds }),
       listEditTransactions(12),
       listCodingLoops(12),
+      listContextCapsules(12),
     ]);
     const tasks = tasksResult.status === "fulfilled" ? tasksResult.value : [];
     const operations = operationsResult.status === "fulfilled" ? operationsResult.value : [];
     const editTransactions = transactionsResult.status === "fulfilled" ? transactionsResult.value : [];
     const codingLoops = loopsResult.status === "fulfilled" ? loopsResult.value : [];
+    const contextCapsules = capsulesResult.status === "fulfilled" ? capsulesResult.value : [];
     res.json({
       ok: true,
       runtime: getRuntimeSnapshot(),
@@ -179,12 +186,15 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         isolation: loop.isolation,
         updated_at: loop.updated_at,
       })),
+      context_capsules: contextCapsules.map(compactContextCapsule),
       state_errors: [
         ...(tasksResult.status === "rejected" ? [`agent_tasks: ${String(tasksResult.reason)}`] : []),
         ...(operationsResult.status === "rejected" ? [`operations: ${String(operationsResult.reason)}`] : []),
         ...(transactionsResult.status === "rejected" ? [`edit_transactions: ${String(transactionsResult.reason)}`] : []),
         ...(loopsResult.status === "rejected" ? [`coding_loops: ${String(loopsResult.reason)}`] : []),
         ...(loopsResult.status === "fulfilled" ? getCodingLoopStateErrors().map((error) => `coding_loops: ${error}`) : []),
+        ...(capsulesResult.status === "rejected" ? [`context_capsules: ${String(capsulesResult.reason)}`] : []),
+        ...(capsulesResult.status === "fulfilled" ? getContextCapsuleStateErrors().map((error) => `context_capsules: ${error}`) : []),
       ],
       memory: {
         rss_bytes: memory.rss,

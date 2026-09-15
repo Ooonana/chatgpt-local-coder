@@ -58,6 +58,7 @@ const isolatedEnv = {
   MCP_UPSTREAM_CONFIG: path.join(scratch, "upstream.json"),
   MCP_EDIT_TRANSACTION_STATE_DIR: path.join(scratch, "edit-transactions"),
   MCP_CODING_LOOP_STATE_DIR: path.join(scratch, "coding-loops"),
+  MCP_CONTEXT_CAPSULE_STATE_DIR: path.join(scratch, "context-capsules"),
   MCP_CODING_LOOP_WORKTREE_ROOT: path.join(scratch, "worktrees"),
   MCP_JSON_RESPONSE: "false",
   MCP_SSE_KEEPALIVE_MS: "1000",
@@ -96,7 +97,7 @@ try {
 
   const uiRes = await fetch(`http://127.0.0.1:${adminPort}/ui`);
   const uiHtml = await uiRes.text();
-  if (!uiRes.ok || !uiHtml.includes('id="overview-last-tool"') || !uiHtml.includes('id="dash-active"') || !uiHtml.includes('id="dash-transactions"') || !uiHtml.includes('id="dash-loops"')) {
+  if (!uiRes.ok || !uiHtml.includes('id="overview-last-tool"') || !uiHtml.includes('id="dash-active"') || !uiHtml.includes('id="dash-transactions"') || !uiHtml.includes('id="dash-loops"') || !uiHtml.includes('id="dash-capsules"')) {
     throw new Error("admin UI page missing live runtime overview");
   }
   const uiJsRes = await fetch(`http://127.0.0.1:${adminPort}/ui/app.js`);
@@ -110,8 +111,8 @@ try {
   console.log("OK  admin UI live overview assets");
 
   const runtime = await (await fetch(`http://127.0.0.1:${adminPort}/api/runtime`)).json();
-  if (!Array.isArray(runtime.agent_tasks) || !Array.isArray(runtime.operations) || !Array.isArray(runtime.edit_transactions) || !Array.isArray(runtime.coding_loops) || !Array.isArray(runtime.state_errors)) {
-    throw new Error("admin runtime missing persistent agent task/operation/transaction/coding-loop state");
+  if (!Array.isArray(runtime.agent_tasks) || !Array.isArray(runtime.operations) || !Array.isArray(runtime.edit_transactions) || !Array.isArray(runtime.coding_loops) || !Array.isArray(runtime.context_capsules) || !Array.isArray(runtime.state_errors)) {
+    throw new Error("admin runtime missing persistent agent task/operation/transaction/coding-loop/context-capsule state");
   }
   console.log("OK  admin agent runtime state");
 
@@ -166,6 +167,7 @@ try {
     "edit_transaction",
     "coding_loop",
     "coding_loop_status",
+    "context_capsule",
     "process_history",
     "run_commands_parallel",
     "pty",

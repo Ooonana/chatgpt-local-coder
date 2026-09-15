@@ -104,6 +104,7 @@ async function startServer() {
     MCP_OPERATION_STATE_DIR: path.join(stateRoot, "operations"),
     MCP_EDIT_TRANSACTION_STATE_DIR: path.join(stateRoot, "edit-transactions"),
     MCP_CODING_LOOP_STATE_DIR: path.join(stateRoot, "coding-loops"),
+    MCP_CONTEXT_CAPSULE_STATE_DIR: path.join(stateRoot, "context-capsules"),
     MCP_CODING_LOOP_WORKTREE_ROOT: path.join(stateRoot, "worktrees"),
     MCP_SHELL_STATE_DIR: path.join(stateRoot, "shell"),
     CHECKPOINT_PATH: path.join(stateRoot, "checkpoints"),
@@ -308,10 +309,35 @@ try {
     transaction_id: transactionId,
   });
 
+  const capsuleCheckpoint = await tool(server, sessionId, "context_capsule", {
+    action: "checkpoint",
+    workspace,
+    task_id: taskId,
+    coding_loop_id: loopId,
+    summary: "The arithmetic implementation edit is complete. Verification is the next action; do not rediscover the repository or repeat the edit.",
+    decisions: ["Keep the edit inside the coding-loop transaction until verification passes."],
+    findings: ["src/math.js now contains the repaired marker expected by verify.mjs."],
+    next_steps: ["Resume the existing coding loop and run its verification recipe."],
+    files: [{ path: path.join(workspace, "src", "math.js"), note: "edited inside active transaction" }],
+  });
+  const capsuleId = capsuleCheckpoint.payload?.data?.capsule?.id;
+  assert.ok(capsuleId);
+
   // Simulate ChatGPT/MCP interruption after edits but before verification.
   await stopTree(server.child);
   server = await startServer();
   sessionId = await initialize(server);
+
+  const resumedContext = await tool(server, sessionId, "context_capsule", {
+    action: "resume",
+    id: capsuleId,
+    workspace,
+  });
+  assert.match(resumedContext.payload?.data?.capsule?.semantic?.summary || "", /Verification is the next action/);
+  assert.equal(resumedContext.payload?.data?.capsule?.machine?.task?.id, taskId);
+  assert.equal(resumedContext.payload?.data?.capsule?.machine?.coding_loop?.id, loopId);
+  metric("context_resume_bytes", resumedContext.bytes, " bytes");
+  assert.ok(resumedContext.bytes < 32 * 1024, `context resume response too large: ${resumedContext.bytes}`);
 
   const resumed = await tool(server, sessionId, "coding_loop", { action: "resume", id: loopId });
   assert.equal(resumed.payload?.data?.reopened, true);
