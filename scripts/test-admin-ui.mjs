@@ -72,6 +72,8 @@ test("runtime overview surfaces are present", () => {
     if (!css.includes(className)) throw new Error(`missing CSS ${className}`);
   }
   if (!js.includes("coding_loops")) throw new Error("runtime overview does not render coding loops");
+  if (!js.includes("recent.slice(0, 20)")) throw new Error("runtime overview does not retain the 20 latest completed calls");
+  if (css.includes("radial-gradient(circle at top left")) throw new Error("overview hero still uses the colorful status wash");
 });
 
 test("responsive UI keeps dedicated mobile layouts", () => {

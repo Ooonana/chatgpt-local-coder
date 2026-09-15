@@ -58,7 +58,7 @@ const CURSOR_HIDE = `${CSI}?25l`;
 const CURSOR_SHOW = `${CSI}?25h`;
 const CLEAR = `${CSI}2J${CSI}H`;
 const ANSI_RE = /\x1B\[[0-?]*[ -\/]*[@-~]/g;
-const DEFAULT_DASHBOARD_ROWS = 30;
+const DEFAULT_DASHBOARD_ROWS = 44;
 const MIN_DASHBOARD_ROWS = 20;
 const MAX_DASHBOARD_ROWS = 60;
 
@@ -66,11 +66,11 @@ function ansi(code: string, text: string, enabled: boolean): string {
   return enabled ? `\x1b[${code}m${text}\x1b[0m` : text;
 }
 
-function tone(text: string, color: boolean, code = "36"): string {
+function tone(text: string, color: boolean, code = "2"): string {
   return ansi(code, text, color);
 }
 
-function metric(label: string, value: string, color: boolean, valueCode = "36;1"): string {
+function metric(label: string, value: string, color: boolean, valueCode = "37"): string {
   return `${ansi("2", label, color)} ${ansi(valueCode, value, color)}`;
 }
 
@@ -165,7 +165,7 @@ function shortWorkspace(workspace: string): string {
   return normalized.split(/[\\/]/).pop() || normalized;
 }
 
-function section(title: string, width: number, color = false, code = "36;1"): string {
+function section(title: string, width: number, color = false, code = "1"): string {
   if (width < 4) return crop("-", width);
   const safeTitle = crop(title, Math.max(1, width - 7));
   const label = `─ ${safeTitle} `;
@@ -175,7 +175,7 @@ function section(title: string, width: number, color = false, code = "36;1"): st
 
 function row(content: string, width: number, color = false): string {
   if (width < 3) return crop(content, width);
-  return `${tone("│", color, "2;36")}${pad(` ${content}`, Math.max(0, width - 2))}${tone("│", color, "2;36")}`;
+  return `${tone("│", color, "2")}${pad(` ${content}`, Math.max(0, width - 2))}${tone("│", color, "2")}`;
 }
 
 function toolStatusSymbol(status: "ok" | "error", color: boolean): string {
@@ -183,8 +183,7 @@ function toolStatusSymbol(status: "ok" | "error", color: boolean): string {
 }
 
 function kindLabel(kind: string, color: boolean): string {
-  const code = kind === "READ" ? "36" : kind === "EDIT" ? "33" : kind === "MCP" ? "35" : "34";
-  return ansi(code, kind.padEnd(4), color);
+  return ansi("2", kind.padEnd(4), color);
 }
 
 function spinner(nowMs: number, color: boolean): string {
@@ -228,7 +227,7 @@ function finishFrame(lines: string[], width: number, height: number, color = fal
     const bottom = lines.at(-1) || "";
     const hasBottomBorder = bottom.replace(ANSI_RE, "").startsWith("└");
     const body = hasBottomBorder ? lines.slice(0, -1) : [...lines];
-    const footer = hasBottomBorder ? bottom : tone(`└${"─".repeat(Math.max(0, width - 2))}┘`, color, "36");
+    const footer = hasBottomBorder ? bottom : tone(`└${"─".repeat(Math.max(0, width - 2))}┘`, color, "2");
     while (body.length < height - 1) body.push(row("", width, color));
     body.push(footer);
     return body.join("\n");
@@ -255,50 +254,50 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
   const titleRight = ` ${online} `;
   if (width >= measureTerminalCells(titleLeft) + measureTerminalCells(titleRight) + 4) {
     const titleFill = Math.max(0, width - measureTerminalCells(titleLeft) - measureTerminalCells(titleRight) - 2);
-    lines.push(`${tone("┌", model.color, "36")}${ansi("1;36", titleLeft, model.color)}${tone("─".repeat(titleFill), model.color, "2;36")}${titleRight}${tone("┐", model.color, "36")}`);
+    lines.push(`${tone("┌", model.color, "2")}${ansi("1", titleLeft, model.color)}${tone("─".repeat(titleFill), model.color, "2")}${titleRight}${tone("┐", model.color, "2")}`);
   } else {
-    lines.push(`${tone("┌", model.color, "36")}${ansi("1;36", pad(" Local Coder", width - 2), model.color)}${tone("┐", model.color, "36")}`);
+    lines.push(`${tone("┌", model.color, "2")}${ansi("1", pad(" Local Coder", width - 2), model.color)}${tone("┐", model.color, "2")}`);
   }
   lines.push(row([
-    metric("TIME", clock(model.now), model.color, "37;1"),
-    metric("UP", uptime, model.color, "36;1"),
+    metric("TIME", clock(model.now), model.color),
+    metric("UP", uptime, model.color),
     ansi("2", lastToolLabel(model.runtime, nowMs), model.color),
-    metric("PID", String(process.pid), model.color, "35;1"),
+    metric("PID", String(process.pid), model.color),
     metric("CPU", `${model.cpuPercent.toFixed(1)}%`, model.color, healthColor(model.cpuPercent)),
-    metric("RSS", formatBytes(model.rssBytes), model.color, "35;1"),
-    metric("HEAP", formatBytes(model.heapBytes), model.color, "34;1"),
+    metric("RSS", formatBytes(model.rssBytes), model.color),
+    metric("HEAP", formatBytes(model.heapBytes), model.color),
   ].join("  "), width, model.color));
 
-  lines.push(section("Connection", width, model.color, "36;1"));
+  lines.push(section("Connection", width, model.color));
   const keepAlive = model.transportMode === "sse" ? ` keepalive ${Math.round(model.keepAliveMs / 1000)}s` : "";
   lines.push(row([
-    metric("MCP", `:${model.mcpPort}`, model.color, "36;1"),
-    ansi("35;1", `${model.transportMode.toUpperCase()}${keepAlive}`, model.color),
-    metric("SESSIONS", String(model.sessionCount), model.color, "34;1"),
+    metric("MCP", `:${model.mcpPort}`, model.color),
+    ansi("1", `${model.transportMode.toUpperCase()}${keepAlive}`, model.color),
+    metric("SESSIONS", String(model.sessionCount), model.color),
     metric("AUTH", model.authEnabled ? "ON" : "OFF", model.color, model.authEnabled ? "32;1" : "33;1"),
-    metric("PROFILE", model.toolProfile, model.color, "33;1"),
+    metric("PROFILE", model.toolProfile, model.color),
   ].join("  "), width, model.color));
   lines.push(row([
-    metric("WORKSPACE", shortWorkspace(model.workspace), model.color, "37;1"),
+    metric("WORKSPACE", shortWorkspace(model.workspace), model.color),
     metric("POLICY", model.permission.split(":", 1)[0], model.color, model.permission.startsWith("open") ? "32;1" : "33;1"),
-    metric("LOOPS", String(activeLoops.length), model.color, activeLoops.length ? "35;1" : "36"),
-    metric("ADMIN", `:${model.adminPort}`, model.color, "36;1"),
+    metric("LOOPS", String(activeLoops.length), model.color),
+    metric("ADMIN", `:${model.adminPort}`, model.color),
   ].join("  "), width, model.color));
 
   if (activeLoops.length && height >= 20) {
     const loop = activeLoops[0];
     const attempt = `${loop.attempts.length}/${loop.max_attempts}`;
-    lines.push(row(`${ansi("35;1", "LOOP", model.color)} ${ansi("1", loop.phase.toUpperCase(), model.color)} ${ansi("33;1", attempt, model.color)}  ${loop.goal}`, width, model.color));
+    lines.push(row(`${ansi("1", "LOOP", model.color)} ${loop.phase.toUpperCase()} ${ansi("2", attempt, model.color)}  ${loop.goal}`, width, model.color));
   }
 
-  lines.push(section(`Active tools (${model.runtime.active.length})`, width, model.color, "34;1"));
+  lines.push(section(`Active tools (${model.runtime.active.length})`, width, model.color));
   const activeSlots = height >= 30 ? 5 : height >= 24 ? 4 : height >= 20 ? 3 : 1;
   if (!model.runtime.active.length) {
-    lines.push(row(`${ansi("2", "idle", model.color)}  ${ansi("36", "·", model.color)}  waiting for tool calls`, width, model.color));
+    lines.push(row(`${ansi("2", "idle", model.color)}  ·  waiting for tool calls`, width, model.color));
   } else {
     for (const call of model.runtime.active.slice(0, activeSlots)) {
       const elapsed = formatDuration(nowMs - call.started_ms).padStart(6);
-      lines.push(row(`${spinner(nowMs, model.color)} ${kindLabel(call.kind, model.color)} ${ansi("1", call.tool.padEnd(22).slice(0, 22), model.color)} ${ansi("33", elapsed, model.color)}  ${call.summary}`, width, model.color));
+      lines.push(row(`${spinner(nowMs, model.color)} ${kindLabel(call.kind, model.color)} ${ansi("1", call.tool.padEnd(22).slice(0, 22), model.color)} ${ansi("2", elapsed, model.color)}  ${call.summary}`, width, model.color));
     }
     if (model.runtime.active.length > activeSlots) {
       lines.push(row(`… ${model.runtime.active.length - activeSlots} more active call(s)`, width));
@@ -309,7 +308,7 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
   const runningPtys = model.ptys.filter((item) => item.running);
   const runningAgents = model.subagents.filter((item) => item.running);
   const runningCount = runningProcesses.length + runningPtys.length + runningAgents.length;
-  if (height >= 15) lines.push(section(`Workers (${runningCount})`, width, model.color, "35;1"));
+  if (height >= 15) lines.push(section(`Workers (${runningCount})`, width, model.color));
   const runningRows: string[] = [];
   for (const item of runningProcesses) {
     runningRows.push(`BG    ${String(item.pid ?? "-").padEnd(7)} ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${item.command}`);
@@ -322,26 +321,26 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
   }
   if (height >= 15) {
     const workerSlots = height >= 30 ? 4 : height >= 24 ? 3 : height >= 20 ? 2 : 1;
-    if (!runningRows.length) lines.push(row(`${ansi("2", "none", model.color)}  ${ansi("35", "·", model.color)}  no background process, PTY, or subagent`, width, model.color));
+    if (!runningRows.length) lines.push(row(`${ansi("2", "none", model.color)}  ·  no background process, PTY, or subagent`, width, model.color));
     else for (const item of runningRows.slice(0, workerSlots)) lines.push(row(item, width, model.color));
     if (runningRows.length > workerSlots) lines.push(row(`… ${runningRows.length - workerSlots} more running item(s)`, width));
   }
 
-  lines.push(section("Activity", width, model.color, "32;1"));
+  lines.push(section("Activity", width, model.color));
   const footerReserve = height >= 18 ? 4 : 2;
-  const recentSlots = Math.max(1, Math.min(height >= 30 ? 8 : height >= 24 ? 6 : 4, height - lines.length - footerReserve));
+  const recentSlots = Math.max(1, Math.min(20, height - lines.length - footerReserve));
   const recent = model.runtime.recent.slice(0, recentSlots);
   if (!recent.length) lines.push(row(`${ansi("2", "no completed calls yet", model.color)}`, width));
   for (const item of recent) {
     const time = new Date(item.finished_at).toLocaleTimeString("en-GB", { hour12: false });
     const summary = item.status === "error" ? item.error || item.summary : item.summary;
-    lines.push(row(`${toolStatusSymbol(item.status, model.color)} ${ansi("2", time, model.color)} ${kindLabel(item.kind, model.color)} ${ansi("1", item.tool.padEnd(21).slice(0, 21), model.color)} ${ansi("33", formatDuration(item.duration_ms).padStart(6), model.color)}  ${summary}`, width, model.color));
+    lines.push(row(`${toolStatusSymbol(item.status, model.color)} ${ansi("2", time, model.color)} ${kindLabel(item.kind, model.color)} ${ansi("1", item.tool.padEnd(21).slice(0, 21), model.color)} ${ansi("2", formatDuration(item.duration_ms).padStart(6), model.color)}  ${summary}`, width, model.color));
   }
 
   if (height >= 18) {
-    lines.push(section("Usage", width, model.color, "33;1"));
+    lines.push(section("Usage", width, model.color));
     const usage = model.runtime.usage.slice(0, 6).map((item) => `${item.tool} ${item.calls}`).join("  ·  ");
-    lines.push(row(usage ? ansi("36", usage, model.color) : ansi("2", "No tool usage yet", model.color), width, model.color));
+    lines.push(row(usage || ansi("2", "No tool usage yet", model.color), width, model.color));
   }
 
   const latestProblem = [...model.messages].reverse().find(
@@ -352,9 +351,9 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
     lines.push(row(`${label} ${latestProblem.text}`, width, model.color));
   } else {
     const permission = model.permission.split(":", 1)[0];
-    lines.push(row(`${metric("POLICY", permission, model.color, permission === "open" ? "32;1" : "33;1")}  ${ansi("36", "·", model.color)}  ${ansi("2", lastToolLabel(model.runtime, nowMs), model.color)}  ${ansi("36", "·", model.color)}  ${metric("CALLS", `${model.runtime.total_calls}/${model.runtime.total_errors} err`, model.color, model.runtime.total_errors ? "31;1" : "32;1")}  ${ansi("36", "·", model.color)}  ${ansi("2", "Ctrl+C stop", model.color)}`, width, model.color));
+    lines.push(row(`${metric("POLICY", permission, model.color, permission === "open" ? "32;1" : "33;1")}  ·  ${ansi("2", lastToolLabel(model.runtime, nowMs), model.color)}  ·  ${metric("CALLS", `${model.runtime.total_calls}/${model.runtime.total_errors} err`, model.color, model.runtime.total_errors ? "31;1" : "32;1")}  ·  ${ansi("2", "Ctrl+C stop", model.color)}`, width, model.color));
   }
-  lines.push(tone(`└${"─".repeat(inner)}┘`, model.color, "36"));
+  lines.push(tone(`└${"─".repeat(inner)}┘`, model.color, "2"));
   return finishFrame(lines, width, height, model.color);
 }
 

@@ -93,7 +93,7 @@ body {
   margin-bottom: 0.9rem;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: radial-gradient(circle at top left, rgba(97, 208, 149, 0.09), transparent 38%), var(--surface);
+  background: var(--surface);
 }
 .overview-eyebrow {
   color: var(--faint);
@@ -147,13 +147,14 @@ body {
 .runtime-row:last-child { border-bottom: none; }
 .runtime-row:hover { background: var(--hover); }
 .runtime-kind { font-family: var(--mono); font-size: 0.65rem; letter-spacing: 0.05em; color: var(--muted); min-width: 2.6rem; }
-.runtime-kind.read { color: #82d9e8; }
-.runtime-kind.edit { color: var(--amber); }
-.runtime-kind.exec { color: var(--blue); }
-.runtime-kind.mcp { color: #bc9cff; }
-.runtime-kind.task { color: var(--green); }
-.runtime-kind.operation { color: #9fb7ff; }
-.runtime-kind.loop { color: var(--amber); }
+.runtime-kind.read,
+.runtime-kind.edit,
+.runtime-kind.exec,
+.runtime-kind.mcp,
+.runtime-kind.task,
+.runtime-kind.operation,
+.runtime-kind.loop,
+.runtime-kind.transaction { color: var(--muted); }
 .runtime-tool { font-family: var(--mono); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .runtime-summary { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .runtime-time { color: var(--faint); font-family: var(--mono); font-size: 0.7rem; white-space: nowrap; }

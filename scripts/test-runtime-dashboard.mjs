@@ -94,7 +94,7 @@ await test("dashboard renders stable operational sections", async () => {
   assert.equal(frame.split("\n").length, 30, "desktop dashboard should fill its fixed canvas height");
 });
 
-await test("dashboard uses color accents without changing terminal width", async () => {
+await test("dashboard uses restrained state colors without changing terminal width", async () => {
   const now = new Date("2026-09-14T13:00:00.000Z");
   const frame = dashboard.renderDashboardFrame(baseModel(now, {
     width: 120,
@@ -102,19 +102,38 @@ await test("dashboard uses color accents without changing terminal width", async
     color: true,
     cpuPercent: 42,
   }));
-  assert.match(frame, /\x1b\[/, "expected ANSI color sequences");
+  assert.match(frame, /\x1b\[/, "expected ANSI state accents");
   assert.match(frame, /ONLINE/);
   assert.match(frame, /PROFILE/);
+  assert.doesNotMatch(frame, /\x1b\[(34|35)(;1)?m/, "routine dashboard text should not use blue/magenta accents");
   assert.equal(frame.split("\n").length, 30);
   assertFits(frame, 120, 30);
 });
 
-await test("dashboard height preference defaults to 30 rows and stays bounded", async () => {
-  assert.equal(dashboard.preferredTerminalDashboardRows(undefined), 30);
+await test("dashboard height preference defaults to 44 rows and stays bounded", async () => {
+  assert.equal(dashboard.preferredTerminalDashboardRows(undefined), 44);
   assert.equal(dashboard.preferredTerminalDashboardRows("36"), 36);
   assert.equal(dashboard.preferredTerminalDashboardRows("8"), 20);
   assert.equal(dashboard.preferredTerminalDashboardRows("200"), 60);
   assert.equal(dashboard.preferredTerminalDashboardRows("auto"), null);
+});
+
+await test("desktop activity renders the 20 latest completed tool calls", async () => {
+  runtime.resetRuntimeStateForTests();
+  for (let index = 0; index < 25; index++) {
+    const id = runtime.beginToolCall({ tool: `activity_${String(index).padStart(2, "0")}`, kind: "READ", summary: `item ${index}` });
+    runtime.finishToolCall(id, "ok");
+  }
+  const now = new Date();
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 120,
+    height: 44,
+    runtime: runtime.getRuntimeSnapshot(),
+  }));
+  const activitySection = frame.split("├─ Activity ")[1]?.split("├─ Usage ")[0] || "";
+  for (let index = 5; index < 25; index++) assert.match(activitySection, new RegExp(`activity_${String(index).padStart(2, "0")}`));
+  for (let index = 0; index < 5; index++) assert.doesNotMatch(activitySection, new RegExp(`activity_${String(index).padStart(2, "0")}`));
+  assertFits(frame, 120, 44);
 });
 
 await test("dashboard shows elapsed time since last tool activity", async () => {

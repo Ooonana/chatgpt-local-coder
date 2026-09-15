@@ -141,7 +141,7 @@ function renderRuntimeOverview(runtimeInfo) {
 
   const recentEl = document.getElementById("dash-recent");
   recentEl.innerHTML = recent.length
-    ? recent.slice(0, 8).map((item) => {
+    ? recent.slice(0, 20).map((item) => {
         const stateClass = item.status === "ok" ? "runtime-state-ok" : "runtime-state-error";
         const summary = item.status === "error" ? (item.error || item.summary) : item.summary;
         return `<div class="runtime-row">

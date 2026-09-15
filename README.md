@@ -81,9 +81,9 @@ Server runs at `http://127.0.0.1:3000` — health check: `http://127.0.0.1:3000/
 
 ### Live terminal dashboard
 
-Interactive launches use a clean alternate-screen TUI instead of scrolling request logs. The desktop view uses a stable **30-row canvas by default**, requests a one-time resize upward when the terminal is shorter, and uses color-coded connection, health, tool-kind, worker, activity, and usage surfaces. It shows the current time and uptime, sessions, active tool calls and their kind (`READ`, `EDIT`, `EXEC`, `MCP`), elapsed time, coding-loop state, background processes/PTYs/subagents, recent completions, per-tool usage, CPU, RSS, and heap memory. Narrow/tiny terminals still fall back to the compact resize-safe layouts; non-interactive/CI/redirected output automatically falls back to normal logs.
+Interactive launches use a clean alternate-screen TUI instead of scrolling request logs. The desktop view uses a stable **44-row canvas by default**, requests a one-time resize upward when the terminal is shorter, and keeps color restrained to meaningful state accents such as online/error/warning/active indicators. It shows the current time and uptime, sessions, active tool calls and their kind (`READ`, `EDIT`, `EXEC`, `MCP`), elapsed time, coding-loop state, background processes/PTYs/subagents, the **20 latest completed tool calls**, per-tool usage, CPU, RSS, and heap memory. Narrow/tiny terminals still fall back to the compact resize-safe layouts; non-interactive/CI/redirected output automatically falls back to normal logs.
 
-Set `LOCAL_CODER_TUI=off` to force traditional logs, or `LOCAL_CODER_TUI=on` to request the dashboard when stdout is a TTY. `LOCAL_CODER_TUI_HEIGHT=30` controls the preferred desktop height (20–60 rows); set it to `auto` or `0` to follow the terminal height without requesting a resize.
+Set `LOCAL_CODER_TUI=off` to force traditional logs, or `LOCAL_CODER_TUI=on` to request the dashboard when stdout is a TTY. `LOCAL_CODER_TUI_HEIGHT=44` controls the preferred desktop height (20–60 rows); set it to `auto` or `0` to follow the terminal height without requesting a resize.
 
 Set `WORKSPACE_PATH` to your project root (absolute path). With `MCP_TOKEN` set, the MCP endpoint becomes `/mcp/<token>` — that full path is what goes in the connector.
 
