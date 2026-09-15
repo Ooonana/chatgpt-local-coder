@@ -15,8 +15,8 @@ interface GitRunResult {
 
 const MAX_GIT_OUTPUT_CHARS = 500_000;
 const GIT_TIMEOUT_MS = (() => {
-  const parsed = Number(process.env.GIT_TIMEOUT_MS || 120_000);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 120_000;
+  const parsed = Number(process.env.GIT_TIMEOUT_MS || 300_000);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 300_000;
   return Math.min(Math.max(Math.trunc(parsed), 5_000), 10 * 60 * 1000);
 })();
 

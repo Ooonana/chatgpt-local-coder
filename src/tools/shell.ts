@@ -228,19 +228,21 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     {
       title: "Run Command",
       description:
-        "Run shell commands to verify work (tests, build, lint). Cwd persists across ChatGPT tool calls (saved to disk). Use shell_status to check cwd. Use start_process for long jobs.",
+        "Run a bounded shell command. Cwd persists across ChatGPT tool calls (saved to disk). timeout_seconds overrides the server default up to 1 hour; use start_process for very long/continuous jobs.",
       inputSchema: {
         command: z.string().max(MAX_COMMAND_CHARS),
         working_directory: z.string().optional().describe("One-off override; does not reset persistent cwd unless you use shell_reset"),
+        timeout_seconds: z.number().int().positive().max(3600).optional()
+          .describe("Per-call timeout in seconds. Defaults to SHELL_TIMEOUT (300s by default). Use start_process for continuous jobs."),
       },
 
       annotations: toolAnnotations("command"),
     },
-    async ({ command, working_directory }) => {
+    async ({ command, working_directory, timeout_seconds }) => {
       const cwdOverride = working_directory ? await validatePath(working_directory) : undefined;
       const policyCwd = cwdOverride ?? getShellStatus().cwd ?? defaultCwd;
       requireCommandAllowed(command, policyCwd);
-      const result = await execInShellSession(command, defaultCwd, timeoutSec * 1000, cwdOverride);
+      const result = await execInShellSession(command, defaultCwd, (timeout_seconds ?? timeoutSec) * 1000, cwdOverride);
       await audit({
         tool: "run_command",
         action: "command",
@@ -260,7 +262,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     {
       title: "Run Commands in Parallel",
       description:
-        "Run independent shell commands concurrently in isolated processes. Use for builds/tests/searches that can safely run at the same time. Does not change the persistent run_command cwd.",
+        "Run independent shell commands concurrently in isolated processes. Each command may set timeout_seconds up to 1 hour; otherwise SHELL_TIMEOUT is used. Does not change the persistent run_command cwd.",
       inputSchema: {
         commands: z.array(z.object({
           command: z.string().max(MAX_COMMAND_CHARS),

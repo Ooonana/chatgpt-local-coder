@@ -41,7 +41,11 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const MCP_TOKEN = (process.env.MCP_TOKEN || "").trim();
 const ADMIN_PORT = parseInt(process.env.ADMIN_PORT || "3001", 10);
-const SHELL_TIMEOUT = parseInt(process.env.SHELL_TIMEOUT || "120", 10);
+const SHELL_TIMEOUT = (() => {
+  const parsed = Number(process.env.SHELL_TIMEOUT || 300);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 300;
+  return Math.min(Math.max(Math.trunc(parsed), 5), 3600);
+})();
 const SESSION_RECOVERY =
   (process.env.MCP_SESSION_RECOVERY || "true").toLowerCase() !== "false";
 

@@ -60,6 +60,26 @@ await run("parallel commands overlap in time", async () => {
   if (Math.abs(stamps[0] - stamps[1]) > 300) throw new Error(`commands did not overlap: ${stamps.join(", ")}`);
 });
 
+await run("run_command exposes and honors a per-call timeout", async () => {
+  const listed = await client.listTools();
+  const tool = listed.tools.find((item) => item.name === "run_command");
+  if (!tool?.inputSchema?.properties?.timeout_seconds) {
+    throw new Error("run_command timeout_seconds schema missing");
+  }
+
+  const command = process.platform === "win32" ? "Start-Sleep -Seconds 2" : "sleep 2";
+  const started = Date.now();
+  let timedOut = false;
+  try {
+    const result = await call("run_command", { command, working_directory: tmp, timeout_seconds: 1 });
+    timedOut = result.isError === true && /timed out after 1s/i.test(JSON.stringify(result));
+  } catch (error) {
+    timedOut = /timed out after 1s/i.test(String(error));
+  }
+  if (!timedOut) throw new Error("run_command did not honor timeout_seconds=1");
+  if (Date.now() - started > 5_000) throw new Error("timeout override took unexpectedly long");
+});
+
 await run("managed background processes are terminated by server shutdown cleanup", async () => {
   const command = process.platform === "win32" ? "Start-Sleep -Seconds 30" : "sleep 30";
   const started = await call("start_process", { command, working_directory: tmp });

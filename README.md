@@ -365,7 +365,8 @@ MCP_TOKEN=                      # generate one — see below
 WORKSPACE_PATH=C:\Users\You\projects\my-app     # macOS: /Users/you/projects/my-app
 CHATGPT_AUTO_APPROVE=true
 LOCAL_CODER_TUI=auto
-SHELL_TIMEOUT=120
+SHELL_TIMEOUT=300
+GIT_TIMEOUT_MS=300000
 MCP_SESSION_RECOVERY=true
 MCP_JSON_RESPONSE=false
 MCP_SSE_KEEPALIVE_MS=10000
@@ -388,7 +389,8 @@ OPENAI_TUNNEL_API_KEY=
 | `MCP_SESSION_RECOVERY` | `true` | Auto-recover stale sessions after restart |
 | `MCP_JSON_RESPONSE` | `false` | Keep `false` for SSE tool responses with heartbeat frames. Set `true` only as a compatibility fallback for clients that require one JSON response at the end |
 | `MCP_SSE_KEEPALIVE_MS` | `10000` | SSE heartbeat interval for long MCP calls. The server clamps this to 1–60 seconds |
-| `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
+| `SHELL_TIMEOUT` | `300` | Default timeout for synchronous `run_command` / `run_commands_parallel` calls, clamped to 5–3600 seconds. Both support per-call overrides; prefer `start_process` for very long or continuous jobs |
+| `GIT_TIMEOUT_MS` | `300000` | Default timeout for native Git tools, clamped to 5 seconds–10 minutes |
 | `MCP_AGENT_TASK_STATE_DIR` | `.mcp-state/agent-tasks` | Durable regular-ChatGPT coding-task/plan state |
 | `MCP_OPERATION_STATE_DIR` | `.mcp-state/operations` | Durable background-operation history and bounded output tails |
 | `MCP_EDIT_TRANSACTION_STATE_DIR` | `.mcp-state/edit-transactions` | Durable transaction metadata and baseline snapshots for transaction-aware edits |

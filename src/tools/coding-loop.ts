@@ -247,6 +247,8 @@ async function killGitTree(child: ReturnType<typeof spawn>): Promise<void> {
   });
 }
 
+const WORKTREE_GIT_TIMEOUT_MS = 300_000;
+
 async function gitExec(args: string[], cwd: string, timeoutMs = 60_000): Promise<{ code: number; stdout: string; stderr: string }> {
   const command = `git ${args.map(quoteForDisplay).join(" ")}`;
   requireCommandAllowed(command, cwd);
@@ -310,7 +312,7 @@ async function createIsolatedWorktree(options: {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   await fs.mkdir(path.dirname(target), { recursive: true });
-  const created = await gitExec(["worktree", "add", "-b", branch, target, options.baseRef], options.sourceWorkspace, 120_000);
+  const created = await gitExec(["worktree", "add", "-b", branch, target, options.baseRef], options.sourceWorkspace, WORKTREE_GIT_TIMEOUT_MS);
   if (created.code !== 0) {
     await gitExec(["worktree", "remove", "--force", target], options.sourceWorkspace, 60_000).catch(() => undefined);
     await gitExec(["branch", "-D", branch], options.sourceWorkspace, 60_000).catch(() => undefined);
@@ -338,7 +340,7 @@ async function cleanupWorktree(record: CodingLoopRecord, force: boolean): Promis
   const args = ["worktree", "remove"];
   if (force) args.push("--force");
   args.push(record.isolation.worktree_path);
-  const result = await gitExec(args, record.isolation.source_workspace, 120_000);
+  const result = await gitExec(args, record.isolation.source_workspace, WORKTREE_GIT_TIMEOUT_MS);
   if (result.code !== 0) throw new Error(`git worktree remove failed (${result.code}): ${result.stderr || result.stdout}`);
   record.isolation.cleaned_at = nowIso();
   return saveCodingLoop(record);
@@ -537,7 +539,7 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
         } catch (error) {
           if (transactionId) await rollbackEditTransaction(transactionId, true).catch(() => undefined);
           if (worktree) {
-            await gitExec(["worktree", "remove", "--force", worktree.workspace], sourceWorkspace, 120_000).catch(() => undefined);
+            await gitExec(["worktree", "remove", "--force", worktree.workspace], sourceWorkspace, WORKTREE_GIT_TIMEOUT_MS).catch(() => undefined);
             await gitExec(["branch", "-D", worktree.branch], sourceWorkspace, 60_000).catch(() => undefined);
           }
           throw error;
