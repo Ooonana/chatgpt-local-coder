@@ -24,10 +24,22 @@ function boundedPositiveInt(raw: string | undefined, fallback: number, min: numb
 
 const SESSION_TTL_MS = boundedPositiveInt(
   process.env.MCP_SESSION_TTL_MS,
-  86_400_000,
+  7_200_000,
   60_000,
   7 * 24 * 60 * 60 * 1000
-); // default 24h
+); // default 2h; stale IDs can still be recovered on demand
+const CLOSED_SESSION_TTL_MS = boundedPositiveInt(
+  process.env.MCP_CLOSED_SESSION_TTL_MS,
+  900_000,
+  60_000,
+  24 * 60 * 60 * 1000
+); // default 15m
+const SESSION_MAX_RETAINED = boundedPositiveInt(
+  process.env.MCP_SESSION_MAX_RETAINED,
+  32,
+  4,
+  256
+);
 const SESSION_CLEANUP_INTERVAL_MS = boundedPositiveInt(
   process.env.MCP_SESSION_CLEANUP_MS,
   300_000,
@@ -231,10 +243,14 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     cancelDeleteGrace(sessionId);
     const session = sessions[sessionId];
     if (!session) return;
-    getUpstreamManager().unregisterMcpServer(session.server);
     delete sessions[sessionId];
     delete lastTransportErrors[sessionId];
     sessionOpChains.delete(sessionId);
+    clearPendingRecovery(sessionId);
+    getUpstreamManager().unregisterMcpServer(session.server);
+    // Remove registry references before closing so SDK close callbacks cannot
+    // re-arm grace retention for a session Local Coder has already evicted.
+    void session.server.close().catch(() => undefined);
     console.log(`[MCP] Session removed (${reason}): ${sessionId}`);
     void runLocalHooks("session_end", {
       workspace: config.workspaceRoot,
@@ -245,6 +261,21 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
 
   function clearPendingRecovery(sessionId: string): void {
     delete pendingRecoveries[sessionId];
+  }
+
+  function enforceSessionCapacity(protectedSessionId?: string): void {
+    const entries = Object.entries(sessions);
+    if (entries.length <= SESSION_MAX_RETAINED) return;
+    const removable = entries
+      .filter(([sid]) => sid !== protectedSessionId && !sessionOpChains.has(sid) && !pendingRecoveries[sid])
+      .sort(([, a], [, b]) => {
+        if (a.closed !== b.closed) return a.closed ? -1 : 1;
+        return a.lastAccessedAt - b.lastAccessedAt;
+      });
+    while (Object.keys(sessions).length > SESSION_MAX_RETAINED && removable.length) {
+      const [sid] = removable.shift()!;
+      removeSession(sid, "session capacity exceeded");
+    }
   }
 
   async function buildSession(preferredSessionId?: string): Promise<McpSession> {
@@ -290,6 +321,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
           closed: false,
         };
         clearPendingRecovery(sid);
+        enforceSessionCapacity(sid);
         console.log(`[MCP] Session initialized: ${sid}`);
       },
       onsessionclosed: (sid) => {
@@ -551,9 +583,10 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       cleanupTimer = setInterval(() => {
         const now = Date.now();
         for (const [sid, session] of Object.entries(sessions)) {
-          if (now - session.lastAccessedAt > SESSION_TTL_MS) {
+          const ttlMs = session.closed ? CLOSED_SESSION_TTL_MS : SESSION_TTL_MS;
+          if (now - session.lastAccessedAt > ttlMs) {
             void session.transport.close().catch(() => undefined);
-            removeSession(sid, "TTL expired");
+            removeSession(sid, session.closed ? "closed-session TTL expired" : "idle TTL expired");
           }
         }
         for (const sid of Object.keys(pendingRecoveries)) {

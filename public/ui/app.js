@@ -16,6 +16,15 @@ const ENV_KEYS = [
   "MCP_CONTEXT_CAPSULE_RESULT_BYTES",
   "MCP_CONTEXT_CAPSULE_ROLLOVER_CYCLES",
   "MCP_CODING_LOOP_WORKTREE_ROOT",
+  "MCP_RESULT_STATE_DIR",
+  "MCP_PARALLEL_BATCH_STATE_DIR",
+  "MCP_IDEMPOTENCY_STATE_DIR",
+  "MCP_PROJECT_REGISTRY_PATH",
+  "MCP_VERIFICATION_CACHE_STATE_DIR",
+  "MCP_VERIFICATION_CACHE_TTL_SECONDS",
+  "MCP_RUNTIME_IDENTITY_PATH",
+  "MCP_EPHEMERAL_STATE_RETENTION_DAYS",
+  "MCP_STALE_STATE_HOURS",
   "MCP_SESSION_RECOVERY",
   "MCP_SESSION_DELETE_GRACE_MS",
   "MCP_JSON_RESPONSE",
@@ -94,6 +103,13 @@ function formatElapsed(ms) {
   return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
+function formatBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${Math.round(value)} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KiB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
 function lastRuntimeActivityMs(runtime) {
   let latest = Number.NEGATIVE_INFINITY;
   for (const item of runtime?.active || []) latest = Math.max(latest, Number(item.started_ms) || 0);
@@ -109,6 +125,8 @@ function runtimeKind(kind) {
 
 function renderRuntimeOverview(runtimeInfo) {
   const runtime = runtimeInfo.runtime || {};
+  const identity = runtimeInfo.identity || {};
+  const affinity = runtimeInfo.project_affinity || {};
   const now = Date.now();
   const active = Array.isArray(runtime.active) ? runtime.active : [];
   const recent = Array.isArray(runtime.recent) ? runtime.recent : [];
@@ -133,6 +151,14 @@ function renderRuntimeOverview(runtimeInfo) {
   if (workerStat) workerStat.textContent = String(workers);
   if (callsStat) callsStat.textContent = String(runtime.total_calls ?? 0);
   if (errorsStat) errorsStat.textContent = String(runtime.total_errors ?? 0);
+  const runStat = document.getElementById("stat-run-id");
+  const schemaStat = document.getElementById("stat-schema");
+  const projectStat = document.getElementById("stat-project");
+  const projectSub = document.getElementById("stat-project-sub");
+  if (runStat) runStat.textContent = identity.run_id ? String(identity.run_id).replace(/^run_/, "").slice(0, 12) : "—";
+  if (schemaStat) schemaStat.textContent = identity.schema_hash ? String(identity.schema_hash).slice(0, 12) : "—";
+  if (projectStat) projectStat.textContent = affinity.active_alias || "—";
+  if (projectSub) projectSub.textContent = affinity.active_root || "No active project";
 
   const activeEl = document.getElementById("dash-active");
   activeEl.innerHTML = active.length
@@ -157,6 +183,24 @@ function renderRuntimeOverview(runtimeInfo) {
         </div>`;
       }).join("")
     : '<div class="runtime-empty">No completed tool calls in this server process yet.</div>';
+
+  const usage = Array.isArray(runtime.usage) ? runtime.usage : [];
+  const usageEl = document.getElementById("dash-usage");
+  const usageCount = document.getElementById("dash-usage-count");
+  if (usageCount) usageCount.textContent = String(usage.length);
+  if (usageEl) {
+    usageEl.innerHTML = usage.length
+      ? usage.slice(0, 10).map((item) => {
+          const summary = `${item.calls || 0} call(s) · p50 ${formatElapsed(item.p50_duration_ms || 0)} · p95 ${formatElapsed(item.p95_duration_ms || 0)} · avg ${formatBytes(item.average_result_bytes || 0)}${item.repeated_calls ? ` · ${item.repeated_calls} repeat(s)` : ""}`;
+          return `<div class="runtime-row">
+            <span class="runtime-kind read">PERF</span>
+            <span class="runtime-tool" title="${esc(item.tool)}">${esc(item.tool)}</span>
+            <span class="runtime-summary" title="${esc(summary)}">${esc(summary)}</span>
+            <span class="runtime-time">${formatBytes(item.total_result_bytes || 0)}</span>
+          </div>`;
+        }).join("")
+      : '<div class="runtime-empty">No tool telemetry yet.</div>';
+  }
 
   const tasks = Array.isArray(runtimeInfo.agent_tasks) ? runtimeInfo.agent_tasks : [];
   const resumable = tasks.filter((task) => task.status === "active" || task.status === "blocked");
@@ -328,12 +372,16 @@ async function loadDashboard() {
     <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" id="stat-workers">${workers}</div></div>
     <div class="stat"><div class="stat-label">Tool calls</div><div class="stat-value" id="stat-calls">${runtimeInfo.runtime?.total_calls ?? 0}</div></div>
     <div class="stat"><div class="stat-label">Errors</div><div class="stat-value" id="stat-errors">${runtimeInfo.runtime?.total_errors ?? 0}</div></div>
+    <div class="stat"><div class="stat-label">Run ID</div><div class="stat-value" id="stat-run-id" style="font-size:0.85rem">${esc((runtimeInfo.identity?.run_id || "—").replace(/^run_/, "").slice(0, 12))}</div></div>
+    <div class="stat"><div class="stat-label">Schema</div><div class="stat-value" id="stat-schema" style="font-size:0.85rem">${esc((runtimeInfo.identity?.schema_hash || "—").slice(0, 12))}</div></div>
     <div class="stat"><div class="stat-label">Policy</div><div class="stat-value">${esc(policy)}</div></div>
     <div class="stat"><div class="stat-label">Project memory</div><div class="stat-value">${memCount} file(s)</div>
       <div class="stat-sub">${instr.instruction_bytes ? Math.round(instr.instruction_bytes / 1024) + " KB instructions" : ""}</div></div>
     <div class="stat"><div class="stat-label">Git branch</div><div class="stat-value" style="font-size:0.85rem">${esc(gitBranch)}</div></div>
     <div class="stat"><div class="stat-label">Workspace</div><div class="stat-value" style="font-size:0.85rem">${esc(health.default_cwd?.split(/[/\\]/).pop())}</div>
-      <div class="stat-sub">${esc(health.default_cwd)}</div></div>`;
+      <div class="stat-sub">${esc(health.default_cwd)}</div></div>
+    <div class="stat"><div class="stat-label">Active project</div><div class="stat-value" id="stat-project" style="font-size:0.85rem">${esc(runtimeInfo.project_affinity?.active_alias || "—")}</div>
+      <div class="stat-sub" id="stat-project-sub">${esc(runtimeInfo.project_affinity?.active_root || "No active project")}</div></div>`;
   document.getElementById("dash-servers").innerHTML = serversTable(health.upstream || [], { actions: false });
   document.getElementById("status-json").textContent = JSON.stringify(health, null, 2);
   renderRuntimeOverview(runtimeInfo);

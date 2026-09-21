@@ -72,6 +72,7 @@ export interface CodingLoopRecord {
   id: string;
   goal: string;
   task_id?: string;
+  managed_task?: boolean;
   status: CodingLoopStatus;
   phase: CodingLoopPhase;
   source_workspace: string;

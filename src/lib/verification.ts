@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { detectPackageManager } from "./package-manager.js";
 
 export interface VerificationCommand {
   label: string;
@@ -69,11 +70,7 @@ async function packageJsonRecipe(root: string, preset: "quick" | "full"): Promis
     return [];
   }
   const scripts = pkg.scripts || {};
-  const manager = pkg.packageManager?.split("@")[0]
-    || (await exists(path.join(root, "pnpm-lock.yaml")) ? "pnpm"
-      : await exists(path.join(root, "yarn.lock")) ? "yarn"
-      : await exists(path.join(root, "bun.lock")) || await exists(path.join(root, "bun.lockb")) ? "bun"
-      : "npm");
+  const manager = await detectPackageManager(root, pkg.packageManager);
   const runScript = (name: string) => `${manager} run ${name}`;
   const names = preset === "quick"
     ? ["lint", "typecheck", "check", "build"]

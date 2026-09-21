@@ -70,7 +70,18 @@ const DEFAULT_CONFIG: SubagentConfig = {
   isolation: "none",
 };
 const MAX_LOG_CHARS = 1_000_000;
+const MAX_RETAINED_SUBAGENTS = 48;
 const agents = new Map<string, ManagedSubagent>();
+
+function pruneFinishedSubagents(): void {
+  if (agents.size <= MAX_RETAINED_SUBAGENTS) return;
+  const finished = [...agents.values()]
+    .filter((item) => !item.running && !item.worktree_path)
+    .sort((a, b) => a.started_at.localeCompare(b.started_at));
+  while (agents.size > MAX_RETAINED_SUBAGENTS && finished.length) {
+    agents.delete(finished.shift()!.id);
+  }
+}
 
 function parseEnvBoolean(name: string, fallback: boolean): boolean {
   const raw = process.env[name];
@@ -381,6 +392,7 @@ export async function spawnSubagent(options: {
     record.exit_code = code ?? (error ? 1 : null);
     record.signal = signal;
     record.finished_at = new Date().toISOString();
+    pruneFinishedSubagents();
     record.resolveDone();
     if (error && record.worktree_path) void removeWorktree(record);
     void runLocalHooks("subagent_stop", {

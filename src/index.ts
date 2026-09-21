@@ -36,6 +36,8 @@ import {
 } from "./lib/permissions.js";
 import { shutdownSubagents } from "./lib/subagent-manager.js";
 import { startTerminalDashboard } from "./lib/terminal-dashboard.js";
+import { initializeRuntimeIdentity } from "./lib/runtime-identity.js";
+import { pruneEphemeralState } from "./lib/state-maintenance.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -99,6 +101,24 @@ console.log(
   `[MCP] MCP instructions: ${Math.round(instructionContext.instructionBytes / 1024)}KB (agent prompt + env + git + memory)`
 );
 console.log(`[MCP] Tool profile: ${getChatGptToolProfile()} (CHATGPT_TOOL_PROFILE)`);
+const runtimeIdentity = initializeRuntimeIdentity(workspaceRoot);
+console.log(`[MCP] Runtime: ${runtimeIdentity.run_id} schema=${runtimeIdentity.schema_hash} commit=${runtimeIdentity.build_commit || "unknown"}`);
+if (runtimeIdentity.connector_refresh_recommended) {
+  console.warn("[MCP] Tool schema changed since the previous run; refresh the ChatGPT connector and use a fresh chat after this restart.");
+}
+const stateMaintenance = await pruneEphemeralState().catch((error) => ({
+  removed_files: 0,
+  removed_bytes: 0,
+  scanned_files: 0,
+  errors: [error instanceof Error ? error.message : String(error)],
+  retention_days: 30,
+}));
+if (stateMaintenance.removed_files > 0) {
+  console.log(`[MCP] State maintenance: removed ${stateMaintenance.removed_files} expired ephemeral file(s), ${stateMaintenance.removed_bytes} bytes`);
+}
+if (stateMaintenance.errors.length) {
+  console.warn(`[MCP] State maintenance warning: ${stateMaintenance.errors.slice(0, 3).join(" | ")}`);
+}
 
 const sessionManager = createSessionManager({
   workspaceRoot,
@@ -393,6 +413,9 @@ server = app.listen(PORT, HOST, () => {
   console.log(`  Transport: ${MCP_JSON_RESPONSE ? "JSON response" : `SSE keepalive ${MCP_SSE_KEEPALIVE_MS / 1000}s`}`);
   console.log(`  Auth:      ${MCP_TOKEN ? "ON (MCP_TOKEN in URL path)" : "OFF — set MCP_TOKEN in .env!"}`);
   console.log(`  PID:       ${process.pid}`);
+  console.log(`  Run ID:    ${runtimeIdentity.run_id}`);
+  console.log(`  Schema:    ${runtimeIdentity.schema_hash}`);
+  console.log(`  Build:     ${runtimeIdentity.build_commit || "unknown"}`);
   console.log("========================================");
   console.log("  Running... (Ctrl+C to stop)");
   console.log("========================================");

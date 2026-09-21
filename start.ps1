@@ -10,6 +10,18 @@ param(
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
+# Old launchers wrote server/tunnel output to these files. They are no longer
+# authoritative and can contain historical tokenized MCP endpoints, so remove
+# them rather than letting stale logs look like current runtime state.
+foreach ($LegacyLog in @(".server.log", ".tunnel.log")) {
+    if (Test-Path $LegacyLog) {
+        Remove-Item $LegacyLog -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $LegacyLog)) {
+            Write-Host "[Cleanup] Removed legacy runtime log: $LegacyLog" -ForegroundColor DarkGray
+        }
+    }
+}
+
 function Get-PortOwnerPid([int]$TargetPort) {
     $lines = netstat -ano | Select-String ":$TargetPort\s" | Select-String "LISTENING"
     foreach ($line in $lines) {

@@ -168,8 +168,6 @@ export const SLIM_CHATGPT_TOOLS = new Set([
   "load_path_rules",
   "list_skills",
   "load_skill",
-  "node_repl",
-  "ponytail_turn",
   "rewind",
   "view_image",
   "lsp",

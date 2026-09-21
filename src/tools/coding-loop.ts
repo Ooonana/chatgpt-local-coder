@@ -27,7 +27,14 @@ import {
   type VerificationCommand,
 } from "../lib/verification.js";
 import { runOneShotCommand } from "./shell.js";
-import { getAgentTask, updateAgentTask } from "../lib/agent-task-store.js";
+import { createAgentTask, getAgentTask, updateAgentTask } from "../lib/agent-task-store.js";
+import { recordProjectAffinity, resolveProjectReference } from "../lib/project-affinity.js";
+import {
+  hasVerificationCache,
+  saveVerificationCache,
+  selectIncrementalVerification,
+  verificationFingerprint,
+} from "../lib/verification-cache.js";
 import {
   createCodingLoop,
   getCodingLoop,
@@ -61,6 +68,7 @@ interface VerificationResult {
   excerpt: string;
   output_chars: number;
   truncated: boolean;
+  cached?: boolean;
 }
 
 function nowIso(): string {
@@ -181,22 +189,43 @@ function diagnoseFailures(results: VerificationResult[]): CodingLoopFailure[] {
     }));
 }
 
-async function runVerification(record: CodingLoopRecord): Promise<{
+async function runVerification(record: CodingLoopRecord, affectedFiles: string[]): Promise<{
   source: string;
   results: VerificationResult[];
   passed: number;
   failed: number;
   duration_ms: number;
+  incremental: boolean;
+  incremental_reason: string | null;
+  cached_checks: number;
 }> {
   const configured = record.verification;
   const recipe = configured.preset === "custom"
     ? { source: "custom", commands: configured.commands || [] }
     : await discoverVerificationRecipe(record.workspace, configured.preset);
-  if (!recipe.commands.length) throw new Error("No verification checks discovered for coding loop");
+  const selected = selectIncrementalVerification(recipe.commands, affectedFiles, configured.preset);
+  if (!selected.commands.length) throw new Error("No verification checks discovered for coding loop");
 
   const results: VerificationResult[] = [];
-  for (const check of recipe.commands as VerificationCommand[]) {
+  for (const check of selected.commands as VerificationCommand[]) {
     requireCommandAllowed(check.command, record.workspace);
+    const fingerprint = affectedFiles.length
+      ? await verificationFingerprint(record.workspace, check.command, affectedFiles)
+      : null;
+    if (fingerprint && await hasVerificationCache(record.workspace, check.command, fingerprint)) {
+      results.push({
+        label: check.label,
+        command: check.command,
+        exit_code: 0,
+        duration_ms: 0,
+        timed_out: false,
+        excerpt: "cached successful verification for unchanged affected-file fingerprint",
+        output_chars: 0,
+        truncated: false,
+        cached: true,
+      });
+      continue;
+    }
     const result = await runOneShotCommand(check.command, record.workspace, check.timeout_seconds * 1000);
     const compact = compactVerificationOutput(result.stdout, result.stderr);
     results.push({
@@ -206,7 +235,9 @@ async function runVerification(record: CodingLoopRecord): Promise<{
       duration_ms: result.duration_ms,
       timed_out: result.timed_out,
       ...compact,
+      cached: false,
     });
+    if (result.exit_code === 0 && fingerprint) await saveVerificationCache(record.workspace, check.command, fingerprint).catch(() => undefined);
     if (configured.stop_on_failure && result.exit_code !== 0) break;
   }
   const failed = results.filter((item) => item.exit_code !== 0).length;
@@ -216,6 +247,9 @@ async function runVerification(record: CodingLoopRecord): Promise<{
     passed: results.length - failed,
     failed,
     duration_ms: results.reduce((sum, item) => sum + item.duration_ms, 0),
+    incremental: selected.incremental,
+    incremental_reason: selected.reason,
+    cached_checks: results.filter((item) => item.cached).length,
   };
 }
 
@@ -367,6 +401,7 @@ function compactLoop(record: CodingLoopRecord) {
     id: record.id,
     goal: record.goal,
     task_id: record.task_id,
+    managed_task: Boolean(record.managed_task),
     status: record.status,
     phase: record.phase,
     workspace: record.workspace,
@@ -420,6 +455,7 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
         goal: z.string().min(1).max(20_000).optional(),
         workspace: z.string().optional(),
         task_id: z.string().optional(),
+        manage_task: z.boolean().optional().default(true),
         isolation: z.enum(["none", "worktree"]).optional().default("none"),
         worktree_path: z.string().optional(),
         base_ref: z.string().max(200).optional().default("HEAD"),
@@ -444,7 +480,7 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
     },
     async (args) => {
       const {
-        action, id, goal, workspace, task_id, isolation, worktree_path, base_ref, allow_dirty_base,
+        action, id, goal, workspace, task_id, manage_task, isolation, worktree_path, base_ref, allow_dirty_base,
         verification_preset, commands, stop_on_failure, max_attempts, extend_attempts,
         intel_action, query, path: intelPath, line, column, server: requestedServer, max_results,
         allow_unverified, force, note,
@@ -459,8 +495,26 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
         if ((line !== undefined || column !== undefined) && !intelPath) throw new Error("path is required when line/column are supplied");
         if (base_ref.startsWith("-")) throw new Error("base_ref must be a Git revision, not an option");
 
-        const sourceWorkspace = workspace ? await validatePath(workspace) : defaultCwd;
+        const sourceCandidate = await resolveProjectReference(workspace, defaultCwd);
+        const sourceWorkspace = await validatePath(sourceCandidate);
+        await recordProjectAffinity(sourceWorkspace).catch(() => undefined);
         if (task_id && !(await getAgentTask(task_id))) throw new Error(`Unknown agent task id: ${task_id}`);
+        let effectiveTaskId = task_id;
+        let managedTask = false;
+        if (!effectiveTaskId && manage_task) {
+          const autoTask = await createAgentTask({
+            title: goal.trim().slice(0, 160),
+            objective: goal.trim(),
+            workspace: sourceWorkspace,
+            plan: [
+              "Implement the requested change set",
+              "Verify the affected project",
+              "Finish and accept the transaction or rollback safely",
+            ],
+          });
+          effectiveTaskId = autoTask.id;
+          managedTask = true;
+        }
         const loopId = newCodingLoopId();
         let effectiveWorkspace = sourceWorkspace;
         let worktree: { workspace: string; branch: string } | undefined;
@@ -494,7 +548,8 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
           const record = await createCodingLoop({
             id: loopId,
             goal: goal.trim(),
-            task_id,
+            task_id: effectiveTaskId,
+            managed_task: managedTask,
             status: "active",
             phase: "editing",
             source_workspace: sourceWorkspace,
@@ -520,24 +575,27 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
               : { mode: "none", source_workspace: sourceWorkspace, workspace: effectiveWorkspace },
             notes: note?.trim() ? [{ at: nowIso(), text: note.trim() }] : [],
           });
-          if (task_id) {
-            await updateAgentTask(task_id, { note: `Coding loop ${loopId} started: ${goal.trim()}` }).catch(() => undefined);
+          if (effectiveTaskId) {
+            await updateAgentTask(effectiveTaskId, { note: `Coding loop ${loopId} started: ${goal.trim()}` }).catch(() => undefined);
           }
           await audit({
             tool: "coding_loop",
             action: "begin",
             target: effectiveWorkspace,
             status: "ok",
-            details: { id: loopId, task_id, transaction_id: transaction.id, isolation, max_attempts },
+            details: { id: loopId, task_id: effectiveTaskId, managed_task: managedTask, transaction_id: transaction.id, isolation, max_attempts },
           });
           return toolResult("coding_loop", {
             action,
             loop: compactLoop(record),
             intel: contextBuilt.intel_result ?? null,
-            next: `Use transaction_id=${transaction.id} on supported file edits. Then call coding_loop action=verify id=${loopId}.`,
+            next: `Use transaction_id=${transaction.id} on supported file edits. For shell-driven edits also pass transaction_id plus mutation_paths. Then call coding_loop action=verify id=${loopId}.`,
           }, { summary: `began ${loopId} in ${isolation} mode` });
         } catch (error) {
           if (transactionId) await rollbackEditTransaction(transactionId, true).catch(() => undefined);
+          if (managedTask && effectiveTaskId) {
+            await updateAgentTask(effectiveTaskId, { status: "cancelled", note: `Coding loop startup failed: ${error instanceof Error ? error.message : String(error)}` }).catch(() => undefined);
+          }
           if (worktree) {
             await gitExec(["worktree", "remove", "--force", worktree.workspace], sourceWorkspace, WORKTREE_GIT_TIMEOUT_MS).catch(() => undefined);
             await gitExec(["branch", "-D", worktree.branch], sourceWorkspace, 60_000).catch(() => undefined);
@@ -550,6 +608,7 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
       return withCodingLoopLock(id, async () => {
         let record = await getCodingLoop(id);
         await validatePath(record.workspace);
+        await recordProjectAffinity(record.workspace).catch(() => undefined);
 
         if (action === "resume") {
           if (record.status === "failed" && extend_attempts) {
@@ -634,7 +693,8 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
               );
             }
             const started = nowIso();
-            const verification = await runVerification(record);
+            const affectedFiles = [...new Set(transaction.edits.flatMap((edit) => edit.paths))];
+            const verification = await runVerification(record, affectedFiles);
             const failures = diagnoseFailures(verification.results);
             const attempt: CodingLoopAttempt = {
               number: record.attempts.length + 1,
@@ -685,7 +745,7 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
               action: "verify",
               target: record.workspace,
               status: verification.failed ? "error" : "ok",
-              details: { id, attempt: attempt.number, max_attempts: record.max_attempts, passed: verification.passed, failed: verification.failed },
+              details: { id, attempt: attempt.number, max_attempts: record.max_attempts, passed: verification.passed, failed: verification.failed, incremental: verification.incremental, cached_checks: verification.cached_checks, affected_files: affectedFiles.length },
             });
             return toolResult("coding_loop", {
               action,
@@ -742,7 +802,10 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
             contextRefreshError = error instanceof Error ? error.message : String(error);
           }
           if (record.task_id) {
-            await updateAgentTask(record.task_id, { note: `Coding loop ${id} completed successfully.` }).catch(() => undefined);
+            await updateAgentTask(record.task_id, {
+              ...(record.managed_task ? { status: "completed" as const } : {}),
+              note: `Coding loop ${id} completed successfully.`,
+            }).catch(() => undefined);
           }
           await audit({ tool: "coding_loop", action: "finish", target: record.workspace, status: "ok", details: { id, allow_unverified, isolation: record.isolation.mode } });
           return toolResult("coding_loop", {
@@ -784,6 +847,9 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
           record.cancelled_at = nowIso();
           if (note?.trim()) record.notes.push({ at: nowIso(), text: note.trim() });
           record = await saveCodingLoop(record);
+          if (record.task_id && record.managed_task) {
+            await updateAgentTask(record.task_id, { status: "cancelled", note: `Coding loop ${id} rolled back and was cancelled.` }).catch(() => undefined);
+          }
           await audit({ tool: "coding_loop", action: "rollback", target: record.workspace, status: "ok", details: { id, force } });
           return toolResult("coding_loop", {
             action,

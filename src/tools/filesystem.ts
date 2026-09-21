@@ -13,6 +13,7 @@ import { toolResult } from "../lib/tool-result.js";
 import { globFiles } from "../lib/glob-search.js";
 import { grepSearch } from "../lib/grep-search.js";
 import { captureTransactionPaths, recordTransactionEdit, withEditTransactionLock } from "../lib/edit-transaction-store.js";
+import { readTextCached } from "../lib/text-read-cache.js";
 
 const MAX_TEXT_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_EDITABLE_TEXT_BYTES = 16 * 1024 * 1024;
@@ -124,11 +125,13 @@ export function registerFilesystemTools(server: McpServer): void {
         limit: z.number().int().positive().max(100_000).optional().describe("Number of lines to read from offset"),
         head: z.number().int().positive().max(100_000).optional(),
         tail: z.number().int().positive().max(100_000).optional(),
+        if_mtime_ms: z.number().nonnegative().optional().describe("Conditional read revision mtime; pair with if_ctime_ms"),
+        if_ctime_ms: z.number().nonnegative().optional().describe("Conditional read revision ctime; pair with if_mtime_ms"),
       },
 
       annotations: toolAnnotations("read"),
     },
-    async ({ path: filePath, offset, limit, head, tail }) => {
+    async ({ path: filePath, offset, limit, head, tail, if_mtime_ms, if_ctime_ms }) => {
       const validPath = await validatePath(filePath);
       const stat = await fs.stat(validPath);
       if (!stat.isFile()) throw new Error("Path is not a regular file");
@@ -138,7 +141,12 @@ export function registerFilesystemTools(server: McpServer): void {
           "Use grep, a shell command that streams the needed range, or read_file_base64 chunks."
         );
       }
-      const content = await fs.readFile(validPath, "utf-8");
+      if (if_mtime_ms !== undefined && if_ctime_ms !== undefined && if_mtime_ms === stat.mtimeMs && if_ctime_ms === stat.ctimeMs) {
+        await audit({ tool: "read_text_file", action: "read", target: validPath, status: "ok", details: { unchanged: true, mtime_ms: stat.mtimeMs, ctime_ms: stat.ctimeMs } });
+        return toolResult("read_text_file", { path: validPath, unchanged: true, mtime_ms: stat.mtimeMs, ctime_ms: stat.ctimeMs, size: stat.size });
+      }
+      const cachedRead = await readTextCached(validPath);
+      const content = cachedRead.text;
       const lines = content.split("\n");
 
       if (offset !== undefined) {
@@ -146,14 +154,14 @@ export function registerFilesystemTools(server: McpServer): void {
         const end = limit !== undefined ? start + limit : lines.length;
         const slice = lines.slice(start, end);
         const numbered = slice.map((line, idx) => `${String(start + idx + 1).padStart(6, " ")}|${line}`);
-        await audit({ tool: "read_text_file", action: "read", target: validPath, status: "ok", details: { offset, limit } });
-        return toolResult("read_text_file", { path: validPath, content: numbered.join("\n"), offset, limit, lines: slice.length });
+        await audit({ tool: "read_text_file", action: "read", target: validPath, status: "ok", details: { offset, limit, cache_hit: cachedRead.cache_hit } });
+        return toolResult("read_text_file", { path: validPath, content: numbered.join("\n"), offset, limit, lines: slice.length, cache_hit: cachedRead.cache_hit, mtime_ms: cachedRead.mtime_ms, ctime_ms: cachedRead.ctime_ms });
       }
 
       const result =
         head !== undefined ? lines.slice(0, head).join("\n") : tail !== undefined ? lines.slice(-tail).join("\n") : content;
-      await audit({ tool: "read_text_file", action: "read", target: validPath, status: "ok" });
-      return toolResult("read_text_file", { path: validPath, content: result, head, tail });
+      await audit({ tool: "read_text_file", action: "read", target: validPath, status: "ok", details: { cache_hit: cachedRead.cache_hit } });
+      return toolResult("read_text_file", { path: validPath, content: result, head, tail, cache_hit: cachedRead.cache_hit, mtime_ms: cachedRead.mtime_ms, ctime_ms: cachedRead.ctime_ms });
     }
   );
 
@@ -171,6 +179,8 @@ export function registerFilesystemTools(server: McpServer): void {
           head: z.number().int().positive().max(20_000).optional(),
           tail: z.number().int().positive().max(20_000).optional(),
           max_chars: z.number().int().positive().max(200_000).optional().default(80_000),
+          if_mtime_ms: z.number().nonnegative().optional(),
+          if_ctime_ms: z.number().nonnegative().optional(),
         })).min(1).max(MAX_BATCH_READ_FILES),
       },
       annotations: toolAnnotations("read"),
@@ -181,6 +191,10 @@ export function registerFilesystemTools(server: McpServer): void {
         content?: string;
         lines?: number;
         truncated?: boolean;
+        cache_hit?: boolean;
+        unchanged?: boolean;
+        mtime_ms?: number;
+        ctime_ms?: number;
         error?: string;
       }> = [];
       let remaining = MAX_BATCH_READ_TOTAL_CHARS;
@@ -197,7 +211,12 @@ export function registerFilesystemTools(server: McpServer): void {
           if (stat.size > MAX_BATCH_READ_FILE_BYTES) {
             throw new Error(`Batch text read is limited to ${MAX_BATCH_READ_FILE_BYTES} bytes per file (${stat.size} bytes)`);
           }
-          const content = await fs.readFile(validPath, "utf-8");
+          if (spec.if_mtime_ms !== undefined && spec.if_ctime_ms !== undefined && spec.if_mtime_ms === stat.mtimeMs && spec.if_ctime_ms === stat.ctimeMs) {
+            results.push({ path: validPath, unchanged: true, mtime_ms: stat.mtimeMs, ctime_ms: stat.ctimeMs, cache_hit: true });
+            continue;
+          }
+          const cachedRead = await readTextCached(validPath);
+          const content = cachedRead.text;
           const lines = content.split("\n");
           let selected: string;
           let selectedLines = lines.length;
@@ -224,7 +243,7 @@ export function registerFilesystemTools(server: McpServer): void {
           const truncated = selected.length > budget;
           const bounded = truncated ? selected.slice(0, budget) : selected;
           remaining -= bounded.length;
-          results.push({ path: validPath, content: bounded, lines: selectedLines, truncated });
+          results.push({ path: validPath, content: bounded, lines: selectedLines, truncated, cache_hit: cachedRead.cache_hit, mtime_ms: cachedRead.mtime_ms, ctime_ms: cachedRead.ctime_ms });
         } catch (error) {
           results.push({ path: spec.path, error: error instanceof Error ? error.message : String(error) });
         }

@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { spawn } from "child_process";
+import { detectPackageManager } from "./package-manager.js";
 
 const IGNORED_DIRS = new Set([
   ".git",
@@ -150,14 +151,6 @@ async function inspectGit(root: string): Promise<ProjectInspection["git"]> {
   };
 }
 
-function detectPackageManager(names: Set<string>): string | undefined {
-  if (names.has("pnpm-lock.yaml")) return "pnpm";
-  if (names.has("yarn.lock")) return "yarn";
-  if (names.has("bun.lockb") || names.has("bun.lock")) return "bun";
-  if (names.has("package-lock.json")) return "npm";
-  return names.has("package.json") ? "npm" : undefined;
-}
-
 async function inspectPackage(root: string, names: Set<string>): Promise<ProjectInspection["package"] | undefined> {
   if (!names.has("package.json")) return undefined;
   try {
@@ -170,11 +163,11 @@ async function inspectPackage(root: string, names: Set<string>): Promise<Project
     return {
       name: raw.name,
       version: raw.version,
-      manager: raw.packageManager?.split("@")[0] || detectPackageManager(names),
+      manager: await detectPackageManager(root, raw.packageManager),
       scripts: Object.keys(raw.scripts || {}).sort(),
     };
   } catch {
-    return { manager: detectPackageManager(names), scripts: [] };
+    return { manager: await detectPackageManager(root), scripts: [] };
   }
 }
 

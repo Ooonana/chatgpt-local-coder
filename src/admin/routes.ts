@@ -32,6 +32,8 @@ import {
   saveSubagentConfig,
 } from "../lib/subagent-manager.js";
 import { getRuntimeSnapshot } from "../lib/runtime-state.js";
+import { getRuntimeIdentity } from "../lib/runtime-identity.js";
+import { getProjectAffinity } from "../lib/project-affinity.js";
 import { getAgentTaskProgress, listAgentTasks } from "../lib/agent-task-store.js";
 import { listOperationHistory } from "../lib/operation-store.js";
 import { listEditTransactions } from "../lib/edit-transaction-store.js";
@@ -145,8 +147,11 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     const editTransactions = transactionsResult.status === "fulfilled" ? transactionsResult.value : [];
     const codingLoops = loopsResult.status === "fulfilled" ? loopsResult.value : [];
     const contextCapsules = capsulesResult.status === "fulfilled" ? capsulesResult.value : [];
+    const projectAffinity = await getProjectAffinity(getDefaultCwd()).catch(() => ({ active_root: null, active_alias: null, recents: [] }));
     res.json({
       ok: true,
+      identity: getRuntimeIdentity(),
+      project_affinity: projectAffinity,
       runtime: getRuntimeSnapshot(),
       processes,
       ptys: getPtySessionSnapshot(),

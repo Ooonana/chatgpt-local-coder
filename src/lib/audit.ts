@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { appendActivity } from "./activity-log.js";
 import { boundDiagnosticValue } from "./bounded-value.js";
+import { getRuntimeIdentity } from "./runtime-identity.js";
 
 export type AuditStatus = "ok" | "error" | "blocked" | "dry-run";
 
@@ -41,6 +42,7 @@ export async function audit(event: AuditEvent): Promise<void> {
   const record = boundDiagnosticValue({
     time: new Date().toISOString(),
     pid: process.pid,
+    run_id: getRuntimeIdentity().run_id,
     ...event,
   }, {
     maxStringChars: 4_000,

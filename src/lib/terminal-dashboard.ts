@@ -339,7 +339,10 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
 
   if (height >= 18) {
     lines.push(section("Usage", width, model.color));
-    const usage = model.runtime.usage.slice(0, 6).map((item) => `${item.tool} ${item.calls}`).join("  ·  ");
+    const usage = model.runtime.usage.slice(0, 6).map((item) => {
+      const repeated = item.repeated_calls ? ` r${item.repeated_calls}` : "";
+      return `${item.tool} ${item.calls} p95:${formatDuration(item.p95_duration_ms)} ${formatBytes(item.total_result_bytes)}${repeated}`;
+    }).join("  ·  ");
     lines.push(row(usage || ansi("2", "No tool usage yet", model.color), width, model.color));
   }
 

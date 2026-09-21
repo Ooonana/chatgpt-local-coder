@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
+import { spawnSync } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../dist/server-factory.js";
@@ -14,6 +15,7 @@ const tmp = path.join(root, ".tool-test-tmp", "agent-runtime");
 const fixture = path.join(tmp, "fixture");
 process.env.MCP_OPERATION_STATE_DIR = path.join(tmp, "operations");
 process.env.MCP_AGENT_TASK_STATE_DIR = path.join(tmp, "tasks");
+process.env.MCP_VERIFICATION_CACHE_STATE_DIR = path.join(tmp, "verification-cache");
 process.env.PERMISSIONS_CONFIG = path.join(tmp, "permissions.json");
 process.env.LOCAL_HOOKS_CONFIG = path.join(tmp, "hooks.json");
 process.env.SUBAGENT_CONFIG = path.join(tmp, "subagents.json");
@@ -37,6 +39,13 @@ await fs.writeFile(path.join(fixture, "package.json"), JSON.stringify({
   },
 }, null, 2));
 await fs.writeFile(path.join(fixture, "package-lock.json"), "{}\n");
+await fs.writeFile(path.join(fixture, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+await fs.mkdir(path.join(fixture, "node_modules"), { recursive: true });
+await fs.writeFile(path.join(fixture, "node_modules", ".package-lock.json"), "{}\n");
+const olderNpmLockTime = new Date(Date.now() - 24 * 60 * 60 * 1000);
+await fs.utimes(path.join(fixture, "package-lock.json"), olderNpmLockTime, olderNpmLockTime);
+const misleadingPnpmLockTime = new Date();
+await fs.utimes(path.join(fixture, "pnpm-lock.yaml"), misleadingPnpmLockTime, misleadingPnpmLockTime);
 await fs.writeFile(path.join(fixture, "src", "a.ts"), "export const a = 1;\n");
 await fs.writeFile(path.join(fixture, "src", "b.ts"), "export const b = 2;\n");
 
@@ -54,6 +63,12 @@ await run("verification recipe discovers standard package checks", async () => {
   const labels = full.commands.map((item) => item.label);
   for (const expected of ["build", "test", "test:integration"]) {
     if (!labels.includes(expected)) throw new Error(`missing ${expected}: ${JSON.stringify(labels)}`);
+  }
+  if (full.commands.some((item) => /^(pnpm|yarn|bun)\s+run\s/.test(item.command))) {
+    throw new Error(`secondary lockfile overrode the active npm installation: ${JSON.stringify(full.commands)}`);
+  }
+  if (!full.commands.some((item) => item.command === "npm run build")) {
+    throw new Error(`npm build command not selected: ${JSON.stringify(full.commands)}`);
   }
 });
 
@@ -162,6 +177,34 @@ await run("read_files batches independent reads", async () => {
   if (!rows[0].content.includes("a = 1") || !rows[1].content.includes("b = 2")) throw new Error(JSON.stringify(rows));
 });
 
+await run("conditional reads require the full mtime+ctime revision pair", async () => {
+  const file = path.join(fixture, "src", "a.ts");
+  const first = await call("read_text_file", { path: file });
+  const revision = first.structuredContent?.data;
+  if (!revision?.mtime_ms || !revision?.ctime_ms) throw new Error(`missing revision metadata: ${JSON.stringify(first)}`);
+
+  const unchanged = await call("read_text_file", {
+    path: file,
+    if_mtime_ms: revision.mtime_ms,
+    if_ctime_ms: revision.ctime_ms,
+  });
+  if (unchanged.structuredContent?.data?.unchanged !== true) throw new Error(`matching revision was not compacted: ${JSON.stringify(unchanged)}`);
+
+  const originalStat = await fs.stat(file);
+  await fs.writeFile(file, "export const a = 9;\n");
+  await fs.utimes(file, originalStat.atime, originalStat.mtime);
+  const changed = await call("read_text_file", {
+    path: file,
+    if_mtime_ms: revision.mtime_ms,
+    if_ctime_ms: revision.ctime_ms,
+  });
+  const changedData = changed.structuredContent?.data;
+  if (changedData?.unchanged === true || !changedData?.content?.includes("a = 9")) {
+    throw new Error(`stale conditional revision was accepted: ${JSON.stringify(changed)}`);
+  }
+  await fs.writeFile(file, "export const a = 1;\n");
+});
+
 await run("inspect_project MCP tool returns compact project state", async () => {
   const result = await call("inspect_project", { path: fixture, max_depth: 3 });
   const data = result.structuredContent?.data;
@@ -178,6 +221,50 @@ await run("verify_project supports discover and compact custom execution", async
   });
   const row = executed.structuredContent?.data?.results?.[0];
   if (!row || row.exit_code !== 0 || !row.excerpt.includes("VERIFY_OK")) throw new Error(JSON.stringify(executed));
+});
+
+await run("verify_project rejects affected_files outside the selected project", async () => {
+  const outside = path.join(tmp, "outside-affected.txt");
+  await fs.writeFile(outside, "outside\n");
+  const result = await call("verify_project", {
+    path: fixture,
+    preset: "custom",
+    commands: [{ label: "marker", command: "node -e \"process.exit(0)\"", timeout_seconds: 30 }],
+    affected_files: [outside],
+    use_cache: true,
+  });
+  if (!result.isError || !/affected_files path is outside the selected project/i.test(JSON.stringify(result))) {
+    throw new Error(`outside affected_files was not rejected: ${JSON.stringify(result)}`);
+  }
+});
+
+await run("verify_project does not persist cache entries when use_cache is false", async () => {
+  const cacheFixture = path.join(tmp, "cache-fixture");
+  await fs.mkdir(cacheFixture, { recursive: true });
+  await fs.writeFile(path.join(cacheFixture, "package.json"), JSON.stringify({ name: "cache-fixture" }, null, 2));
+  const source = path.join(cacheFixture, "source.js");
+  await fs.writeFile(source, "export const value = 1;\n");
+  const runGit = (...args) => {
+    const result = spawnSync("git", args, { cwd: cacheFixture, encoding: "utf8" });
+    if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`);
+  };
+  runGit("init", "-q");
+  runGit("config", "user.email", "agent-runtime@example.invalid");
+  runGit("config", "user.name", "Agent Runtime Test");
+  runGit("add", ".");
+  runGit("commit", "-qm", "init");
+  await fs.rm(process.env.MCP_VERIFICATION_CACHE_STATE_DIR, { recursive: true, force: true });
+  const result = await call("verify_project", {
+    path: cacheFixture,
+    preset: "custom",
+    commands: [{ label: "marker", command: "node -e \"process.exit(0)\"", timeout_seconds: 30 }],
+    affected_files: [source],
+    use_cache: false,
+  });
+  if (result.isError) throw new Error(JSON.stringify(result));
+  let cacheEntries = [];
+  try { cacheEntries = await fs.readdir(process.env.MCP_VERIFICATION_CACHE_STATE_DIR); } catch {}
+  if (cacheEntries.length) throw new Error(`cache was written with use_cache=false: ${cacheEntries.join(", ")}`);
 });
 
 await run("background process persists named operation history", async () => {

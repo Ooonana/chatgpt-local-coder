@@ -1,5 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { validatePath } from "../lib/path-security.js";
 import { audit } from "../lib/audit.js";
 import { requireCommandAllowed } from "../lib/permissions.js";
@@ -13,12 +15,37 @@ import {
 } from "../lib/verification.js";
 import { runOneShotCommand } from "./shell.js";
 import { updateAgentTask } from "../lib/agent-task-store.js";
+import { recordProjectAffinity, resolveProjectReference } from "../lib/project-affinity.js";
+import { getShellStatus } from "../lib/persistent-shell.js";
+import {
+  hasVerificationCache,
+  saveVerificationCache,
+  selectIncrementalVerification,
+  verificationFingerprint,
+} from "../lib/verification-cache.js";
 
 const commandSchema = z.object({
   label: z.string().min(1).max(120),
   command: z.string().min(1).max(100_000),
   timeout_seconds: z.number().int().min(5).max(3600).optional().default(180),
 });
+
+async function validateAffectedFiles(root: string, affectedFiles: string[] | undefined): Promise<string[]> {
+  if (!affectedFiles?.length) return [];
+  const canonicalRoot = await fs.realpath(root).catch(() => path.resolve(root));
+  const validated: string[] = [];
+  for (const item of affectedFiles) {
+    const candidate = path.isAbsolute(item) ? item : path.resolve(root, item);
+    const allowed = await validatePath(candidate);
+    const canonical = await fs.realpath(allowed).catch(() => path.resolve(allowed));
+    const relative = path.relative(canonicalRoot, canonical);
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error(`affected_files path is outside the selected project: ${item}`);
+    }
+    validated.push(allowed);
+  }
+  return [...new Set(validated)];
+}
 
 export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string): void {
   server.registerTool(
@@ -34,7 +61,9 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
       annotations: toolAnnotations("read"),
     },
     async ({ path: projectPath, max_depth }) => {
-      const root = projectPath ? await validatePath(projectPath) : defaultCwd;
+      const affinityRoot = await resolveProjectReference(projectPath, getShellStatus().cwd || defaultCwd);
+      const root = await validatePath(affinityRoot);
+      await recordProjectAffinity(root).catch(() => undefined);
       const inspection = await inspectProject(root, max_depth);
       await audit({
         tool: "inspect_project",
@@ -61,17 +90,25 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
         commands: z.array(commandSchema).min(1).max(12).optional(),
         stop_on_failure: z.boolean().optional().default(false),
         task_id: z.string().optional().describe("Optional persistent agent_task id to append a compact verification note"),
+        affected_files: z.array(z.string().max(2000)).max(256).optional(),
+        use_cache: z.boolean().optional().default(false).describe("Opt-in successful-check cache; keyed to the complete Git worktree state and short TTL"),
       },
       annotations: toolAnnotations("command"),
     },
-    async ({ path: projectPath, preset, commands, stop_on_failure, task_id }) => {
-      const root = projectPath ? await validatePath(projectPath) : defaultCwd;
+    async ({ path: projectPath, preset, commands, stop_on_failure, task_id, affected_files, use_cache }) => {
+      const affinityRoot = await resolveProjectReference(projectPath, getShellStatus().cwd || defaultCwd);
+      const root = await validatePath(affinityRoot);
+      await recordProjectAffinity(root).catch(() => undefined);
       if (preset === "custom" && !commands?.length) throw new Error("commands are required when preset=custom");
       if (preset !== "custom" && commands?.length) throw new Error("commands may only be supplied when preset=custom");
+      const safeAffectedFiles = await validateAffectedFiles(root, affected_files);
 
       const discovered = preset === "custom"
         ? { source: "custom" as const, commands: commands as VerificationCommand[] }
         : await discoverVerificationRecipe(root, preset === "discover" ? "full" : preset);
+      const selected = preset === "discover"
+        ? { commands: discovered.commands, incremental: false, reason: null }
+        : selectIncrementalVerification(discovered.commands, safeAffectedFiles, preset);
 
       if (preset === "discover") {
         return toolResult("verify_project", {
@@ -82,10 +119,10 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
         }, { summary: `${discovered.commands.length} verification check(s) discovered` });
       }
 
-      if (!discovered.commands.length) {
+      if (!selected.commands.length) {
         return toolResult(
           "verify_project",
-          { path: root, preset, source: discovered.source, commands: [], results: [] },
+          { path: root, preset, source: discovered.source, commands: [], results: [], incremental: selected.incremental, incremental_reason: selected.reason },
           { ok: false, summary: "no verification checks discovered" }
         );
       }
@@ -99,10 +136,28 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
         excerpt: string;
         output_chars: number;
         truncated: boolean;
+        cached: boolean;
       }> = [];
 
-      for (const check of discovered.commands) {
+      for (const check of selected.commands) {
         requireCommandAllowed(check.command, root);
+        const fingerprint = use_cache && safeAffectedFiles.length
+          ? await verificationFingerprint(root, check.command, safeAffectedFiles)
+          : null;
+        if (use_cache && fingerprint && await hasVerificationCache(root, check.command, fingerprint)) {
+          results.push({
+            label: check.label,
+            command: check.command,
+            exit_code: 0,
+            duration_ms: 0,
+            timed_out: false,
+            excerpt: "cached successful verification for unchanged affected-file fingerprint",
+            output_chars: 0,
+            truncated: false,
+            cached: true,
+          });
+          continue;
+        }
         const result = await runOneShotCommand(check.command, root, check.timeout_seconds * 1000);
         const compact = compactVerificationOutput(result.stdout, result.stderr);
         results.push({
@@ -112,7 +167,9 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
           duration_ms: result.duration_ms,
           timed_out: result.timed_out,
           ...compact,
+          cached: false,
         });
+        if (use_cache && result.exit_code === 0 && fingerprint) await saveVerificationCache(root, check.command, fingerprint).catch(() => undefined);
         if (stop_on_failure && result.exit_code !== 0) break;
       }
 
@@ -131,7 +188,7 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
         action: "verify",
         target: root,
         status: failed ? "error" : "ok",
-        details: { preset, source: discovered.source, checks: results.length, failed, duration_ms: totalMs, task_id },
+        details: { preset, source: discovered.source, checks: results.length, failed, duration_ms: totalMs, task_id, incremental: selected.incremental, affected_files: safeAffectedFiles.length, use_cache },
       });
       return toolResult(
         "verify_project",
@@ -143,7 +200,11 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
           passed,
           failed,
           duration_ms: totalMs,
-          stopped_early: stop_on_failure && results.length < discovered.commands.length,
+          stopped_early: stop_on_failure && results.length < selected.commands.length,
+          incremental: selected.incremental,
+          incremental_reason: selected.reason,
+          affected_files: safeAffectedFiles,
+          cached_checks: results.filter((item) => item.cached).length,
         },
         { ok: failed === 0, summary }
       );

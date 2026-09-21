@@ -21,6 +21,8 @@ export interface CompletedToolCall {
   duration_ms: number;
   status: "ok" | "error";
   error?: string;
+  result_bytes: number;
+  repeated: boolean;
 }
 
 export interface ToolUsageStat {
@@ -30,6 +32,11 @@ export interface ToolUsageStat {
   errors: number;
   total_duration_ms: number;
   average_duration_ms: number;
+  p50_duration_ms: number;
+  p95_duration_ms: number;
+  total_result_bytes: number;
+  average_result_bytes: number;
+  repeated_calls: number;
 }
 
 export interface RuntimeSnapshot {
@@ -46,11 +53,29 @@ const STARTED_AT = new Date().toISOString();
 const MAX_RECENT = 100;
 const active = new Map<string, ActiveToolCall>();
 const recent: CompletedToolCall[] = [];
-const usage = new Map<string, Omit<ToolUsageStat, "tool" | "average_duration_ms">>();
+interface InternalToolUsage {
+  calls: number;
+  ok: number;
+  errors: number;
+  total_duration_ms: number;
+  total_result_bytes: number;
+  repeated_calls: number;
+  durations_ms: number[];
+}
+
+const usage = new Map<string, InternalToolUsage>();
 const listeners = new Set<() => void>();
 let totalCalls = 0;
 let totalOk = 0;
 let totalErrors = 0;
+let lastCompletedSignature = "";
+
+function percentile(values: number[], ratio: number): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * ratio) - 1));
+  return sorted[index];
+}
 
 function notify(): void {
   for (const listener of listeners) {
@@ -87,7 +112,8 @@ export function beginToolCall(input: {
 export function finishToolCall(
   id: string,
   status: "ok" | "error",
-  error?: string
+  error?: string,
+  resultBytes = 0
 ): CompletedToolCall | undefined {
   const item = active.get(id);
   if (!item) return undefined;
@@ -95,6 +121,9 @@ export function finishToolCall(
 
   const finishedMs = Date.now();
   const durationMs = Math.max(0, finishedMs - item.started_ms);
+  const signature = `${item.tool}\0${item.summary}`;
+  const repeated = signature === lastCompletedSignature;
+  lastCompletedSignature = signature;
   const completed: CompletedToolCall = {
     id: item.id,
     tool: item.tool,
@@ -105,6 +134,8 @@ export function finishToolCall(
     duration_ms: durationMs,
     status,
     error: error ? trimOneLine(error, 220) : undefined,
+    result_bytes: Math.max(0, Math.trunc(resultBytes)),
+    repeated,
   };
   recent.unshift(completed);
   if (recent.length > MAX_RECENT) recent.length = MAX_RECENT;
@@ -118,11 +149,18 @@ export function finishToolCall(
     ok: 0,
     errors: 0,
     total_duration_ms: 0,
+    total_result_bytes: 0,
+    repeated_calls: 0,
+    durations_ms: [],
   };
   stat.calls++;
   if (status === "ok") stat.ok++;
   else stat.errors++;
   stat.total_duration_ms += durationMs;
+  stat.total_result_bytes += completed.result_bytes;
+  if (repeated) stat.repeated_calls++;
+  stat.durations_ms.push(durationMs);
+  if (stat.durations_ms.length > 500) stat.durations_ms.splice(0, stat.durations_ms.length - 500);
   usage.set(item.tool, stat);
 
   notify();
@@ -140,8 +178,16 @@ export function getRuntimeSnapshot(): RuntimeSnapshot {
     usage: [...usage.entries()]
       .map(([tool, stat]) => ({
         tool,
-        ...stat,
+        calls: stat.calls,
+        ok: stat.ok,
+        errors: stat.errors,
+        total_duration_ms: stat.total_duration_ms,
         average_duration_ms: stat.calls ? Math.round(stat.total_duration_ms / stat.calls) : 0,
+        p50_duration_ms: percentile(stat.durations_ms, 0.5),
+        p95_duration_ms: percentile(stat.durations_ms, 0.95),
+        total_result_bytes: stat.total_result_bytes,
+        average_result_bytes: stat.calls ? Math.round(stat.total_result_bytes / stat.calls) : 0,
+        repeated_calls: stat.repeated_calls,
       }))
       .sort((a, b) => b.calls - a.calls || a.tool.localeCompare(b.tool)),
   };
@@ -160,5 +206,6 @@ export function resetRuntimeStateForTests(): void {
   totalCalls = 0;
   totalOk = 0;
   totalErrors = 0;
+  lastCompletedSignature = "";
   notify();
 }

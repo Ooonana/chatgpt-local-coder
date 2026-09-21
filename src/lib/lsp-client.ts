@@ -83,6 +83,8 @@ const LANGUAGE_ID_BY_EXTENSION: Record<string, string> = {
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const sessions = new Map<string, LspClient>();
+const sessionLastUsed = new Map<string, number>();
+const MAX_LSP_SESSIONS = 12;
 const MAX_LSP_DOCUMENT_BYTES = 8 * 1024 * 1024;
 const MAX_LSP_MESSAGE_BYTES = 16 * 1024 * 1024;
 
@@ -479,9 +481,21 @@ export async function getLspClient(
   const key = `${selected.id}\0${workspace}\0${selected.command}`;
   let client = sessions.get(key);
   if (!client) {
+    if (sessions.size >= MAX_LSP_SESSIONS) {
+      const oldest = [...sessions.keys()]
+        .filter((candidate) => candidate !== key)
+        .sort((a, b) => (sessionLastUsed.get(a) || 0) - (sessionLastUsed.get(b) || 0))[0];
+      if (oldest) {
+        const evicted = sessions.get(oldest);
+        sessions.delete(oldest);
+        sessionLastUsed.delete(oldest);
+        await evicted?.shutdown().catch(() => undefined);
+      }
+    }
     client = new LspClient(selected.id, selected.command, selected.args, workspace);
     sessions.set(key, client);
   }
+  sessionLastUsed.set(key, Date.now());
   await client.start();
   return client;
 }
@@ -496,6 +510,7 @@ export async function shutdownLspSessions(server?: LspServerId): Promise<number>
     if (server && client.serverId !== server) continue;
     await client.shutdown();
     sessions.delete(key);
+    sessionLastUsed.delete(key);
     stopped++;
   }
   return stopped;

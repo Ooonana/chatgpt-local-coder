@@ -43,7 +43,7 @@ The complete native catalog is maintained in `src/lib/tool-profile.ts` and is ch
 
 The Admin UI can force-enable a native tool outside `slim` or disable any native tool through `profiles/tool-overrides.json`. Unknown/stale override names are filtered automatically.
 
-The default `slim` profile includes common file/directory helpers, regex editing, Git inspection/branch/stash helpers, parallel commands, LSP, local image viewing, and PTY sessions. Higher-risk or redundant helpers such as recursive directory deletion, Git reset/push/pull/checkout, raw binary writes, and the low-level `mcp_tools` / `mcp_call` bridge remain opt-in/full-profile tools.
+The default `slim` profile includes the high-value read/edit/search tools, bounded and parallel shell execution, background-process lifecycle tools, PTY/LSP/image inspection, core Git status/diff/worktree/stage/commit/restore, project/task/transaction/coding-loop/context-capsule tools, rewind, skills/rules, subagent/delegate status, and `mcp_servers`. Convenience/destructive/remote helpers such as recursive directory deletion, Git reset/push/pull/checkout/branch/stash/log, raw binary writes, shell reset/clear-process helpers, `node_repl`, `ponytail_turn`, and low-level `mcp_tools` / `mcp_call` remain opt-in/full-profile unless explicitly overridden. Treat `src/lib/tool-profile.ts` as authoritative.
 
 ## Claude Code ↔ Local Coder mapping
 
@@ -57,8 +57,8 @@ The default `slim` profile includes common file/directory helpers, regex editing
 | `Grep` | `grep` | `content`, `files_with_matches`, and `count` modes. |
 | `LS` | `list_directory` | Optional ignore globs. |
 | `Bash` | `run_command` | Short/finite commands; cwd persists. |
-| Parallel shell | `run_commands_parallel` | Independent commands run concurrently in isolated processes. |
-| Background shell | `start_process` + process tools | Use `process_status`, `process_output`, `process_input`, and `stop_process`. `process_input` is piped stdin, not a full PTY. |
+| Parallel shell | `run_commands_parallel` | Independent commands run concurrently in isolated processes. Batch state is durable so retry/recovery should rerun only failed or incomplete members. |
+| Background shell | `start_process` + process tools | Use `process_status`, `process_output`, `process_input`, and `stop_process`. Prefer event/wait conditions for exit/text instead of repeated `Start-Sleep` polling. `process_input` is piped stdin, not a full PTY. |
 | Interactive terminal | `pty` | Real PTY/ConPTY for TUIs, debuggers, installers, and terminal-native CLIs. |
 | LSP | `lsp` | Hover, definitions, references, symbols, and diagnostics. TypeScript/JS and Python are bundled. |
 | Local image inspection | `view_image` | Returns a local image path as MCP image content so the host can inspect it visually. |
@@ -87,8 +87,8 @@ Real delegated subagents are available through the external-runner `subagent` to
 | Apply several exact edits | `multi_edit` |
 | Create a text file | `write_file` |
 | Short command/build/test | `run_command` |
-| Independent commands in parallel | `run_commands_parallel` |
-| Long-running build/server | `start_process` → `process_status` / `process_output` → optional `process_input` → `stop_process` |
+| Independent commands in parallel | `run_commands_parallel`; recover/retry only failed or incomplete members when a batch id is returned |
+| Long-running build/server | `start_process` → `process_status` / `process_output` with wait condition → optional `process_input` → `stop_process` |
 | Interactive terminal/TUI/debugger | `pty` |
 | Definition/reference/diagnostics | `lsp` |
 | Inspect a local screenshot/image | `view_image` |
@@ -103,6 +103,10 @@ Real delegated subagents are available through the external-runner `subagent` to
 | Undo Local Coder file edits | `rewind` |
 
 For non-trivial changes: explore first, read every file you will edit, apply the smallest practical patch, then run relevant build/tests. Preserve unrelated user changes in a dirty working tree.
+
+When a shell command may edit files, prefer its mutation/idempotency/transaction options instead of wrapping the mutation in an opaque command and assuming `rewind` saw it. Shell mutation evidence fingerprints dirty/untracked contents so an already-dirty file changing again is still detected. Do not reuse a successful verification result across a changed worktree; `verify_project` caching is opt-in and intentionally conservative.
+
+For runtime/schema problems, use `agent_status(mode="doctor")`. Runtime identity is written only by a real server bootstrap; tests/imports must not overwrite it. Doctor can flag stale durable tasks/loops/transactions, schema-refresh recommendations, state read failures, and heap/cache pressure, but it must not silently delete resumable state. Keep long-run memory bounded: text caching is byte-budgeted, old MCP sessions are capped/evicted while stale IDs remain recoverable, and completed process/PTY/subagent plus LSP registries have finite retention.
 
 Do not assume the ChatGPT host will auto-compact a long coding conversation. After important decisions or a returned `context_checkpoint_hint`, checkpoint a compact semantic summary/decisions/findings/blockers/next steps with `context_capsule`. If the hint sets `rollover_recommended=true`, finish the current safe boundary and continue in a fresh chat, then resume the capsule there. On a new/corrupted chat or when the user says continue and prior reasoning is missing, resume the capsule before rediscovering the repository. Local Coder can automatically snapshot machine state, but it cannot read hidden ChatGPT history, erase old host messages, or reconstruct unrecorded reasoning.
 

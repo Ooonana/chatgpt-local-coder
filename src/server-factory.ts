@@ -31,6 +31,7 @@ import {
   autoCheckpointContextCapsule,
   getContextCapsuleHeuristicConfig,
 } from "./lib/context-capsule-store.js";
+import { invalidateTextReadCache } from "./lib/text-read-cache.js";
 
 // OpenAI Secure MCP Tunnel rejects request/response bodies above 10 MiB.
 // Keep a healthy margin for the JSON-RPC/SSE envelope so an oversized tool
@@ -335,7 +336,7 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string): vo
             ...common,
             result: boundedHookValue(result, 50_000),
           }).catch(() => undefined);
-          finishToolCall(runtimeCallId, "ok");
+          finishToolCall(runtimeCallId, "ok", undefined, serializedBytes(result));
           return result;
         } catch (error) {
           await runLocalHooks("post_tool_use", {
@@ -347,6 +348,8 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string): vo
       } catch (error) {
         finishToolCall(runtimeCallId, "error", error instanceof Error ? error.message : String(error));
         throw error;
+      } finally {
+        if (!readOnly) invalidateTextReadCache();
       }
     };
 

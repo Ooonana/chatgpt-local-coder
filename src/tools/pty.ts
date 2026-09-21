@@ -26,7 +26,18 @@ interface ManagedPty {
 
 const terminals = new Map<string, ManagedPty>();
 const MAX_OUTPUT_CHARS = 500_000;
+const MAX_RETAINED_PTYS = 48;
 const MAX_INPUT_CHARS = 100_000;
+
+function pruneFinishedPtys(): void {
+  if (terminals.size <= MAX_RETAINED_PTYS) return;
+  const finished = [...terminals.values()]
+    .filter((item) => item.exitCode !== null)
+    .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+  while (terminals.size > MAX_RETAINED_PTYS && finished.length) {
+    terminals.delete(finished.shift()!.id);
+  }
+}
 
 export function getPtySessionSnapshot() {
   return [...terminals.values()].map(statusOf);
@@ -239,6 +250,7 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
         terminal.onExit(({ exitCode, signal }) => {
           item.exitCode = exitCode;
           item.signal = signal ?? null;
+          pruneFinishedPtys();
         });
         await audit({
           tool: "pty",

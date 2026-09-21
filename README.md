@@ -207,7 +207,7 @@ Free sessions expire after **60 minutes** and the URL changes each time, so you 
 
 Native tools use structured JSON responses `{ ok, tool, summary, data }`. The source-of-truth catalog is `src/lib/tool-profile.ts`; `scripts/test-tool-profile.mjs` verifies it matches the native `server.registerTool()` declarations.
 
-The default `slim` profile is intentionally optimized for regular ChatGPT: it currently exposes **48 high-value tools** while the `full` profile keeps all **69 native tools**. Redundant convenience tools hidden from `slim` remain available through `CHATGPT_TOOL_PROFILE=full`, Admin → **MCP Servers → Local tools**, or a `run_command` fallback. This keeps the default MCP discovery payload below the Phase 4 budget without removing local capability.
+The default `slim` profile is intentionally optimized for regular ChatGPT: it currently exposes **46 high-value tools** while the `full` profile keeps all **69 native tools**. Redundant convenience tools hidden from `slim` remain available through `CHATGPT_TOOL_PROFILE=full`, Admin → **MCP Servers → Local tools**, or a `run_command` fallback. This keeps the default MCP discovery payload below the Phase 4 budget without removing local capability. The source-of-truth counts are enforced by `scripts/test-tool-profile.mjs`; update documentation when that test reports a deliberate profile change.
 
 ### Agent production benchmark
 
@@ -219,11 +219,19 @@ npm run benchmark:agent
 
 It starts isolated real MCP servers and checks the intended Codex-like workflow rather than only unit-level functions: compound repo inspection/read round trips, repository intelligence, verification-output compaction, durable `coding_loop` restart/resume, `context_capsule` recovery after a simulated lost ChatGPT/MCP session, fail → diagnose → repair → pass behavior, and malformed persistent-state resilience. Phase 4 guards the default profile at **≤50 slim tools**, **≤64 KiB `tools/list`**, **≤12,000 instruction characters**, and bounded high-level tool responses so future features cannot silently inflate ChatGPT context/transport cost.
 
+Phase 5 adds a fault-focused efficiency suite:
+
+```bash
+npm run test:phase5
+```
+
+It covers concurrent idempotency, crash-resumable parallel batches, dirty-worktree mutation detection, ambiguous project aliases, verification-cache invalidation, cache coherency, runtime-identity side effects, ephemeral-state pruning, large-result handles, structured no-match errors, and runtime telemetry. These tests exist specifically to catch orchestration failures that can pass ordinary compile/unit checks.
+
 ### Onboarding *(call these first)*
 
 | Tool | Description |
 |------|-------------|
-| `agent_status` | Permissions, workspace roots, audit log |
+| `agent_status` | Permissions, workspace roots, runtime/schema identity, and `mode=doctor` memory/cache/recovery diagnostics |
 | `project_context` | Reads AGENTS.md, README, CLAUDE.md, configs |
 
 ### Filesystem
@@ -250,11 +258,11 @@ It starts isolated real MCP servers and checks the intended Codex-like workflow 
 
 | Tool | Description |
 |------|-------------|
-| `run_command` | Run shell commands (`npm test`, builds, …) |
-| `run_commands_parallel` | Run independent commands concurrently in isolated shell processes |
+| `run_command` | Run bounded shell commands (`npm test`, builds, …). Supports optional idempotency/mutation tracking and transaction-aware shell edits |
+| `run_commands_parallel` | Run independent commands concurrently in isolated shell processes; batches persist per-member completion so failed/incomplete members can be retried without rerunning successful siblings |
 | `shell_status` / `shell_reset` | Persistent shell session |
 | `start_process` | Long-running / background commands |
-| `process_status` / `process_output` | Inspect live background jobs and logs |
+| `process_status` / `process_output` | Inspect live background jobs and logs; use their wait conditions instead of sleep/poll loops when waiting for exit or expected output |
 | `process_history` | Persistent named operation history across MCP/server restarts; stale running jobs are reported as interrupted |
 | `process_input` | Send piped stdin to prompts/REPLs (`append_newline`, optional EOF); not a full PTY |
 | `stop_process` | Stop the background process tree (important for dev servers on Windows) |
@@ -292,13 +300,15 @@ The default slim profile intentionally exposes high-value local development help
 |------|-------------|
 | `agent_task` | Persist/resume a multi-step coding objective with structured `pending` / `in_progress` / `completed` / `blocked` / `skipped` plan steps |
 | `inspect_project` | One-call repository reconnaissance: manifests, scripts, package manager, Git state, top-level layout, and language/file distribution |
-| `verify_project` | Discover or run a deterministic bounded verification recipe and return compact pass/fail evidence |
+| `verify_project` | Discover or run a deterministic bounded verification recipe and return compact pass/fail evidence. Successful-result caching is opt-in and keyed to Git/worktree state with a short TTL |
 | `edit_transaction` | Begin a durable touched-file transaction, preview its aggregate diff, run verification, then accept or conflict-safe rollback |
 | `coding_loop` | Durable Codex-like implementation loop: begin/resume/refresh/verify/finish/rollback/cleanup with bounded repair attempts and optional Git-worktree isolation |
 | `coding_loop_status` | Read recent or specific persistent coding-loop state without requesting a mutating tool |
 | `context_capsule` | Save/resume a bounded semantic working summary plus current task/loop/transaction/Git/activity state across chat loss or reconnects |
 
 The agent loop is deliberately split between **regular ChatGPT** and Local Coder: ChatGPT performs reasoning and decides the next action; Local Coder persists the objective/plan/progress, local operations, verification evidence, files, shell, Git, code intelligence, and a compact resumable working-context capsule. `agent_task` therefore adds durable coding-agent structure without starting another model or hidden subagent.
+
+Large textual command/search results can be compacted into a durable result handle instead of being pushed through the MCP response in full. The returned handle can be read in bounded ranges, keeping ChatGPT context and tunnel payloads predictable. Mutating shell commands can also attach worktree-change evidence so transaction/recovery state reflects edits performed through PowerShell, Python, build scripts, or other command-line tools rather than only Local Coder's direct file-edit tools.
 
 ### ChatGPT context compaction / loss
 
@@ -387,6 +397,9 @@ OPENAI_TUNNEL_API_KEY=
 | `CHATGPT_AUTO_APPROVE` | `true` | Tool annotations to reduce ChatGPT popups |
 | `LOCAL_CODER_TUI` | `auto` | `auto` uses the clean dashboard only in an interactive TTY; `off` keeps scrolling logs; `on` requests TUI when stdout is a TTY |
 | `MCP_SESSION_RECOVERY` | `true` | Auto-recover stale sessions after restart |
+| `MCP_SESSION_TTL_MS` | `7200000` | Idle live-session retention (2 hours by default). Expired session IDs can still be recovered on demand instead of being retained all day |
+| `MCP_CLOSED_SESSION_TTL_MS` | `900000` | Closed-transport retention (15 minutes by default) before cleanup |
+| `MCP_SESSION_MAX_RETAINED` | `32` | Hard cap on retained MCP session/server objects. Old closed/idle sessions are evicted first; stale IDs can still auto-recover on demand |
 | `MCP_JSON_RESPONSE` | `false` | Keep `false` for SSE tool responses with heartbeat frames. Set `true` only as a compatibility fallback for clients that require one JSON response at the end |
 | `MCP_SSE_KEEPALIVE_MS` | `10000` | SSE heartbeat interval for long MCP calls. The server clamps this to 1–60 seconds |
 | `SHELL_TIMEOUT` | `300` | Default timeout for synchronous `run_command` / `run_commands_parallel` calls, clamped to 5–3600 seconds. Both support per-call overrides; prefer `start_process` for very long or continuous jobs |
@@ -402,6 +415,18 @@ OPENAI_TUNNEL_API_KEY=
 | `MCP_CONTEXT_CAPSULE_RESULT_BYTES` | `65536` | Accumulated tool-result byte budget between automatic machine-state snapshots; clamped to 8 KiB–1 MiB |
 | `MCP_CONTEXT_CAPSULE_ROLLOVER_CYCLES` | `3` | Consecutive context-budget cycles before Local Coder recommends a safe fresh-chat rollover; clamped to 2–20 |
 | `MCP_CODING_LOOP_WORKTREE_ROOT` | OS temp directory | Optional root for `coding_loop isolation=worktree`; restricted profiles should choose a path inside an allowed root |
+| `MCP_RESULT_STATE_DIR` | `.mcp-state/results` | Durable bounded storage for oversized textual tool output referenced by result handles |
+| `MCP_PARALLEL_BATCH_STATE_DIR` | `.mcp-state/parallel-batches` | Crash-resumable per-member state for parallel command batches |
+| `MCP_IDEMPOTENCY_STATE_DIR` | `.mcp-state/idempotency` | Persistence for idempotency keys used to avoid duplicate side effects on retried shell work |
+| `MCP_PROJECT_REGISTRY_PATH` | `.mcp-state/projects.json` | Recent/active project registry used for project affinity and aliases; ambiguous aliases fail instead of guessing |
+| `MCP_VERIFICATION_CACHE_STATE_DIR` | `.mcp-state/verification-cache` | Optional successful-verification cache storage |
+| `MCP_VERIFICATION_CACHE_TTL_SECONDS` | `300` | Maximum age of a cached verification success; cache keys include Git HEAD and the dirty/untracked worktree state |
+| `MCP_TEXT_CACHE_MAX_BYTES` | `33554432` | Total estimated heap budget for cached text-file contents (32 MiB); least-recently-used entries are evicted under pressure |
+| `MCP_TEXT_CACHE_MAX_ENTRY_BYTES` | `2097152` | Maximum estimated heap retained by one cached text file (2 MiB); larger files are readable but are not retained |
+| `MCP_TEXT_CACHE_MAX_ENTRIES` | `128` | Secondary entry-count ceiling for the in-memory text cache |
+| `MCP_RUNTIME_IDENTITY_PATH` | workspace-scoped `.mcp-state/runtime-identities/<hash>.json` | Optional explicit override for the real server-run identity/schema record used to detect connector schema drift |
+| `MCP_EPHEMERAL_STATE_RETENTION_DAYS` | `30` | Startup retention window for result/batch/idempotency/verification-cache records |
+| `MCP_STALE_STATE_HOURS` | `24` | Age threshold used by `agent_status(mode="doctor")` when reporting stale resumable tasks/loops/transactions; Doctor never deletes them automatically |
 | `PERMISSIONS_CONFIG` | `profiles/permissions.json` | Optional permission-profile file (`open`, `workspace`, `read_only`, or `custom`). Missing file defaults to `open` |
 
 > Variables already set in your shell **win over `.env`** (`dotenv` does not override). If a change to `.env` seems ignored, check `env | grep WORKSPACE_PATH` first.
@@ -424,7 +449,7 @@ The exact URL is printed in the startup banner. Stopping the server stops the ad
 
 | Tab | What it does |
 |-----|--------------|
-| **Overview** | Live ChatGPT tool calls plus persistent agent plan/progress, coding loops, context capsules, background operation history, edit transactions, PID/sessions/workers, and upstream health |
+| **Overview** | Live ChatGPT tool calls plus persistent agent plan/progress, coding loops, context capsules, background operation history, edit transactions, runtime/schema identity, active project affinity, per-tool p50/p95/result-volume/repeat telemetry, PID/sessions/workers, and upstream health |
 | **MCP Servers** | Enable/disable upstream MCP servers, test connections, inspect their tools |
 | **Import** | Pull existing MCP config from Cursor / Claude Code / OpenCode |
 | **Activity** | Live tool-call log from ChatGPT (SSE stream) |
@@ -504,6 +529,7 @@ The default `open` permission profile grants **full local access** through Local
 | **Tool blocked by OpenAI safety** | Not a server bug. Retry with `run_command` (response may include `run_command_fallback`). Affects `git_push`, `git_checkout`, `delete_directory` occasionally. |
 | **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |
 | **Long tool-heavy turn looks frozen / tunnel log shows HTTP 413** | A tool result exceeded the secure tunnel body limit. Latest Local Coder rejects oversized results before transport; use `read_text_file` offset/limit, smaller base64 chunks, or a shallower tree/search. |
+| **`JavaScript heap out of memory` after many hours/tool calls** | Run `agent_status(mode="doctor")` and inspect heap/cache pressure. Phase 5 bounds text/context caches and retained MCP/process/PTY/subagent/LSP state; on older builds restart after saving durable state, update, then re-test the long-run workload. |
 | **Tunnel URL keeps changing** | Switch to OpenAI Secure Tunnel (`openai-tunnel.ps1`). |
 | **Connector stuck "loading" forever when you click Create** | Make sure you are on the latest build (`npm run build`) — older builds deadlocked on the SSE stream and never answered `tools/list`. Also confirm the URL includes `/mcp/<MCP_TOKEN>`. |
 | **404 on the connector URL** | You omitted the token. Use `https://<tunnel>/mcp/<MCP_TOKEN>`, not `/mcp`. |

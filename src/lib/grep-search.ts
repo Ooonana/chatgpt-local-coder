@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { readTextCached } from "./text-read-cache.js";
 
 export type GrepOutputMode = "content" | "files_with_matches" | "count";
 
@@ -92,7 +93,7 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
           skippedLargeFiles++;
           continue;
         }
-        text = await fs.readFile(fullPath, "utf-8");
+        text = (await readTextCached(fullPath)).text;
       } catch {
         continue;
       }

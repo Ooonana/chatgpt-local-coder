@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
+import path from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
@@ -21,6 +22,20 @@ import {
   recordOperationStart,
 } from "../lib/operation-store.js";
 import { getAgentTask } from "../lib/agent-task-store.js";
+import { classifyToolFailure } from "../lib/error-model.js";
+import { compactOrStoreText, readTextResult } from "../lib/result-store.js";
+import {
+  loadParallelBatch,
+  newParallelBatchId,
+  saveParallelBatch,
+  type ParallelBatchRecord,
+  type ParallelCommandResult,
+  type ParallelCommandSpec,
+} from "../lib/parallel-batch-store.js";
+import { recordProjectAffinity } from "../lib/project-affinity.js";
+import { captureWorkingTree, commandMayMutate, compareWorkingTrees } from "../lib/shell-mutation.js";
+import { loadIdempotent, requestFingerprint, saveIdempotent, withIdempotencyKeyLock } from "../lib/idempotency-store.js";
+import { captureTransactionPaths, getEditTransaction, recordTransactionEdit, withEditTransactionLock } from "../lib/edit-transaction-store.js";
 
 interface ManagedProcess {
   id: string;
@@ -54,8 +69,20 @@ interface OneShotCommandResult {
 
 const processes = new Map<string, ManagedProcess>();
 const MAX_LOG_CHARS = 400_000;
+const MAX_RETAINED_PROCESSES = 64;
 const MAX_PROCESS_INPUT_CHARS = 100_000;
 const MAX_COMMAND_CHARS = 500_000;
+
+function pruneFinishedProcesses(): void {
+  if (processes.size <= MAX_RETAINED_PROCESSES) return;
+  const finished = [...processes.values()]
+    .filter((item) => item.exitCode !== null || item.signal !== null)
+    .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+  while (processes.size > MAX_RETAINED_PROCESSES && finished.length) {
+    const item = finished.shift()!;
+    processes.delete(item.id);
+  }
+}
 
 export function getManagedProcessSnapshot() {
   return [...processes.values()].map((item) => ({
@@ -186,6 +213,64 @@ export async function runOneShotCommand(
   });
 }
 
+function processRunning(item: ManagedProcess): boolean {
+  return item.exitCode === null && item.signal === null && !item.spawnError;
+}
+
+async function waitForProcessCondition(
+  item: ManagedProcess,
+  options: { waitFor: "exit" | "text"; waitText?: string; timeoutMs: number }
+): Promise<{ condition_met: boolean; timed_out: boolean; waited_ms: number }> {
+  const started = Date.now();
+  const matches = () => {
+    if (options.waitFor === "exit") return !processRunning(item);
+    const needle = options.waitText || "";
+    return Boolean(needle) && `${item.stdout.join("")}\n${item.stderr.join("")}`.includes(needle);
+  };
+  if (matches()) return { condition_met: true, timed_out: false, waited_ms: 0 };
+  if (!processRunning(item)) return { condition_met: false, timed_out: false, waited_ms: 0 };
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = (conditionMet: boolean, timedOut: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      item.child.off("close", onChange);
+      item.child.stdout.off("data", onChange);
+      item.child.stderr.off("data", onChange);
+      resolve({ condition_met: conditionMet, timed_out: timedOut, waited_ms: Date.now() - started });
+    };
+    const onChange = () => {
+      if (matches()) finish(true, false);
+      else if (!processRunning(item)) finish(false, false);
+    };
+    const timer = setTimeout(() => finish(matches(), true), Math.max(0, options.timeoutMs));
+    timer.unref?.();
+    item.child.once("close", onChange);
+    item.child.stdout.on("data", onChange);
+    item.child.stderr.on("data", onChange);
+  });
+}
+
+async function compactCommandResult<T extends { stdout: string; stderr: string }>(result: T, prefix: string): Promise<T & {
+  output_handle?: string | null;
+  output_chars?: number;
+  truncated?: boolean;
+}> {
+  const combined = `STDOUT\n${result.stdout}\n\nSTDERR\n${result.stderr}`;
+  const compact = await compactOrStoreText(combined, { inline_chars: 32_000, prefix });
+  if (!compact.truncated) return { ...result, output_handle: null, output_chars: combined.length, truncated: false };
+  return {
+    ...result,
+    stdout: result.stdout.slice(-16_000),
+    stderr: result.stderr.slice(-16_000),
+    output_handle: compact.output_handle,
+    output_chars: compact.output_chars,
+    truncated: true,
+  };
+}
+
 function appendLog(lines: string[], data: Buffer): void {
   lines.push(data.toString());
   let total = lines.reduce((sum, item) => sum + item.length, 0);
@@ -234,26 +319,83 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         working_directory: z.string().optional().describe("One-off override; does not reset persistent cwd unless you use shell_reset"),
         timeout_seconds: z.number().int().positive().max(3600).optional()
           .describe("Per-call timeout in seconds. Defaults to SHELL_TIMEOUT (300s by default). Use start_process for continuous jobs."),
+        idempotency_key: z.string().min(1).max(200).optional(),
+        track_changes: z.boolean().optional().default(true),
+        transaction_id: z.string().optional(),
+        mutation_paths: z.array(z.string().min(1).max(4000)).max(128).optional(),
       },
 
       annotations: toolAnnotations("command"),
     },
-    async ({ command, working_directory, timeout_seconds }) => {
+    async ({ command, working_directory, timeout_seconds, idempotency_key, track_changes, transaction_id, mutation_paths }) => {
       const cwdOverride = working_directory ? await validatePath(working_directory) : undefined;
       const policyCwd = cwdOverride ?? getShellStatus().cwd ?? defaultCwd;
       requireCommandAllowed(command, policyCwd);
-      const result = await execInShellSession(command, defaultCwd, (timeout_seconds ?? timeoutSec) * 1000, cwdOverride);
-      await audit({
-        tool: "run_command",
-        action: "command",
-        target: result.cwd,
-        status: result.exit_code === 0 ? "ok" : "error",
-        details: { command, exit_code: result.exit_code },
-      });
-      return toolResult("run_command", result, {
-        ok: result.exit_code === 0,
-        summary: `exit ${result.exit_code} in ${result.cwd}`,
-      });
+      await recordProjectAffinity(policyCwd).catch(() => undefined);
+      const fingerprint = idempotency_key ? requestFingerprint({ command, cwd: policyCwd, timeout_seconds, transaction_id, mutation_paths }) : undefined;
+      const txPaths = mutation_paths?.length
+        ? await Promise.all(mutation_paths.map((item) => validatePath(path.isAbsolute(item) ? item : path.resolve(policyCwd, item))))
+        : [];
+
+      const executeOnce = async () => {
+        const shouldTrack = track_changes && commandMayMutate(command);
+        const beforeTree = shouldTrack ? await captureWorkingTree(policyCwd) : undefined;
+        if (transaction_id) {
+          if (!txPaths.length) throw new Error("mutation_paths is required when run_command uses transaction_id");
+          await getEditTransaction(transaction_id);
+          await captureTransactionPaths(transaction_id, txPaths);
+        }
+        const rawResult = await execInShellSession(command, defaultCwd, (timeout_seconds ?? timeoutSec) * 1000, cwdOverride);
+        if (transaction_id) await recordTransactionEdit(transaction_id, "run_command", txPaths);
+        const result = await compactCommandResult(rawResult, "command");
+        await recordProjectAffinity(result.cwd).catch(() => undefined);
+        const mutation = beforeTree ? compareWorkingTrees(beforeTree, await captureWorkingTree(result.cwd)) : undefined;
+        const failure = result.exit_code === 0 ? undefined : classifyToolFailure({
+          message: result.stderr,
+          exitCode: result.exit_code,
+          timedOut: result.timed_out,
+          command,
+        });
+        const expectedNoMatch = failure?.category === "expected_no_match";
+        const data = { ...result, ...(failure ? { failure } : {}), ...(mutation ? { mutation } : {}), replayed: false };
+        if (idempotency_key && fingerprint) await saveIdempotent(idempotency_key, fingerprint, data);
+        await audit({
+          tool: "run_command",
+          action: "command",
+          target: result.cwd,
+          status: result.exit_code === 0 || expectedNoMatch ? "ok" : "error",
+          details: { command, exit_code: result.exit_code, timed_out: result.timed_out, failure, changed_paths: mutation?.changed_paths, idempotency_key, transaction_id, mutation_paths: txPaths },
+        });
+        return toolResult("run_command", data, {
+          ok: result.exit_code === 0 || expectedNoMatch,
+          summary: expectedNoMatch ? `no matches in ${result.cwd}` : `exit ${result.exit_code} in ${result.cwd}`,
+        });
+      };
+
+      const executeWithTransaction = () => transaction_id
+        ? withEditTransactionLock(transaction_id, executeOnce)
+        : executeOnce();
+
+      const executeOrReplay = async () => {
+        if (idempotency_key && fingerprint) {
+          const cached = await loadIdempotent<Record<string, unknown>>(idempotency_key, fingerprint);
+          if (cached) {
+            if (transaction_id) {
+              const transaction = await getEditTransaction(transaction_id);
+              if (transaction.status === "rolled_back") {
+                throw new Error(`Idempotency key ${idempotency_key} belongs to rolled-back transaction ${transaction_id}; use a new key to execute again`);
+              }
+            }
+            await audit({ tool: "run_command", action: "replay", target: policyCwd, status: "ok", details: { idempotency_key } });
+            return toolResult("run_command", { ...cached, replayed: true }, { summary: `replayed ${idempotency_key}` });
+          }
+        }
+        return executeWithTransaction();
+      };
+
+      return idempotency_key
+        ? withIdempotencyKeyLock(idempotency_key, executeOrReplay)
+        : executeOrReplay();
     }
   );
 
@@ -261,46 +403,113 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     "run_commands_parallel",
     {
       title: "Run Commands in Parallel",
-      description:
-        "Run independent shell commands concurrently in isolated processes. Each command may set timeout_seconds up to 1 hour; otherwise SHELL_TIMEOUT is used. Does not change the persistent run_command cwd.",
+      description: "Run independent commands concurrently. Returns a durable batch_id; retry_failed reruns only failed/timed-out members.",
       inputSchema: {
         commands: z.array(z.object({
           command: z.string().max(MAX_COMMAND_CHARS),
           working_directory: z.string().optional(),
           timeout_seconds: z.number().int().positive().max(3600).optional(),
-        })).min(1).max(16),
+        })).min(1).max(16).optional(),
         concurrency: z.number().int().min(1).max(8).optional().default(4),
+        batch_id: z.string().optional(),
+        retry_failed: z.boolean().optional().default(false),
       },
       annotations: toolAnnotations("command"),
     },
-    async ({ commands, concurrency }) => {
+    async ({ commands, concurrency, batch_id, retry_failed }) => {
       const defaultParallelCwd = getShellStatus().cwd || defaultCwd;
-      const results: Array<OneShotCommandResult & { index: number; error?: string }> = new Array(commands.length);
+      let record: ParallelBatchRecord;
+      let targetIndices: number[];
+
+      if (batch_id) {
+        if (commands?.length) throw new Error("Do not provide commands when resuming a parallel batch_id");
+        const existing = await loadParallelBatch(batch_id);
+        if (!existing) throw new Error(`Unknown parallel batch id: ${batch_id}`);
+        record = existing;
+        if (!retry_failed) {
+          const failedEntries = record.results
+            .map((item, index) => ({ item, index }))
+            .filter(({ item }) => !item || Boolean(item.error) || (item.exit_code !== 0 && item.failure?.category !== "expected_no_match"));
+          return toolResult("run_commands_parallel", {
+            batch_id: record.id,
+            results: record.results,
+            count: record.commands.length,
+            failed: failedEntries.length,
+            partial_success: failedEntries.length > 0 && failedEntries.length < record.commands.length,
+            retryable_indices: failedEntries.filter(({ item }) => !item || item.failure?.retryable || item.timed_out).map(({ index }) => index),
+            attempts: record.attempts,
+          }, { ok: failedEntries.length === 0, summary: `loaded batch ${record.id}` });
+        }
+        targetIndices = record.results
+          .map((item, index) => ({ item, index }))
+          .filter(({ item }) => !item || Boolean(item.error) || (item.exit_code !== 0 && item.failure?.category !== "expected_no_match"))
+          .map(({ index }) => index);
+        if (!targetIndices.length) {
+          return toolResult("run_commands_parallel", {
+            batch_id: record.id,
+            results: record.results,
+            count: record.commands.length,
+            failed: 0,
+            partial_success: false,
+            retryable_indices: [],
+            attempts: record.attempts,
+          }, { summary: `batch ${record.id} already succeeded` });
+        }
+      } else {
+        if (!commands?.length) throw new Error("commands is required when batch_id is not provided");
+        const now = new Date().toISOString();
+        record = {
+          version: 1,
+          id: newParallelBatchId(),
+          created_at: now,
+          updated_at: now,
+          concurrency,
+          commands: commands as ParallelCommandSpec[],
+          results: new Array(commands.length).fill(null),
+          attempts: 0,
+        };
+        targetIndices = commands.map((_, index) => index);
+      }
+
+      const results = record.results;
+      record.concurrency = concurrency;
+      record.attempts++;
+      await saveParallelBatch(record);
       let nextIndex = 0;
 
       const worker = async () => {
         while (true) {
-          const index = nextIndex++;
-          if (index >= commands.length) return;
-          const spec = commands[index];
+          const target = nextIndex++;
+          if (target >= targetIndices.length) return;
+          const index = targetIndices[target];
+          const spec = record.commands[index];
           const started = Date.now();
           try {
             const cwd = spec.working_directory ? await validatePath(spec.working_directory) : defaultParallelCwd;
             requireCommandAllowed(spec.command, cwd);
-            const result = await runOneShotCommand(
+            const raw = await runOneShotCommand(
               spec.command,
               cwd,
               (spec.timeout_seconds ?? timeoutSec) * 1000
             );
-            results[index] = { index, ...result };
+            const result = await compactCommandResult(raw, "parallel");
+            const failure = result.exit_code === 0 ? undefined : classifyToolFailure({
+              message: result.stderr,
+              exitCode: result.exit_code,
+              timedOut: result.timed_out,
+              command: spec.command,
+            });
+            results[index] = { index, ...result, ...(failure ? { failure } : {}) };
+            await saveParallelBatch(record);
             await audit({
               tool: "run_commands_parallel",
               action: "command",
               target: cwd,
-              status: result.exit_code === 0 ? "ok" : "error",
-              details: { index, command: spec.command, exit_code: result.exit_code, timed_out: result.timed_out },
+              status: result.exit_code === 0 || failure?.category === "expected_no_match" ? "ok" : "error",
+              details: { batch_id: record.id, index, command: spec.command, exit_code: result.exit_code, timed_out: result.timed_out, failure },
             });
           } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
             results[index] = {
               index,
               command: spec.command,
@@ -311,18 +520,34 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
               signal: null,
               timed_out: false,
               duration_ms: Date.now() - started,
-              error: error instanceof Error ? error.message : String(error),
+              error: message,
+              failure: classifyToolFailure({ message, command: spec.command }),
             };
+            await saveParallelBatch(record);
           }
         }
       };
 
-      await Promise.all(Array.from({ length: Math.min(concurrency, commands.length) }, () => worker()));
-      const failed = results.filter((result) => result.exit_code !== 0 || result.error).length;
+      await Promise.all(Array.from({ length: Math.min(concurrency, targetIndices.length) }, () => worker()));
+      record.results = results;
+      await saveParallelBatch(record);
+      const failedEntries = results
+        .map((item, index) => ({ item, index }))
+        .filter(({ item }) => !item || Boolean(item.error) || (item.exit_code !== 0 && item.failure?.category !== "expected_no_match"));
+      const failed = failedEntries.length;
       return toolResult(
         "run_commands_parallel",
-        { results, count: results.length, failed, concurrency: Math.min(concurrency, commands.length) },
-        { ok: failed === 0, summary: `${results.length - failed}/${results.length} command(s) succeeded` }
+        {
+          batch_id: record.id,
+          results,
+          count: results.length,
+          failed,
+          partial_success: failed > 0 && failed < results.length,
+          retryable_indices: failedEntries.filter(({ item }) => !item || item.failure?.retryable || item.timed_out).map(({ index }) => index),
+          attempts: record.attempts,
+          concurrency: Math.min(concurrency, targetIndices.length),
+        },
+        { ok: failed === 0, summary: `${results.length - failed}/${results.length} command(s) succeeded · batch ${record.id}` }
       );
     }
   );
@@ -354,6 +579,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     async ({ path: dirPath }) => {
       const cwd = dirPath ? await validatePath(dirPath) : defaultCwd;
       resetShellSession(cwd);
+      await recordProjectAffinity(cwd).catch(() => undefined);
       return toolResult("shell_reset", { cwd }, { summary: `shell cwd reset to ${cwd}` });
     }
   );
@@ -375,6 +601,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     async ({ command, working_directory, label, task_id }) => {
       const cwd = working_directory ? await validatePath(working_directory) : getShellStatus().cwd || defaultCwd;
       requireCommandAllowed(command, cwd);
+      await recordProjectAffinity(cwd).catch(() => undefined);
       if (task_id) {
         const task = await getAgentTask(task_id);
         if (!task) throw new Error(`Unknown agent task id: ${task_id}`);
@@ -465,7 +692,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           });
         })().catch((error) => {
           item.historyError = error instanceof Error ? error.message : String(error);
-        });
+        }).finally(() => pruneFinishedProcesses());
       });
       try {
         await item.startWrite;
@@ -486,12 +713,23 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     "process_status",
     {
       title: "Process Status",
-      description: "Show status of background process(es).",
-      inputSchema: { id: z.string().optional() },
+      description: "Show background process status; optionally wait for one process to exit without polling.",
+      inputSchema: {
+        id: z.string().optional(),
+        wait_for: z.enum(["none", "exit"]).optional().default("none"),
+        wait_seconds: z.number().int().min(0).max(60).optional().default(30),
+      },
 
       annotations: toolAnnotations("read"),
     },
-    async ({ id }) => {
+    async ({ id, wait_for, wait_seconds }) => {
+      let wait: { condition_met: boolean; timed_out: boolean; waited_ms: number } | undefined;
+      if (wait_for === "exit") {
+        if (!id) throw new Error("id is required when wait_for=exit");
+        const item = processes.get(id);
+        if (!item) throw new Error(`Unknown process id: ${id}`);
+        wait = await waitForProcessCondition(item, { waitFor: "exit", timeoutMs: wait_seconds * 1000 });
+      }
       const processes_list = [...processes.values()]
         .filter((p) => !id || p.id === id)
         .map((p) => ({
@@ -502,14 +740,14 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           command: p.command,
           cwd: p.cwd,
           started_at: p.startedAt,
-          running: p.exitCode === null && p.signal === null,
+          running: processRunning(p),
           stdin_writable: p.child.stdin.writable && !p.child.stdin.destroyed,
           exit_code: p.exitCode,
           signal: p.signal,
           spawn_error: p.spawnError ?? null,
           history_error: p.historyError ?? null,
         }));
-      return toolResult("process_status", { processes: processes_list }, { summary: `${processes_list.length} process(es)` });
+      return toolResult("process_status", { processes: processes_list, ...(wait ? { wait } : {}) }, { summary: `${processes_list.length} process(es)` });
     }
   );
 
@@ -553,17 +791,42 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     "process_output",
     {
       title: "Process Output",
-      description: "Read stdout/stderr logs for a background process.",
+      description: "Read process logs, wait for exit/text, or retrieve a durable oversized-result handle.",
       inputSchema: {
-        id: z.string(),
+        id: z.string().optional(),
+        result_handle: z.string().optional(),
         tail_chars: z.number().int().positive().max(200000).optional().default(40000),
+        offset: z.number().int().nonnegative().optional().default(0),
+        limit: z.number().int().positive().max(200000).optional().default(40000),
+        wait_for: z.enum(["none", "exit", "text"]).optional().default("none"),
+        wait_text: z.string().max(4000).optional(),
+        wait_seconds: z.number().int().min(0).max(60).optional().default(30),
       },
 
       annotations: toolAnnotations("read"),
     },
-    async ({ id, tail_chars }) => {
+    async ({ id, result_handle, tail_chars, offset, limit, wait_for, wait_text, wait_seconds }) => {
+      if (result_handle) {
+        if (id) throw new Error("Provide either id or result_handle, not both");
+        const stored = await readTextResult(result_handle, offset, limit);
+        return toolResult("process_output", stored, { summary: `stored output ${result_handle}` });
+      }
+      if (!id) throw new Error("id or result_handle is required");
       const item = processes.get(id);
       if (!item) throw new Error(`Unknown process id: ${id}`);
+      if (wait_for === "text" && !wait_text) throw new Error("wait_text is required when wait_for=text");
+      let wait: { condition_met: boolean; timed_out: boolean; waited_ms: number } | undefined;
+      if (wait_for !== "none") {
+        wait = await waitForProcessCondition(item, {
+          waitFor: wait_for,
+          waitText: wait_text,
+          timeoutMs: wait_seconds * 1000,
+        });
+      }
+      const stdoutFull = item.stdout.join("");
+      const stderrFull = item.stderr.join("");
+      const combined = `STDOUT\n${stdoutFull}\n\nSTDERR\n${stderrFull}`;
+      const compact = await compactOrStoreText(combined, { inline_chars: Math.min(tail_chars * 2, 80_000), prefix: "process" });
       const data = {
         id,
         label: item.label,
@@ -571,14 +834,18 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         pid: item.child.pid,
         command: item.command,
         cwd: item.cwd,
-        running: item.exitCode === null && item.signal === null,
+        running: processRunning(item),
         stdin_writable: item.child.stdin.writable && !item.child.stdin.destroyed,
         exit_code: item.exitCode,
         signal: item.signal,
         spawn_error: item.spawnError ?? null,
         history_error: item.historyError ?? null,
-        stdout: item.stdout.join("").slice(-tail_chars),
-        stderr: item.stderr.join("").slice(-tail_chars),
+        stdout: stdoutFull.slice(-tail_chars),
+        stderr: stderrFull.slice(-tail_chars),
+        output_chars: combined.length,
+        output_handle: compact.output_handle,
+        truncated: compact.truncated,
+        ...(wait ? { wait } : {}),
       };
       return toolResult("process_output", data, { summary: `output for ${id}` });
     }
