@@ -7,6 +7,7 @@ import { requireWriteAllowed } from "../lib/permissions.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 import { assertCurrentSessionMutationPath, getCurrentSessionState } from "../lib/session-context.js";
+import { terminateChildProcessTree } from "../lib/process-tree.js";
 
 interface GitRunResult {
   stdout: string;
@@ -27,26 +28,8 @@ function appendBounded(current: string, chunk: Buffer): string {
 }
 
 async function killGitTree(child: ReturnType<typeof spawn>): Promise<void> {
-  if (!child.pid) {
-    child.kill("SIGKILL");
-    return;
-  }
-  if (process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, "SIGKILL");
-      return;
-    } catch {
-      child.kill("SIGKILL");
-      return;
-    }
-  }
-  await new Promise<void>((resolve) => {
-    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
-    killer.once("error", () => {
-      child.kill("SIGKILL");
-      resolve();
-    });
-    killer.once("close", () => resolve());
+  await terminateChildProcessTree(child, true).catch(() => {
+    try { child.kill("SIGKILL"); } catch {}
   });
 }
 

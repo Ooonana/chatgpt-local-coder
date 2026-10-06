@@ -14,6 +14,7 @@ import { validatePath } from "./path-security.js";
 import { resolveSafeSpawnSpec } from "./safe-spawn.js";
 import { terminateWindowsProcessTree } from "./process-tree.js";
 import { canonicalProjectRootForPath, sameProjectRoot } from "./workspace-scope.js";
+import { atomicWriteText } from "./atomic-file.js";
 
 export type SubagentIsolation = "none" | "worktree";
 
@@ -173,8 +174,7 @@ export async function getSubagentConfig(): Promise<SubagentConfig> {
 
 export async function saveSubagentConfig(raw: Partial<SubagentConfig>): Promise<SubagentConfig> {
   const next = normalizeConfig(raw);
-  await fs.mkdir(path.dirname(configPath()), { recursive: true });
-  await fs.writeFile(configPath(), JSON.stringify(next, null, 2) + "\n", "utf-8");
+  await atomicWriteText(configPath(), JSON.stringify(next, null, 2) + "\n");
   return next;
 }
 

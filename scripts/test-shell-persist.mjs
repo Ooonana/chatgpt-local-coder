@@ -8,7 +8,9 @@ import {
   bootstrapShellSession,
   execInShellSession,
   getShellStatus,
+  resetShellSession,
 } from "../dist/lib/persistent-shell.js";
+import { loadGlobalShellState } from "../dist/lib/global-shell-state.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -37,6 +39,16 @@ try {
   const cwd2 = getShellStatus().cwd;
   if (cwd2 !== cwd1) throw new Error(`persist failed: ${cwd1} -> ${cwd2}`);
   ok("cwd restored after re-bootstrap");
+
+  resetShellSession(root);
+  await execInShellSession("cd src", root, 5000);
+  const persisted = await loadGlobalShellState(root, root, "__legacy__");
+  if (!persisted?.cwd.replace(/\\/g, "/").endsWith("/src")) {
+    throw new Error(`queued shell state write lost newest cwd: ${JSON.stringify(persisted)}`);
+  }
+  const residue = (await fs.readdir(stateDir)).filter((name) => name.endsWith(".tmp"));
+  if (residue.length) throw new Error(`shell state temp residue: ${residue.join(", ")}`);
+  ok("shell state writes are ordered and atomic");
 } catch (e) {
   fail("shell persist", e.message || e);
 }

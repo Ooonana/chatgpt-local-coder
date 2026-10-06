@@ -61,6 +61,33 @@ await run("lists checkpoints newest first", async () => {
   if (!list[0].id.startsWith("cp_")) throw new Error(`bad id ${list[0].id}`);
 });
 
+await run("parallel checkpoint creation preserves every index entry", async () => {
+  await clearCheckpoints();
+  const files = await Promise.all(Array.from({ length: 12 }, async (_, index) => {
+    const file = path.join(tmpDir, `parallel-${index}.txt`);
+    await fs.writeFile(file, `value-${index}\n`);
+    return file;
+  }));
+  const ids = await Promise.all(files.map((file) => checkpointBefore("parallel-test", [file])));
+  const expected = new Set(ids.filter(Boolean));
+  const listed = await listCheckpoints(50);
+  const actual = new Set(listed.map((checkpoint) => checkpoint.id));
+  if (expected.size !== files.length) throw new Error(`expected ${files.length} ids, got ${expected.size}`);
+  for (const id of expected) {
+    if (!actual.has(id)) throw new Error(`parallel checkpoint missing from index: ${id}`);
+  }
+  const parsed = JSON.parse(await fs.readFile(path.join(storeDir, "index.json"), "utf-8"));
+  if (!Array.isArray(parsed.checkpoints) || parsed.checkpoints.length !== files.length) {
+    throw new Error(`checkpoint index lost concurrent entries: ${JSON.stringify(parsed)}`);
+  }
+  await clearCheckpoints();
+  // Restore the fixture expected by the following preview/restore tests.
+  const alpha = path.join(tmpDir, "alpha.txt");
+  await fs.writeFile(alpha, "v1\n");
+  await checkpointBefore("write_file", [alpha]);
+  await fs.writeFile(alpha, "v2\n");
+});
+
 await run("preview restore shows planned changes", async () => {
   const list = await listCheckpoints(1);
   const plan = await previewRestore(list[0].id);

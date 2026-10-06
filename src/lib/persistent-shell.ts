@@ -1,7 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
-import fs from "fs";
 import path from "path";
 import { getCurrentSessionId } from "./session-context.js";
+import { terminateChildProcessTree } from "./process-tree.js";
+import { getWinShell } from "./win-shell.js";
+export { getWinShell } from "./win-shell.js";
 
 export interface ShellExecResult {
   command: string;
@@ -31,24 +33,7 @@ function persistShellCwd(): boolean {
 }
 
 async function killProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
-  if (process.platform !== "win32" && child.pid) {
-    try {
-      process.kill(-child.pid, "SIGKILL");
-      return;
-    } catch {}
-  }
-  if (process.platform !== "win32" || !child.pid) {
-    child.kill("SIGKILL");
-    return;
-  }
-  await new Promise<void>((resolve) => {
-    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
-    killer.once("error", () => {
-      child.kill("SIGKILL");
-      resolve();
-    });
-    killer.once("close", () => resolve());
-  });
+  await terminateChildProcessTree(child, true);
 }
 
 function shellKey(explicitSessionId?: string): string {
@@ -221,26 +206,6 @@ export function transpileCompoundOperators(cmd: string): string {
   }
 
   return result;
-}
-
-export function getWinShell(): { shell: string; isPwsh: boolean } {
-  const configuredShell = process.env.SHELL?.trim();
-  if (configuredShell && /(?:^|[\\/])(pwsh|powershell)(?:\.exe)?$/i.test(configuredShell)) {
-    return { shell: configuredShell, isPwsh: /pwsh(?:\.exe)?$/i.test(configuredShell) };
-  }
-
-  const pwshPaths = [
-    "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
-    "C:\\Program Files (x86)\\PowerShell\\7\\pwsh.exe",
-  ];
-  for (const p of pwshPaths) {
-    if (fs.existsSync(p)) return { shell: p, isPwsh: true };
-  }
-
-  const sysPowerShell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
-  if (fs.existsSync(sysPowerShell)) return { shell: sysPowerShell, isPwsh: false };
-
-  return { shell: "powershell.exe", isPwsh: false };
 }
 
 function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {

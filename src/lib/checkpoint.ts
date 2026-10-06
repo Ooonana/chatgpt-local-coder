@@ -43,6 +43,7 @@ const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_DIRECTORY_ENTRIES = 5_000;
 const MAX_DIRECTORY_DEPTH = 32;
+let checkpointMutationQueue: Promise<void> = Promise.resolve();
 
 interface SnapshotBudget {
   entries: number;
@@ -139,7 +140,39 @@ async function readIndex(): Promise<CheckpointIndex> {
 async function writeIndex(index: CheckpointIndex): Promise<void> {
   const root = getStoreRoot();
   await fs.mkdir(root, { recursive: true });
-  await fs.writeFile(indexPath(), JSON.stringify(index, null, 2), "utf-8");
+  const target = indexPath();
+  const temp = `${target}.${process.pid}.${randomUUID().replace(/-/g, "").slice(0, 10)}.tmp`;
+  try {
+    await fs.writeFile(temp, JSON.stringify(index, null, 2), "utf-8");
+    await fs.rename(temp, target);
+  } finally {
+    await fs.rm(temp, { force: true }).catch(() => undefined);
+  }
+}
+
+async function writeManifest(manifest: CheckpointManifest): Promise<void> {
+  const target = manifestPath(manifest.id);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  const temp = `${target}.${process.pid}.${randomUUID().replace(/-/g, "").slice(0, 10)}.tmp`;
+  try {
+    await fs.writeFile(temp, JSON.stringify(manifest, null, 2), "utf-8");
+    await fs.rename(temp, target);
+  } finally {
+    await fs.rm(temp, { force: true }).catch(() => undefined);
+  }
+}
+
+async function withCheckpointMutation<T>(work: () => Promise<T>): Promise<T> {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const previous = checkpointMutationQueue;
+  checkpointMutationQueue = previous.catch(() => undefined).then(() => gate);
+  await previous.catch(() => undefined);
+  try {
+    return await work();
+  } finally {
+    release();
+  }
 }
 
 async function readManifest(id: string): Promise<CheckpointManifest | null> {
@@ -275,7 +308,7 @@ async function removeCheckpointData(id: string): Promise<void> {
   await fs.rm(checkpointDir(id), { recursive: true, force: true });
 }
 
-async function pruneCheckpoints(index: CheckpointIndex): Promise<CheckpointIndex> {
+function pruneCheckpointIndex(index: CheckpointIndex): { index: CheckpointIndex; toDelete: string[] } {
   const maxCount = getMaxCount();
   const retentionMs = getRetentionDays() * 24 * 60 * 60 * 1000;
   const cutoff = Date.now() - retentionMs;
@@ -297,11 +330,7 @@ async function pruneCheckpoints(index: CheckpointIndex): Promise<CheckpointIndex
     if (removed) toDelete.push(removed.id);
   }
 
-  for (const id of toDelete) {
-    await removeCheckpointData(id);
-  }
-
-  return { version: INDEX_VERSION, checkpoints };
+  return { index: { version: INDEX_VERSION, checkpoints }, toDelete };
 }
 
 function buildSummary(manifest: CheckpointManifest): CheckpointSummary {
@@ -335,45 +364,44 @@ export async function checkpointBefore(
 ): Promise<string | null> {
   if (!isEnabled() || options?.dry_run) return null;
 
-  const uniquePaths = [...new Set(paths.map((p) => path.resolve(p)))];
-  if (uniquePaths.length === 0) return null;
+  return withCheckpointMutation(async () => {
+    const uniquePaths = [...new Set(paths.map((p) => path.resolve(p)))];
+    if (uniquePaths.length === 0) return null;
 
-  const snapshots: CheckpointFileSnapshot[] = [];
-  const budget: SnapshotBudget = {
-    entries: 0,
-    bytes: 0,
-    maxEntries: getMaxDirectoryEntries(),
-    maxBytes: getMaxTotalBytes(),
-  };
-  for (const filePath of uniquePaths) {
-    snapshots.push(await snapshotFile(filePath, budget));
-  }
+    const snapshots: CheckpointFileSnapshot[] = [];
+    const budget: SnapshotBudget = {
+      entries: 0,
+      bytes: 0,
+      maxEntries: getMaxDirectoryEntries(),
+      maxBytes: getMaxTotalBytes(),
+    };
+    for (const filePath of uniquePaths) {
+      snapshots.push(await snapshotFile(filePath, budget));
+    }
 
-  const id = `cp_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
-  const createdAt = new Date().toISOString();
-  const summary =
-    options?.summary ||
-    `${tool}: ${uniquePaths.length} path(s) — ${uniquePaths.map((p) => path.basename(p)).join(", ")}`;
+    const id = `cp_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    const createdAt = new Date().toISOString();
+    const summary =
+      options?.summary ||
+      `${tool}: ${uniquePaths.length} path(s) — ${uniquePaths.map((p) => path.basename(p)).join(", ")}`;
 
-  const manifest: CheckpointManifest = {
-    version: INDEX_VERSION,
-    id,
-    created_at: createdAt,
-    tool,
-    summary,
-    files: snapshots,
-  };
+    const manifest: CheckpointManifest = {
+      version: INDEX_VERSION,
+      id,
+      created_at: createdAt,
+      tool,
+      summary,
+      files: snapshots,
+    };
 
-  const dir = checkpointDir(id);
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(manifestPath(id), JSON.stringify(manifest, null, 2), "utf-8");
-
-  const index = await readIndex();
-  index.checkpoints.push(buildSummary(manifest));
-  const pruned = await pruneCheckpoints(index);
-  await writeIndex(pruned);
-
-  return id;
+    await writeManifest(manifest);
+    const index = await readIndex();
+    index.checkpoints.push(buildSummary(manifest));
+    const pruned = pruneCheckpointIndex(index);
+    await writeIndex(pruned.index);
+    await Promise.all(pruned.toDelete.map((checkpointId) => removeCheckpointData(checkpointId)));
+    return id;
+  });
 }
 
 export async function listCheckpoints(limit = 50): Promise<CheckpointSummary[]> {
@@ -485,54 +513,57 @@ export async function restoreToCheckpoint(targetId: string): Promise<{
   deleted: string[];
   skipped: Array<{ path: string; reason?: string }>;
 }> {
-  const { target, files } = await collectRestorePlan(targetId);
-  const restored: string[] = [];
-  const deleted: string[] = [];
-  const skipped: Array<{ path: string; reason?: string }> = [];
+  return withCheckpointMutation(async () => {
+    const { target, files } = await collectRestorePlan(targetId);
+    const restored: string[] = [];
+    const deleted: string[] = [];
+    const skipped: Array<{ path: string; reason?: string }> = [];
 
-  // Apply in reverse path order so nested directory restores stay consistent.
-  const ordered = [...files.entries()].sort((a, b) => b[0].length - a[0].length);
+    // Apply in reverse path order so nested directory restores stay consistent.
+    const ordered = [...files.entries()].sort((a, b) => b[0].length - a[0].length);
 
-  for (const [filePath, snapshot] of ordered) {
-    if (snapshot.skipped) {
-      skipped.push({ path: filePath, reason: snapshot.skip_reason });
-      continue;
-    }
-
-    if (!snapshot.existed) {
-      try {
-        await fs.rm(filePath, { recursive: true, force: true });
-        deleted.push(filePath);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    for (const [filePath, snapshot] of ordered) {
+      if (snapshot.skipped) {
+        skipped.push({ path: filePath, reason: snapshot.skip_reason });
+        continue;
       }
-      continue;
+
+      if (!snapshot.existed) {
+        try {
+          await fs.rm(filePath, { recursive: true, force: true });
+          deleted.push(filePath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
+        continue;
+      }
+
+      await restoreSnapshot(snapshot);
+      restored.push(filePath);
     }
 
-    await restoreSnapshot(snapshot);
-    restored.push(filePath);
-  }
+    // Commit the new index before deleting stale checkpoint directories. A
+    // crash can leave harmless orphan data, but never an index pointing at
+    // manifests that were already deleted.
+    const index = await readIndex();
+    const targetIndex = findCheckpointIndex(index.checkpoints, targetId);
+    if (targetIndex < 0) throw new Error(`Checkpoint not found: ${targetId}`);
+    const removed = index.checkpoints.splice(targetIndex);
+    await writeIndex(index);
+    await Promise.all(removed.map((cp) => removeCheckpointData(cp.id)));
 
-  // Remove checkpoints after the restore point (they are now stale).
-  const index = await readIndex();
-  const targetIndex = findCheckpointIndex(index.checkpoints, targetId);
-  const removed = index.checkpoints.splice(targetIndex);
-  for (const cp of removed) {
-    await removeCheckpointData(cp.id);
-  }
-  await writeIndex(index);
-
-  return { checkpoint: target, restored, deleted, skipped };
+    return { checkpoint: target, restored, deleted, skipped };
+  });
 }
 
 export async function clearCheckpoints(): Promise<number> {
-  const index = await readIndex();
-  const count = index.checkpoints.length;
-  for (const cp of index.checkpoints) {
-    await removeCheckpointData(cp.id);
-  }
-  await writeIndex({ version: INDEX_VERSION, checkpoints: [] });
-  return count;
+  return withCheckpointMutation(async () => {
+    const index = await readIndex();
+    const count = index.checkpoints.length;
+    await writeIndex({ version: INDEX_VERSION, checkpoints: [] });
+    await Promise.all(index.checkpoints.map((cp) => removeCheckpointData(cp.id)));
+    return count;
+  });
 }
 
 export function checkpointFingerprint(paths: string[]): string {

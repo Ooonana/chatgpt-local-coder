@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
+  importMcpConfigFromFile,
   importCursorMcpConfig,
   loadUpstreamConfig,
   parseClaudeCodeConfig,
@@ -104,6 +105,69 @@ await run("save and load upstream config", async () => {
   if (loaded.servers.length !== 1 || loaded.servers[0].id !== "demo") {
     throw new Error(JSON.stringify(loaded));
   }
+});
+
+await run("concurrent upstream mutations preserve every server and atomic config", async () => {
+  await saveUpstreamConfig({ version: 1, servers: [] }, configPath);
+  const manager = new McpUpstreamManager(configPath);
+  await manager.init();
+  const makeServer = (id) => ({
+    id,
+    name: id,
+    enabled: false,
+    transport: "http",
+    url: `http://127.0.0.1:3999/${id}`,
+    expose: "none",
+  });
+  await Promise.all([
+    manager.upsertServer(makeServer("parallel-a")),
+    manager.upsertServer(makeServer("parallel-b")),
+    manager.upsertServer(makeServer("parallel-c")),
+  ]);
+  const persisted = await loadUpstreamConfig(configPath);
+  const ids = new Set(persisted.servers.map((server) => server.id));
+  for (const id of ["parallel-a", "parallel-b", "parallel-c"]) {
+    if (!ids.has(id)) throw new Error(`concurrent upstream mutation lost ${id}: ${JSON.stringify(persisted)}`);
+  }
+  const residue = (await fs.readdir(path.dirname(configPath))).filter((name) =>
+    name.startsWith(path.basename(configPath) + ".") && name.endsWith(".tmp")
+  );
+  if (residue.length) throw new Error(`upstream config temp residue: ${residue.join(", ")}`);
+  await manager.shutdown();
+});
+
+await run("concurrent import and manager upsert preserve both changes", async () => {
+  await saveUpstreamConfig({ version: 1, servers: [] }, configPath);
+  const manager = new McpUpstreamManager(configPath);
+  await manager.init();
+  const fixturePath = path.join(tmpDir, "parallel-import.json");
+  await fs.writeFile(fixturePath, JSON.stringify({
+    mcpServers: {
+      imported: { url: "http://127.0.0.1:3999/imported" },
+    },
+  }), "utf-8");
+  await Promise.all([
+    importMcpConfigFromFile(fixturePath, "cursor", { merge: true }),
+    manager.upsertServer({
+      id: "managed",
+      name: "Managed",
+      enabled: false,
+      transport: "http",
+      url: "http://127.0.0.1:3999/managed",
+      expose: "none",
+    }),
+  ]);
+  const persisted = await loadUpstreamConfig(configPath);
+  const ids = new Set(persisted.servers.map((server) => server.id));
+  if (!ids.has("imported") || !ids.has("managed")) {
+    throw new Error(`concurrent import/upsert lost an entry: ${JSON.stringify(persisted)}`);
+  }
+  await manager.reloadConfig();
+  const managerIds = new Set(manager.listServerConfigs().map((server) => server.id));
+  if (!managerIds.has("imported") || !managerIds.has("managed")) {
+    throw new Error(`manager did not converge to persisted config: ${JSON.stringify(manager.listServerConfigs())}`);
+  }
+  await manager.shutdown();
 });
 
 await run("parse claude code mcp config", async () => {

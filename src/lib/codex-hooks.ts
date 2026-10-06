@@ -4,6 +4,8 @@ import path from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { requireCommandAllowed } from "./permissions.js";
+import { atomicWriteText } from "./atomic-file.js";
+import { terminateChildProcessTree } from "./process-tree.js";
 
 type HookEvent = "session_start" | "user_prompt_submit" | "subagent_start";
 
@@ -129,8 +131,10 @@ export async function saveCodexHooks(enabledIds: unknown): Promise<CodexHook[]> 
   const enabled = Array.isArray(enabledIds)
     ? [...new Set(enabledIds.filter((id): id is string => typeof id === "string" && known.has(id)))]
     : [];
-  await fs.mkdir(path.dirname(STATE_PATH), { recursive: true });
-  await fs.writeFile(STATE_PATH, JSON.stringify({ enabled, disabled: hooks.map((hook) => hook.id).filter((id) => !enabled.includes(id)) }, null, 2) + "\n");
+  await atomicWriteText(
+    STATE_PATH,
+    JSON.stringify({ enabled, disabled: hooks.map((hook) => hook.id).filter((id) => !enabled.includes(id)) }, null, 2) + "\n"
+  );
   return getCodexHooks();
 }
 
@@ -144,18 +148,24 @@ function execute(command: string, timeoutMs: number, input?: string): Promise<st
       env: { ...process.env, PLUGIN_DATA: CODEX_HOME },
     });
     let stdout = "";
+    let settled = false;
+    const finish = (value: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
     const timer = setTimeout(() => {
-      child.kill();
-      resolve("");
+      void terminateChildProcessTree(child, true)
+        .catch(() => { try { child.kill("SIGKILL"); } catch {} })
+        .finally(() => finish(""));
     }, timeoutMs);
     child.stdout.on("data", (data: Buffer) => (stdout += data.toString()));
     child.on("close", () => {
-      clearTimeout(timer);
-      resolve(stdout.trim());
+      finish(stdout.trim());
     });
     child.on("error", () => {
-      clearTimeout(timer);
-      resolve("");
+      finish("");
     });
     child.stdin.end(input);
   });

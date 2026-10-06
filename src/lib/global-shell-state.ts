@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "fs/promises";
 import path from "path";
 
@@ -14,6 +14,7 @@ function getStateDir(): string {
   return process.env.MCP_SHELL_STATE_DIR || path.join(process.cwd(), ".mcp-state");
 }
 const MAX_RECENT = 20;
+const stateWriteQueues = new Map<string, Promise<void>>();
 
 function workspaceKey(workspaceRoot: string): string {
   return createHash("sha256").update(path.resolve(workspaceRoot)).digest("hex").slice(0, 16);
@@ -39,8 +40,10 @@ export async function loadGlobalShellState(
   defaultCwd: string,
   sessionId?: string
 ): Promise<GlobalShellState | null> {
+  const target = statePath(workspaceRoot, sessionId);
+  await stateWriteQueues.get(target)?.catch(() => undefined);
   try {
-    const raw = await fs.readFile(statePath(workspaceRoot, sessionId), "utf-8");
+    const raw = await fs.readFile(target, "utf-8");
     const parsed = JSON.parse(raw) as GlobalShellState;
     if (!parsed.cwd) return null;
     return parsed;
@@ -70,8 +73,24 @@ export async function saveGlobalShellState(
     recent_commands: recent,
   };
 
-  await fs.mkdir(getStateDir(), { recursive: true });
-  await fs.writeFile(statePath(workspaceRoot, sessionId), JSON.stringify(state, null, 2), "utf-8");
+  const target = statePath(workspaceRoot, sessionId);
+  const previousWrite = stateWriteQueues.get(target) ?? Promise.resolve();
+  const write = previousWrite.catch(() => undefined).then(async () => {
+    await fs.mkdir(getStateDir(), { recursive: true });
+    const temp = `${target}.${process.pid}.${randomUUID().replace(/-/g, "").slice(0, 10)}.tmp`;
+    try {
+      await fs.writeFile(temp, JSON.stringify(state, null, 2), "utf-8");
+      await fs.rename(temp, target);
+    } finally {
+      await fs.rm(temp, { force: true }).catch(() => undefined);
+    }
+  });
+  stateWriteQueues.set(target, write);
+  try {
+    await write;
+  } finally {
+    if (stateWriteQueues.get(target) === write) stateWriteQueues.delete(target);
+  }
 }
 
 export async function restoreShellFromDisk(

@@ -3,6 +3,7 @@ import os from "os";
 import path from "path";
 import { createHash } from "crypto";
 import { spawn } from "child_process";
+import { terminateChildProcessTree } from "../lib/process-tree.js";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
@@ -264,26 +265,8 @@ function quoteForDisplay(value: string): string {
 }
 
 async function killGitTree(child: ReturnType<typeof spawn>): Promise<void> {
-  if (!child.pid) {
-    child.kill("SIGKILL");
-    return;
-  }
-  if (process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, "SIGKILL");
-      return;
-    } catch {
-      child.kill("SIGKILL");
-      return;
-    }
-  }
-  await new Promise<void>((resolve) => {
-    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
-    killer.once("error", () => {
-      child.kill("SIGKILL");
-      resolve();
-    });
-    killer.once("close", () => resolve());
+  await terminateChildProcessTree(child, true).catch(() => {
+    try { child.kill("SIGKILL"); } catch {}
   });
 }
 

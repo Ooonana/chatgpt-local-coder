@@ -2,6 +2,7 @@ import fs from "fs";
 import fsp from "fs/promises";
 import os from "os";
 import path from "path";
+import { atomicWriteTextSync } from "./atomic-file.js";
 
 export interface LocalPluginsConfig {
   computer_use?: { enabled?: boolean };
@@ -18,8 +19,7 @@ export function getLocalPluginsConfig(): LocalPluginsConfig {
 }
 
 export function saveLocalPluginsConfig(next: LocalPluginsConfig): void {
-  fs.mkdirSync(path.dirname(configPath()), { recursive: true });
-  fs.writeFileSync(configPath(), JSON.stringify(next, null, 2));
+  atomicWriteTextSync(configPath(), JSON.stringify(next, null, 2) + "\n");
 }
 
 export function isComputerUseEnabled(): boolean {

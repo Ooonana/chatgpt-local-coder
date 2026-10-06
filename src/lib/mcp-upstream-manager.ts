@@ -11,6 +11,7 @@ import {
   type UpstreamConfigFile,
   type UpstreamServerConfig,
   resolveUpstreamConfigPath,
+  withUpstreamConfigMutation,
 } from "./mcp-upstream-config.js";
 import { FileOAuthClientProvider } from "./mcp-oauth-provider.js";
 
@@ -52,6 +53,7 @@ export class McpUpstreamManager {
   private servers = new Set<McpServer>();
   private toolsCache = new Map<string, { tools: Tool[]; expiresAt: number }>();
   private oauthProviders = new Map<string, FileOAuthClientProvider>();
+  private configMutationQueue: Promise<void> = Promise.resolve();
   private readonly toolsCacheTtlMs = 60_000;
   private readonly connectTimeoutMs = Math.max(1_000, Number(process.env.MCP_UPSTREAM_CONNECT_TIMEOUT_MS) || 15_000);
 
@@ -62,6 +64,30 @@ export class McpUpstreamManager {
 
   async init(): Promise<void> {
     this.config = await loadUpstreamConfig(this.configPath);
+  }
+
+  private async withConfigMutation<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.configMutationQueue;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const current = previous.catch(() => undefined).then(() => gate);
+    this.configMutationQueue = current;
+    await previous.catch(() => undefined);
+    try {
+      return await withUpstreamConfigMutation(this.configPath, work);
+    } finally {
+      release();
+      if (this.configMutationQueue === current) this.configMutationQueue = Promise.resolve();
+    }
+  }
+
+  private async applyConfigUnlocked(next: UpstreamConfigFile): Promise<UpstreamConfigFile> {
+    await saveUpstreamConfig(next, this.configPath);
+    await this.shutdown();
+    this.config = await loadUpstreamConfig(this.configPath);
+    this.oauthProviders.clear();
+    await this.refreshAllProxies();
+    return this.config;
   }
 
   registerMcpServer(server: McpServer): void {
@@ -89,36 +115,43 @@ export class McpUpstreamManager {
   }
 
   async reloadConfig(): Promise<UpstreamConfigFile> {
-    await this.shutdown();
-    this.config = await loadUpstreamConfig(this.configPath);
-    this.oauthProviders.clear();
-    await this.refreshAllProxies();
-    return this.config;
+    return this.withConfigMutation(async () => {
+      await this.shutdown();
+      this.config = await loadUpstreamConfig(this.configPath);
+      this.oauthProviders.clear();
+      await this.refreshAllProxies();
+      return this.config;
+    });
   }
 
   async updateConfig(next: UpstreamConfigFile): Promise<UpstreamConfigFile> {
-    await saveUpstreamConfig(next, this.configPath);
-    await this.shutdown();
-    this.config = next;
-    this.oauthProviders.clear();
-    await this.refreshAllProxies();
-    return this.config;
+    return this.withConfigMutation(() => this.applyConfigUnlocked(next));
   }
 
   async upsertServer(server: UpstreamServerConfig): Promise<void> {
-    const idx = this.config.servers.findIndex((s) => s.id === server.id);
-    if (idx >= 0) this.config.servers[idx] = server;
-    else this.config.servers.push(server);
-    await this.updateConfig(this.config);
+    await this.withConfigMutation(async () => {
+      const current = await loadUpstreamConfig(this.configPath);
+      const servers = current.servers.map((item) => ({ ...item }));
+      const idx = servers.findIndex((item) => item.id === server.id);
+      if (idx >= 0) servers[idx] = { ...server };
+      else servers.push({ ...server });
+      await this.applyConfigUnlocked({ version: 1, servers });
+    });
   }
 
   async removeServer(serverId: string): Promise<boolean> {
-    const before = this.config.servers.length;
-    this.config.servers = this.config.servers.filter((s) => s.id !== serverId);
-    if (this.config.servers.length === before) return false;
-    await this.disconnect(serverId);
-    await this.updateConfig(this.config);
-    return true;
+    return this.withConfigMutation(async () => {
+      const current = await loadUpstreamConfig(this.configPath);
+      const servers = current.servers.filter((server) => server.id !== serverId).map((server) => ({ ...server }));
+      if (servers.length === current.servers.length) {
+        // Keep the manager synchronized even when another writer changed the
+        // file but the requested server was already absent.
+        this.config = current;
+        return false;
+      }
+      await this.applyConfigUnlocked({ version: 1, servers });
+      return true;
+    });
   }
 
   private async disconnectDisabled(): Promise<void> {

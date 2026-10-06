@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { atomicWriteTextSync } from "./atomic-file.js";
 
 export type ToolProfileName = "full" | "slim";
 
@@ -120,8 +121,7 @@ export function getLocalToolOverrides(): LocalToolOverrides {
 
 export function saveLocalToolOverrides(next: LocalToolOverrides): void {
   const sanitized = sanitizeLocalToolOverrides(next);
-  fs.mkdirSync(path.dirname(overridesPath()), { recursive: true });
-  fs.writeFileSync(overridesPath(), JSON.stringify(sanitized, null, 2) + "\n");
+  atomicWriteTextSync(overridesPath(), JSON.stringify(sanitized, null, 2) + "\n");
 }
 
 /** Core tools for the ChatGPT app — smaller tools/list payload, fewer discovery errors. */

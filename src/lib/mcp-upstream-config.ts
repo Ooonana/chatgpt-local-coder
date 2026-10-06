@@ -1,6 +1,28 @@
 import fs from "fs/promises";
 import path from "path";
 import os from "os";
+import { atomicWriteText } from "./atomic-file.js";
+
+const upstreamConfigMutationQueues = new Map<string, Promise<void>>();
+
+export async function withUpstreamConfigMutation<T>(
+  configPath: string,
+  work: () => Promise<T>
+): Promise<T> {
+  const key = path.resolve(configPath);
+  const previous = upstreamConfigMutationQueues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const current = previous.catch(() => undefined).then(() => gate);
+  upstreamConfigMutationQueues.set(key, current);
+  await previous.catch(() => undefined);
+  try {
+    return await work();
+  } finally {
+    release();
+    if (upstreamConfigMutationQueues.get(key) === current) upstreamConfigMutationQueues.delete(key);
+  }
+}
 
 export type UpstreamTransport = "stdio" | "http";
 export type UpstreamExposeMode = "none" | "meta_only" | "allowlist" | "all";
@@ -114,8 +136,7 @@ export async function saveUpstreamConfig(
     version: CONFIG_VERSION,
     servers: config.servers.map(normalizeServer),
   };
-  await fs.mkdir(path.dirname(configPath), { recursive: true });
-  await fs.writeFile(configPath, JSON.stringify(normalized, null, 2), "utf-8");
+  await atomicWriteText(configPath, JSON.stringify(normalized, null, 2) + "\n");
 }
 
 export type McpImportSource = "cursor" | "claude" | "opencode" | "file";
@@ -277,21 +298,24 @@ async function mergeImportedServers(
   options?: { merge?: boolean; enableImported?: boolean }
 ): Promise<{ imported: string[]; config: UpstreamConfigFile }> {
   const configPath = resolveUpstreamConfigPath();
-  const existing = await loadUpstreamConfig(configPath);
-  const merge = options?.merge !== false;
-  const byId = new Map(existing.servers.map((s) => [s.id, s]));
-  const imported: string[] = [];
+  return withUpstreamConfigMutation(configPath, async () => {
+    const existing = await loadUpstreamConfig(configPath);
+    const merge = options?.merge !== false;
+    const byId = new Map(existing.servers.map((s) => [s.id, s]));
+    const imported: string[] = [];
 
-  for (const server of incoming) {
-    if (options?.enableImported) server.enabled = true;
-    if (merge && byId.has(server.id)) continue;
-    byId.set(server.id, server);
-    imported.push(server.id);
-  }
+    for (const rawServer of incoming) {
+      const server = { ...rawServer };
+      if (options?.enableImported) server.enabled = true;
+      if (merge && byId.has(server.id)) continue;
+      byId.set(server.id, server);
+      imported.push(server.id);
+    }
 
-  const merged: UpstreamConfigFile = { version: CONFIG_VERSION, servers: [...byId.values()] };
-  await saveUpstreamConfig(merged, configPath);
-  return { imported, config: merged };
+    const merged: UpstreamConfigFile = { version: CONFIG_VERSION, servers: [...byId.values()] };
+    await saveUpstreamConfig(merged, configPath);
+    return { imported, config: merged };
+  });
 }
 
 export async function importMcpConfigFromFile(

@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { atomicWriteTextSync } from "./atomic-file.js";
 
 export type PermissionProfile = "open" | "workspace" | "read_only" | "custom";
 
@@ -95,8 +96,7 @@ export function getPermissionConfig(): PermissionConfig {
 
 export function savePermissionConfig(next: Partial<PermissionConfig>): PermissionConfig {
   const normalized = normalizeConfig(next);
-  fs.mkdirSync(path.dirname(configPath()), { recursive: true });
-  fs.writeFileSync(configPath(), JSON.stringify(normalized, null, 2) + "\n");
+  atomicWriteTextSync(configPath(), JSON.stringify(normalized, null, 2) + "\n");
   return normalized;
 }
 

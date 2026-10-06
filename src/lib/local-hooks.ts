@@ -4,6 +4,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import { fileURLToPath } from "url";
 import { requireCommandAllowed } from "./permissions.js";
 import { getWinShell } from "./persistent-shell.js";
+import { terminateChildProcessTree } from "./process-tree.js";
+import { atomicWriteText } from "./atomic-file.js";
 
 export type LocalHookEvent =
   | "session_start"
@@ -144,8 +146,7 @@ export async function getLocalHooksConfig(): Promise<LocalHooksConfig> {
 
 export async function saveLocalHooksConfig(raw: Partial<LocalHooksConfig>): Promise<LocalHooksConfig> {
   const next = normalizeConfig(raw);
-  await fs.mkdir(path.dirname(configPath()), { recursive: true });
-  await fs.writeFile(configPath(), JSON.stringify(next, null, 2) + "\n", "utf-8");
+  await atomicWriteText(configPath(), JSON.stringify(next, null, 2) + "\n");
   return next;
 }
 
@@ -201,20 +202,9 @@ function appendBounded(current: string, chunk: Buffer): string {
 }
 
 async function killHookProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
-  if (!child.pid) return;
-  if (process.platform === "win32") {
-    await new Promise<void>((resolve) => {
-      const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
-      killer.on("error", () => resolve());
-      killer.on("close", () => resolve());
-    });
-    return;
-  }
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    child.kill("SIGKILL");
-  }
+  await terminateChildProcessTree(child, true).catch(() => {
+    try { child.kill("SIGKILL"); } catch {}
+  });
 }
 
 async function executeHook(

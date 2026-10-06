@@ -1,5 +1,6 @@
 import { spawn } from "child_process";
 import { resolveSafeSpawnSpec } from "./safe-spawn.js";
+import { terminateChildProcessTree } from "./process-tree.js";
 
 export type DelegateId = "claude" | "codex" | "grok" | "opencode";
 export type DelegatePromptChannel = "stdin" | "file" | "argv";
@@ -68,12 +69,9 @@ async function runCapture(command: string, args: string[], timeoutMs: number): P
       resolve({ stdout: stdout.trim(), stderr: stderr.trim(), code });
     };
     const timer = setTimeout(() => {
-      if (process.platform === "win32" && child.pid) {
-        const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
-        killer.on("error", () => child.kill());
-      } else {
-        child.kill("SIGKILL");
-      }
+      void terminateChildProcessTree(child, true).catch(() => {
+        try { child.kill("SIGKILL"); } catch {}
+      });
     }, timeoutMs);
     timer.unref?.();
     child.stdout?.on("data", (data: Buffer) => {

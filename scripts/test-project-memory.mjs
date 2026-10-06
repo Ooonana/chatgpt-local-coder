@@ -6,6 +6,10 @@ import {
   buildInstructionContext,
   summarizeInstructionContext,
 } from "../dist/lib/instruction-context.js";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { appendAutoMemory, loadAutoMemory } from "../dist/lib/auto-memory.js";
 
 const workspaceRoot = process.env.WORKSPACE_PATH || process.cwd();
 let passed = 0;
@@ -61,6 +65,32 @@ try {
   console.log("Memory files:", ctx.projectMemory.sections.map((s) => s.path).join(", ") || "(none)");
 } catch (err) {
   fail("buildInstructionContext", err.message || err);
+}
+
+try {
+  const autoHome = await fs.mkdtemp(path.join(os.tmpdir(), "local-coder-auto-memory-"));
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = autoHome;
+  try {
+    const memoryWorkspace = path.join(autoHome, "workspace");
+    await fs.mkdir(memoryWorkspace, { recursive: true });
+    await Promise.all(Array.from({ length: 230 }, (_, index) =>
+      appendAutoMemory(memoryWorkspace, `concurrent-note-${index}`)
+    ));
+    const memory = await loadAutoMemory(memoryWorkspace);
+    if (!memory?.includes("concurrent-note-229")) throw new Error("latest auto-memory note was lost");
+    const noteLines = memory.split(/\r?\n/).filter((line) => line.startsWith("- "));
+    if (noteLines.length > 198) throw new Error(`auto-memory line budget exceeded: ${noteLines.length}`);
+    if (Buffer.byteLength(memory, "utf-8") > 25_000) throw new Error("auto-memory byte budget exceeded");
+    if (noteLines.length !== new Set(noteLines).size) throw new Error("auto-memory contains duplicate/corrupt note lines");
+    ok("concurrent auto-memory appends preserve latest bounded notes");
+  } finally {
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+    await fs.rm(autoHome, { recursive: true, force: true });
+  }
+} catch (err) {
+  fail("auto-memory concurrency", err.message || err);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

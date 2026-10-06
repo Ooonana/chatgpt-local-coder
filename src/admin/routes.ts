@@ -59,6 +59,7 @@ import {
 } from "../lib/activity-log.js";
 import type { SessionRuntimeState } from "../lib/session-context.js";
 import type { TunnelSnapshot } from "../lib/tunnel-supervisor.js";
+import { atomicWriteText } from "../lib/atomic-file.js";
 
 function parseDotEnv(text: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -115,6 +116,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
 }): Router {
   const router = Router();
   const envPath = path.resolve(process.cwd(), ".env");
+  let envMutationQueue: Promise<void> = Promise.resolve();
 
   router.get("/health", async (_req: Request, res: Response) => {
     const upstream = await manager.listStatuses();
@@ -256,15 +258,19 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         res.status(400).json({ ok: false, error: "values object required" });
         return;
       }
-      let original = "";
-      try {
-        original = await fs.readFile(envPath, "utf-8");
-      } catch {}
-      const next = serializeDotEnv(values, original || "");
-      await fs.writeFile(envPath, next, "utf-8");
-      for (const [k, v] of Object.entries(values)) {
-        process.env[k] = v;
-      }
+      const mutation = envMutationQueue.catch(() => undefined).then(async () => {
+        let original = "";
+        try {
+          original = await fs.readFile(envPath, "utf-8");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        const next = serializeDotEnv(values, original);
+        await atomicWriteText(envPath, next);
+        for (const [k, v] of Object.entries(values)) process.env[k] = v;
+      });
+      envMutationQueue = mutation;
+      await mutation;
       res.json({ ok: true, path: envPath });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });

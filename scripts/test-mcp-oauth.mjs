@@ -54,5 +54,15 @@ await test("oauth disconnect removes tokens without client registration", async 
   assert.equal((await a.clientInformation())?.client_id, "client-1");
 });
 
+await test("oauth persistence uses a complete parseable store with no temp residue", async () => {
+  const a = make();
+  await a.beginAuthorization();
+  await a.saveTokens({ access_token: "access-atomic", token_type: "Bearer", refresh_token: "refresh-atomic" });
+  const files = await fs.readdir(dir);
+  assert.equal(files.some((name) => name.endsWith(".tmp")), false);
+  const store = JSON.parse(await fs.readFile(path.join(dir, "test-server.json"), "utf-8"));
+  assert.equal(store.tokens?.access_token, "access-atomic");
+});
+
 await fs.rm(dir, { recursive: true, force: true });
 console.log(`\n${passed} passed, 0 failed`);

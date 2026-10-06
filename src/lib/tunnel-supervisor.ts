@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
+import { atomicWriteText } from "./atomic-file.js";
 
 export type TunnelStatus = "disabled" | "not_configured" | "starting" | "online" | "degraded" | "stopped";
 
@@ -115,7 +116,7 @@ async function writeProfile(root: string, port: number, healthPort: number, tunn
   const profileDir = path.join(root, "profiles");
   const profile = profilePath(root);
   await fs.mkdir(profileDir, { recursive: true });
-  await fs.writeFile(profile, expectedProfileText(port, healthPort, tunnelId), "utf-8");
+  await atomicWriteText(profile, expectedProfileText(port, healthPort, tunnelId));
   return profile;
 }
 

@@ -79,7 +79,13 @@ export class FileOAuthClientProvider implements OAuthClientProvider {
   private async save(): Promise<void> {
     this.store.updatedAt = new Date().toISOString();
     await fs.mkdir(path.dirname(this.storePath), { recursive: true });
-    await fs.writeFile(this.storePath, JSON.stringify(this.store, null, 2), { encoding: "utf-8", mode: 0o600 });
+    const temp = `${this.storePath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+    try {
+      await fs.writeFile(temp, JSON.stringify(this.store, null, 2), { encoding: "utf-8", mode: 0o600 });
+      await fs.rename(temp, this.storePath);
+    } finally {
+      await fs.rm(temp, { force: true }).catch(() => undefined);
+    }
   }
 
   get redirectUrl(): string {
