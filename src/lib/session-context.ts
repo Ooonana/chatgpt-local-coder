@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
+import { isPathInside } from "./path-identity.js";
+import { canonicalizePotentialPath } from "./path-security.js";
 
 export type SessionWorkspaceKind = "unbound" | "project" | "machine";
 export type SessionConnectionState = "initializing" | "connected" | "disconnected" | "closed";
@@ -119,31 +121,26 @@ export function bindCurrentSessionMachine(): SessionRuntimeState | undefined {
   return state;
 }
 
-function normalizedForComparison(value: string): string {
-  const resolved = path.resolve(value);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-}
-
 export function isPathInsideSessionProject(target: string): boolean {
   const state = getCurrentSessionState();
   if (!state || state.workspace_kind !== "project" || !state.project_root) return true;
-  const root = normalizedForComparison(state.project_root);
-  const candidate = normalizedForComparison(target);
-  if (candidate === root) return true;
-  const relative = path.relative(root, candidate);
-  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+  return isPathInside(state.project_root, target);
 }
 
 /**
  * Protect project-bound sessions from silently mutating a different project.
  * Machine/unbound sessions intentionally retain broad host access.
  */
-export function assertCurrentSessionMutationPath(target: string, operation = "mutation"): void {
+export async function assertCurrentSessionMutationPath(target: string, operation = "mutation"): Promise<void> {
   const state = getCurrentSessionState();
   if (!state || state.workspace_kind !== "project" || !state.project_root) return;
-  if (isPathInsideSessionProject(target)) return;
+  const [canonicalRoot, canonicalTarget] = await Promise.all([
+    canonicalizePotentialPath(state.project_root),
+    canonicalizePotentialPath(target),
+  ]);
+  if (isPathInside(canonicalRoot, canonicalTarget)) return;
   throw new Error(
-    `Cross-workspace mutation blocked for ${operation}. This MCP session is bound to '${state.project_alias || state.project_root}' (${state.project_root}), but the target is '${path.resolve(target)}'. Use project_context to explicitly switch projects, or switch to machine context for deliberate host-wide work.`
+    `Cross-workspace mutation blocked for ${operation}. This MCP session is bound to '${state.project_alias || state.project_root}' (${state.project_root}), but the target resolves to '${canonicalTarget}'. Use project_context to explicitly switch projects, or switch to machine context for deliberate host-wide work.`
   );
 }
 

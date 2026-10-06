@@ -47,7 +47,7 @@ function pathWithinRoot(target: string, root: string): boolean {
  * any not-yet-created suffix. This prevents an in-workspace junction from
  * turning a lexically safe path into a write outside the configured roots.
  */
-async function canonicalizePotentialPath(inputPath: string): Promise<string> {
+export async function canonicalizePotentialPath(inputPath: string): Promise<string> {
   let cursor = path.resolve(inputPath);
   const missing: string[] = [];
 

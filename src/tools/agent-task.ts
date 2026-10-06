@@ -21,6 +21,7 @@ import {
   assertCurrentSessionMutationPath,
   getCurrentSessionState,
 } from "../lib/session-context.js";
+import { sameResolvedPath } from "../lib/path-identity.js";
 
 const statusSchema = z.enum(["active", "blocked", "completed", "cancelled", "abandoned", "archived"]);
 const stepStatusSchema = z.enum(["pending", "in_progress", "completed", "blocked", "skipped"]);
@@ -55,7 +56,7 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
       if (action === "list") {
         const resolvedWorkspace = workspace ? await validatePath(workspace) : null;
         const tasks = (await listAgentTasks(status as AgentTaskStatus | undefined))
-          .filter((task) => !resolvedWorkspace || path.resolve(task.workspace) === path.resolve(resolvedWorkspace));
+          .filter((task) => !resolvedWorkspace || sameResolvedPath(task.workspace, resolvedWorkspace));
         return toolResult("agent_task", { action, tasks: tasks.map(taskWithProgress) }, { summary: `${tasks.length} task(s)` });
       }
 
@@ -79,7 +80,7 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
           task = candidates[0] || null;
         }
         if (!task) throw new Error(id ? `Agent task ${id} is not resumable` : "No active or blocked agent task matched the requested workspace");
-        if (resolvedWorkspace && path.resolve(task.workspace) !== path.resolve(resolvedWorkspace)) {
+        if (resolvedWorkspace && !sameResolvedPath(task.workspace, resolvedWorkspace)) {
           throw new Error(`Agent task ${task.id} belongs to ${task.workspace}, not ${resolvedWorkspace}`);
         }
         const progress = getAgentTaskProgress(task);
@@ -100,7 +101,7 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
           : session?.workspace_kind === "project" && session.project_root
             ? session.project_root
             : defaultCwd;
-        assertCurrentSessionMutationPath(resolvedWorkspace, "agent_task start");
+        await assertCurrentSessionMutationPath(resolvedWorkspace, "agent_task start");
         const task = await createAgentTask({ title, objective, workspace: resolvedWorkspace, plan });
         await audit({
           tool: "agent_task",
@@ -143,7 +144,7 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
               : action === "archive"
                 ? "archived"
                 : (status as AgentTaskStatus | undefined);
-      if (action === "archive" && (existing.status === "active" || existing.status === "blocked")) {
+      if (nextStatus === "archived" && (existing.status === "active" || existing.status === "blocked")) {
         throw new Error(`Agent task ${id} is still ${existing.status}; abandon or finish it before archiving.`);
       }
       const task = await updateAgentTask(id, { title, objective, status: nextStatus, plan, note });

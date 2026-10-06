@@ -29,19 +29,25 @@ import { beginToolCall, finishToolCall, type RuntimeToolKind } from "./lib/runti
 import { requireUnsafeRuntimeAllowed } from "./lib/permissions.js";
 import {
   autoCheckpointContextCapsule,
+  getAutoCheckpointContextCapsule,
   getContextCapsuleHeuristicConfig,
-  resumeContextCapsule,
 } from "./lib/context-capsule-store.js";
 import { invalidateTextReadCache } from "./lib/text-read-cache.js";
 import path from "node:path";
 import {
   bindCurrentSessionMachine,
   bindCurrentSessionProject,
+  ensureSessionRuntimeState,
   getCurrentSessionState,
   runWithSessionContext,
 } from "./lib/session-context.js";
 import { detectProjectRoot, isProjectRoot } from "./lib/project-affinity.js";
 import { audit } from "./lib/audit.js";
+import {
+  incrementContextBudgetCycle,
+  recordContextBudgetActivity,
+  resetContextBudgetWindow,
+} from "./lib/context-budget.js";
 
 // OpenAI Secure MCP Tunnel rejects request/response bodies above 10 MiB.
 // Keep a healthy margin for the JSON-RPC/SSE envelope so an oversized tool
@@ -142,9 +148,9 @@ function phaseBoundary(toolName: string, input: unknown): boolean {
   const action = input && typeof input === "object" && typeof (input as Record<string, unknown>).action === "string"
     ? String((input as Record<string, unknown>).action)
     : "";
-  if (toolName === "coding_loop") return ["begin", "verify", "finish", "rollback"].includes(action);
-  if (toolName === "agent_task") return ["start", "step", "update", "finish", "cancel"].includes(action);
-  if (toolName === "edit_transaction") return ["verify", "accept", "rollback"].includes(action);
+  if (toolName === "coding_loop") return ["begin", "verify", "finish", "rollback", "abandon", "archive"].includes(action);
+  if (toolName === "agent_task") return ["start", "step", "update", "finish", "cancel", "abandon", "archive"].includes(action);
+  if (toolName === "edit_transaction") return ["verify", "accept", "rollback", "abandon"].includes(action);
   return toolName === "verify_project" || toolName === "git_commit";
 }
 
@@ -191,7 +197,7 @@ function contextLinks(toolName: string, input: unknown, result: unknown): { work
       : typeof args.task_id === "string"
       ? args.task_id
       : toolName === "agent_task" && typeof args.id === "string"
-        ? (["finish", "cancel"].includes(String(args.action || "")) ? undefined : args.id)
+        ? (["finish", "cancel", "abandon", "archive"].includes(String(args.action || "")) ? undefined : args.id)
         : typeof task?.id === "string" && ["active", "blocked"].includes(String(task.status || ""))
           ? task.id
           : typeof loop?.task_id === "string" && String(loop.status || "") === "active"
@@ -200,7 +206,7 @@ function contextLinks(toolName: string, input: unknown, result: unknown): { work
     coding_loop_id: typeof capsule?.coding_loop_id === "string" && String(capsuleLoop?.status || "") === "active"
       ? capsule.coding_loop_id
       : toolName === "coding_loop" && typeof args.id === "string"
-      ? (["finish", "rollback", "cleanup"].includes(String(args.action || "")) ? undefined : args.id)
+      ? (["finish", "rollback", "abandon", "archive", "cleanup"].includes(String(args.action || "")) ? undefined : args.id)
       : typeof loop?.id === "string" && String(loop.status || "") === "active"
         ? loop.id
         : typeof args.coding_loop_id === "string"
@@ -262,20 +268,17 @@ function terminalContextAction(toolName: string, input: unknown): { task: boolea
     ? String((input as Record<string, unknown>).action)
     : "";
   return {
-    task: toolName === "agent_task" && ["finish", "cancel"].includes(action),
-    loop: toolName === "coding_loop" && ["finish", "rollback", "cleanup"].includes(action),
+    task: toolName === "agent_task" && ["finish", "cancel", "abandon", "archive"].includes(action),
+    loop: toolName === "coding_loop" && ["finish", "rollback", "abandon", "archive", "cleanup"].includes(action),
   };
 }
 
 function configureToolRegistration(server: McpServer, workspaceRoot: string, sessionId: string): void {
   const profile = getChatGptToolProfile();
   const contextHeuristic = getContextCapsuleHeuristicConfig();
-  let toolCallsSinceContextSnapshot = 0;
-  let resultBytesSinceContextSnapshot = 0;
   let contextWorkspaceHint = workspaceRoot;
   let contextTaskHint: string | undefined;
   let contextLoopHint: string | undefined;
-  let contextBudgetCycles = 0;
   const original = server.registerTool.bind(server);
   server.registerTool = ((name, config, callback) => {
     const toolName = String(name);
@@ -339,19 +342,25 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string, ses
             if (links.task_id) contextTaskHint = links.task_id;
             if (links.coding_loop_id) contextLoopHint = links.coding_loop_id;
             if (action === "checkpoint") {
-              toolCallsSinceContextSnapshot = 0;
-              resultBytesSinceContextSnapshot = 0;
+              const sessionState = getCurrentSessionState();
+              const budgetWorkspace = links.workspace ||
+                (sessionState?.workspace_kind === "project" ? sessionState.project_root || undefined : undefined) ||
+                ((contextTaskHint || contextLoopHint) ? contextWorkspaceHint : undefined);
+              if (budgetWorkspace) resetContextBudgetWindow(budgetWorkspace);
             }
           } else {
             const currentLinks = contextLinks(toolName, input, result);
             if (currentLinks.workspace) contextWorkspaceHint = currentLinks.workspace;
             if (currentLinks.task_id) contextTaskHint = currentLinks.task_id;
             if (currentLinks.coding_loop_id) contextLoopHint = currentLinks.coding_loop_id;
-            toolCallsSinceContextSnapshot++;
-            resultBytesSinceContextSnapshot += serializedBytes(result);
-            const budgetDue =
-              toolCallsSinceContextSnapshot >= contextHeuristic.tool_calls ||
-              resultBytesSinceContextSnapshot >= contextHeuristic.result_bytes;
+            const sessionState = getCurrentSessionState();
+            const budgetWorkspace = currentLinks.workspace ||
+              (sessionState?.workspace_kind === "project" ? sessionState.project_root || undefined : undefined) ||
+              ((contextTaskHint || contextLoopHint) ? contextWorkspaceHint : undefined);
+            const budget = budgetWorkspace
+              ? recordContextBudgetActivity(budgetWorkspace, serializedBytes(result), contextHeuristic)
+              : null;
+            const budgetDue = budget?.due ?? false;
             const boundary = phaseBoundary(toolName, input);
             if (budgetDue || boundary) {
               const links = {
@@ -359,23 +368,25 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string, ses
                 coding_loop_id: currentLinks.coding_loop_id || contextLoopHint,
               };
               const reason = budgetDue
-                ? `context budget: ${toolCallsSinceContextSnapshot} tool calls / ${resultBytesSinceContextSnapshot} result bytes`
+                ? `context budget: ${budget?.tool_calls || 0} tool calls / ${budget?.result_bytes || 0} result bytes`
                 : `phase boundary: ${toolName}`;
               let capsule = null;
               let checkpointError: string | undefined;
+              const checkpointWorkspace = currentLinks.workspace || budgetWorkspace || contextWorkspaceHint;
               try {
                 capsule = await autoCheckpointContextCapsule({
-                  workspace: currentLinks.workspace || contextWorkspaceHint,
+                  workspace: checkpointWorkspace,
                   reason,
                   ...links,
                 });
                 // Auto checkpointing deliberately deduplicates identical machine
                 // state. A deduped disk write must still consume the context
                 // budget cycle and emit the semantic checkpoint / rollover hint,
-                // so recover the existing capsule without writing it again.
-                if (!capsule && budgetDue && (links.task_id || links.coding_loop_id)) {
-                  capsule = await resumeContextCapsule({
-                    workspace: currentLinks.workspace || contextWorkspaceHint,
+                // so recover only the exact active task/loop capsule without
+                // invoking manual workspace-level resume ambiguity rules.
+                if (!capsule && budgetDue) {
+                  capsule = await getAutoCheckpointContextCapsule({
+                    workspace: checkpointWorkspace,
                     ...links,
                   });
                 }
@@ -383,10 +394,11 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string, ses
                 checkpointError = error instanceof Error ? error.message : String(error);
               }
               if (capsule) {
-                toolCallsSinceContextSnapshot = 0;
-                resultBytesSinceContextSnapshot = 0;
+                if (budgetWorkspace) resetContextBudgetWindow(budgetWorkspace);
                 if (budgetDue) {
-                  contextBudgetCycles++;
+                  const contextBudgetCycles = budgetWorkspace
+                    ? incrementContextBudgetCycle(budgetWorkspace)
+                    : 1;
                   const rolloverRecommended = contextBudgetCycles >= contextHeuristic.rollover_cycles;
                   result = attachContextCheckpointHint(result, {
                     due: true,
@@ -411,8 +423,9 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string, ses
                 // No active task/loop means there is nothing durable to snapshot.
                 // Start a fresh budget window instead of retrying the same no-op
                 // checkpoint on every later tool call.
-                toolCallsSinceContextSnapshot = 0;
-                resultBytesSinceContextSnapshot = 0;
+                if (budgetWorkspace) resetContextBudgetWindow(budgetWorkspace);
+              } else if (boundary && budgetWorkspace) {
+                resetContextBudgetWindow(budgetWorkspace);
               }
             }
             const terminal = terminalContextAction(toolName, input);
@@ -439,7 +452,7 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string, ses
               workspace_kind: sessionState?.workspace_kind || "unbound",
               ...runtimeDomainOutcome(result),
             },
-          });
+          }).catch(() => undefined);
           return result;
         } catch (error) {
           await runLocalHooks("post_tool_use", {
@@ -485,6 +498,7 @@ export function createMcpServer(
   projectMemoryInstructions?: string,
   sessionId = "legacy"
 ): McpServer {
+  ensureSessionRuntimeState(sessionId, workspaceRoot);
   const server = new McpServer(
     {
       name: "chatgpt-local-coder",

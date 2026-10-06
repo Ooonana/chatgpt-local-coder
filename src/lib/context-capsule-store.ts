@@ -16,6 +16,7 @@ import {
 } from "./coding-loop-store.js";
 import { getEditTransaction } from "./edit-transaction-store.js";
 import { getCurrentSessionId } from "./session-context.js";
+import { sameResolvedPath } from "./path-identity.js";
 
 export type ContextCapsuleCheckpointSource = "manual" | "auto";
 
@@ -284,16 +285,44 @@ async function prune(): Promise<void> {
   }
 }
 
-async function resolveTask(workspace: string, taskId?: string): Promise<AgentTaskRecord | undefined> {
-  if (taskId) return (await getAgentTask(taskId)) || undefined;
-  const tasks = await listAgentTasks();
-  return tasks.find((task) => task.workspace === workspace && (task.status === "active" || task.status === "blocked"));
+async function resolveTask(
+  workspace: string,
+  taskId?: string,
+  loop?: CodingLoopRecord
+): Promise<AgentTaskRecord | undefined> {
+  const effectiveTaskId = taskId || loop?.task_id;
+  if (effectiveTaskId) {
+    const task = await getAgentTask(effectiveTaskId);
+    if (!task) throw new Error(`Unknown agent task id: ${effectiveTaskId}`);
+    const workspaceMatch = sameResolvedPath(task.workspace, workspace);
+    const sourceMatch = Boolean(loop && sameResolvedPath(task.workspace, loop.source_workspace));
+    if (!workspaceMatch && !sourceMatch) {
+      throw new Error(
+        `Agent task ${effectiveTaskId} belongs to '${task.workspace}', not context workspace '${workspace}'.`
+      );
+    }
+    return task;
+  }
+  const candidates = (await listAgentTasks())
+    .filter((task) => sameResolvedPath(task.workspace, workspace))
+    .filter((task) => task.status === "active" || task.status === "blocked");
+  return candidates.length === 1 ? candidates[0] : undefined;
 }
 
 async function resolveLoop(workspace: string, loopId?: string): Promise<CodingLoopRecord | undefined> {
-  if (loopId) return await getCodingLoop(loopId);
-  const loops = await listCodingLoops(100);
-  return loops.find((loop) => loop.source_workspace === workspace && loop.status === "active");
+  if (loopId) {
+    const loop = await getCodingLoop(loopId);
+    if (!sameResolvedPath(loop.workspace, workspace) && !sameResolvedPath(loop.source_workspace, workspace)) {
+      throw new Error(
+        `Coding loop ${loopId} belongs to '${loop.workspace}' (source '${loop.source_workspace}'), not context workspace '${workspace}'.`
+      );
+    }
+    return loop;
+  }
+  const candidates = (await listCodingLoops(100))
+    .filter((loop) => loop.status === "active")
+    .filter((loop) => sameResolvedPath(loop.workspace, workspace) || sameResolvedPath(loop.source_workspace, workspace));
+  return candidates.length === 1 ? candidates[0] : undefined;
 }
 
 async function buildMachineState(
@@ -301,8 +330,11 @@ async function buildMachineState(
   taskId?: string,
   loopId?: string
 ): Promise<{ machine: ContextCapsuleMachineState; task?: AgentTaskRecord; loop?: CodingLoopRecord }> {
-  const loop = await resolveLoop(workspace, loopId).catch(() => undefined);
-  const task = await resolveTask(workspace, taskId || loop?.task_id).catch(() => undefined);
+  const loop = await resolveLoop(workspace, loopId);
+  if (loop && taskId && loop.task_id && loop.task_id !== taskId) {
+    throw new Error(`Agent task ${taskId} is not the task linked to coding loop ${loop.id} (${loop.task_id}).`);
+  }
+  const task = await resolveTask(workspace, taskId, loop);
   const git = await collectGitSnapshot(workspace).catch((): GitSnapshot => ({ is_repo: false }));
   const transaction = loop
     ? await getEditTransaction(loop.transaction_id).catch(() => null)
@@ -368,19 +400,13 @@ function newId(): string {
   return `ctx_${randomUUID().replace(/-/g, "").slice(0, 14)}`;
 }
 
-function sameWorkspace(left: string, right: string): boolean {
-  const a = path.resolve(left);
-  const b = path.resolve(right);
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
-}
-
 function matches(
   record: ContextCapsuleRecord,
   workspace: string,
   taskId?: string,
   loopId?: string
 ): boolean {
-  if (!sameWorkspace(record.workspace, workspace)) return false;
+  if (!sameResolvedPath(record.workspace, workspace)) return false;
   if (loopId) return record.coding_loop_id === loopId;
   if (taskId) return record.task_id === taskId;
   return true;
@@ -394,10 +420,35 @@ function promotableTaskCapsule(
 ): ContextCapsuleRecord | undefined {
   if (!taskId || !loopId) return undefined;
   return records.find((record) =>
-    sameWorkspace(record.workspace, workspace) &&
+    sameResolvedPath(record.workspace, workspace) &&
     record.task_id === taskId &&
     !record.coding_loop_id
   );
+}
+
+async function resolveAutoCheckpointTarget(
+  workspace: string,
+  taskId?: string,
+  loopId?: string
+): Promise<{
+  built: Awaited<ReturnType<typeof buildMachineState>>;
+  taskId?: string;
+  loopId?: string;
+  existing?: ContextCapsuleRecord;
+}> {
+  const built = await buildMachineState(workspace, taskId, loopId);
+  if (!built.task && !built.loop) return { built };
+  const effectiveTaskId = taskId || built.task?.id || built.loop?.task_id;
+  const effectiveLoopId = loopId || built.loop?.id;
+  const all = await readAll();
+  const existing = all.find((record) => matches(record, workspace, effectiveTaskId, effectiveLoopId))
+    || promotableTaskCapsule(all, workspace, effectiveTaskId, effectiveLoopId);
+  return {
+    built,
+    taskId: effectiveTaskId,
+    loopId: effectiveLoopId,
+    existing,
+  };
 }
 
 function machineFingerprint(machine: ContextCapsuleMachineState): string {
@@ -467,11 +518,28 @@ export async function checkpointContextCapsule(input: {
   return mutate(async () => {
     const workspace = path.resolve(input.workspace);
     const all = await readAll();
-    const existing = input.id
-      ? await getContextCapsule(input.id)
-      : all.find((record) => matches(record, workspace, input.task_id, input.coding_loop_id))
-        || promotableTaskCapsule(all, workspace, input.task_id, input.coding_loop_id);
+    let existing = input.id ? await getContextCapsule(input.id) : undefined;
+    if (existing && !sameResolvedPath(existing.workspace, workspace)) {
+      throw new Error(`Context capsule ${existing.id} belongs to a different workspace: ${existing.workspace}`);
+    }
+    if (existing?.task_id && input.task_id && existing.task_id !== input.task_id) {
+      throw new Error(`Context capsule ${existing.id} is already linked to agent task ${existing.task_id}`);
+    }
+    if (existing?.coding_loop_id && input.coding_loop_id && existing.coding_loop_id !== input.coding_loop_id) {
+      throw new Error(`Context capsule ${existing.id} is already linked to coding loop ${existing.coding_loop_id}`);
+    }
     const built = await buildMachineState(workspace, input.task_id || existing?.task_id, input.coding_loop_id || existing?.coding_loop_id);
+    const effectiveTaskId = input.task_id || existing?.task_id || built.task?.id || built.loop?.task_id;
+    const effectiveLoopId = input.coding_loop_id || existing?.coding_loop_id || built.loop?.id;
+    if (!existing) {
+      if (effectiveTaskId || effectiveLoopId) {
+        existing = all.find((record) => matches(record, workspace, effectiveTaskId, effectiveLoopId))
+          || promotableTaskCapsule(all, workspace, effectiveTaskId, effectiveLoopId);
+      } else {
+        const workspaceRecords = all.filter((record) => sameResolvedPath(record.workspace, workspace));
+        if (workspaceRecords.length === 1) existing = workspaceRecords[0];
+      }
+    }
     const createdAt = existing?.created_at || nowIso();
     const mergeSemantic = input.semantic_mode !== "replace";
     const semantic = normalizeSemantic({
@@ -490,8 +558,8 @@ export async function checkpointContextCapsule(input: {
         input.objective || existing?.objective || built.task?.objective || built.loop?.goal || semantic.summary,
         4_000
       ),
-      task_id: input.task_id || existing?.task_id || built.task?.id,
-      coding_loop_id: input.coding_loop_id || existing?.coding_loop_id || built.loop?.id,
+      task_id: effectiveTaskId,
+      coding_loop_id: effectiveLoopId,
       session_id: existing?.session_id || input.session_id || getCurrentSessionId(),
       semantic,
       machine: built.machine,
@@ -516,13 +584,12 @@ export async function autoCheckpointContextCapsule(input: {
 }): Promise<ContextCapsuleRecord | null> {
   return mutate(async () => {
     const workspace = path.resolve(input.workspace);
-    const built = await buildMachineState(workspace, input.task_id, input.coding_loop_id);
+    const target = await resolveAutoCheckpointTarget(workspace, input.task_id, input.coding_loop_id);
+    const { built } = target;
     if (!built.task && !built.loop) return null;
-    const all = await readAll();
-    const taskId = input.task_id || built.task?.id || built.loop?.task_id;
-    const loopId = input.coding_loop_id || built.loop?.id;
-    const existing = all.find((record) => matches(record, workspace, taskId, loopId))
-      || promotableTaskCapsule(all, workspace, taskId, loopId);
+    const taskId = target.taskId;
+    const loopId = target.loopId;
+    const existing = target.existing;
     const fingerprint = machineFingerprint(built.machine);
     const existingFingerprint = existing?.machine_fingerprint || (existing ? machineFingerprint(existing.machine) : null);
     if (existing && existingFingerprint === fingerprint) return null;
@@ -549,6 +616,28 @@ export async function autoCheckpointContextCapsule(input: {
   });
 }
 
+/**
+ * Resolve only the capsule associated with the active durable task/loop state.
+ * Unlike manual resume, this never falls back to a workspace-only capsule and
+ * therefore never becomes ambiguous merely because a project has history from
+ * multiple completed tasks.
+ */
+export async function getAutoCheckpointContextCapsule(input: {
+  workspace: string;
+  task_id?: string;
+  coding_loop_id?: string;
+}): Promise<ContextCapsuleRecord | null> {
+  const workspace = path.resolve(input.workspace);
+  const target = await resolveAutoCheckpointTarget(workspace, input.task_id, input.coding_loop_id);
+  if (!target.existing || (!target.built.task && !target.built.loop)) return null;
+  return fitRecord({
+    ...target.existing,
+    task_id: target.taskId || target.existing.task_id,
+    coding_loop_id: target.loopId || target.existing.coding_loop_id,
+    machine: target.built.machine,
+  });
+}
+
 export async function resumeContextCapsule(input: {
   workspace: string;
   id?: string;
@@ -557,10 +646,35 @@ export async function resumeContextCapsule(input: {
   session_id?: string;
 }): Promise<ContextCapsuleRecord | null> {
   const workspace = path.resolve(input.workspace);
-  const record = input.id
-    ? await getContextCapsule(input.id)
-    : (await readAll()).find((candidate) => matches(candidate, workspace, input.task_id, input.coding_loop_id));
+  const initialBuilt = await buildMachineState(workspace, input.task_id, input.coding_loop_id);
+  const effectiveTaskId = input.task_id || initialBuilt.task?.id || initialBuilt.loop?.task_id;
+  const effectiveLoopId = input.coding_loop_id || initialBuilt.loop?.id;
+  let record: ContextCapsuleRecord | undefined;
+  if (input.id) {
+    record = await getContextCapsule(input.id);
+  } else {
+    const all = await readAll();
+    if (effectiveTaskId || effectiveLoopId) {
+      record = all.find((candidate) => matches(candidate, workspace, effectiveTaskId, effectiveLoopId))
+        || promotableTaskCapsule(all, workspace, effectiveTaskId, effectiveLoopId);
+    } else {
+      const workspaceRecords = all.filter((candidate) => sameResolvedPath(candidate.workspace, workspace));
+      if (workspaceRecords.length > 1) {
+        throw new Error(`Multiple context capsules exist for '${workspace}'. Provide an explicit capsule, task, or coding-loop id.`);
+      }
+      record = workspaceRecords[0];
+    }
+  }
   if (!record) return null;
+  if (!sameResolvedPath(record.workspace, workspace)) {
+    throw new Error(`Context capsule ${record.id} belongs to a different workspace: ${record.workspace}`);
+  }
+  if (record.task_id && input.task_id && record.task_id !== input.task_id) {
+    throw new Error(`Context capsule ${record.id} is linked to agent task ${record.task_id}, not ${input.task_id}`);
+  }
+  if (record.coding_loop_id && input.coding_loop_id && record.coding_loop_id !== input.coding_loop_id) {
+    throw new Error(`Context capsule ${record.id} is linked to coding loop ${record.coding_loop_id}, not ${input.coding_loop_id}`);
+  }
   const built = await buildMachineState(workspace, input.task_id || record.task_id, input.coding_loop_id || record.coding_loop_id);
   return fitRecord({
     ...record,

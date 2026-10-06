@@ -95,8 +95,16 @@ Write-Host "Port: $Port"
 Write-Host "Admin UI: http://127.0.0.1:$AdminPort/ui"
 Write-Host ""
 
-if ($env:OPEN_UI -eq "1" -or $OpenUI) {
-    Start-Process "http://127.0.0.1:$AdminPort/ui"
+# Validate/compile the replacement build before touching a currently healthy
+# Local Coder process. A compile failure must not take the working server down.
+Write-Host "Checking build..." -ForegroundColor Yellow
+$buildArgs = @("scripts/build-if-needed.mjs")
+if ($Rebuild) { $buildArgs += "--force" }
+if ($NoBuild) { $buildArgs += "--skip" }
+& node @buildArgs
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Build failed!" -ForegroundColor Red
+    exit 1
 }
 
 $existingPid = Get-PortOwnerPid -TargetPort $Port
@@ -118,15 +126,8 @@ if ($existingPid) {
     }
 }
 
-Write-Host "Checking build..." -ForegroundColor Yellow
-$buildArgs = @("scripts/build-if-needed.mjs")
-if ($Rebuild) { $buildArgs += "--force" }
-if ($NoBuild) { $buildArgs += "--skip" }
-& node @buildArgs
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Build failed!" -ForegroundColor Red
-    Read-Host "Press Enter to close"
-    exit 1
+if ($env:OPEN_UI -eq "1" -or $OpenUI) {
+    Start-Process "http://127.0.0.1:$AdminPort/ui"
 }
 
 Write-Host "Starting Local Coder dashboard..." -ForegroundColor Green

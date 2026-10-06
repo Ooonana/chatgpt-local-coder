@@ -60,14 +60,12 @@ function tunnelExecutable(root: string): string | null {
   return "tunnel-client";
 }
 
-async function writeProfile(root: string, port: number, healthPort: number, tunnelId: string): Promise<string> {
-  const profileDir = path.join(root, "profiles");
-  const profile = path.join(profileDir, "codex-local.yaml");
+function expectedProfileText(port: number, healthPort: number, tunnelId: string): string {
   const token = (process.env.MCP_TOKEN || "").trim();
   const mcpUrl = token
     ? `http://127.0.0.1:${port}/mcp/${token}`
     : `http://127.0.0.1:${port}/mcp`;
-  const yaml = [
+  return [
     "config_version: 1",
     "control_plane:",
     `  tunnel_id: ${tunnelId}`,
@@ -83,8 +81,26 @@ async function writeProfile(root: string, port: number, healthPort: number, tunn
     `      url: ${mcpUrl}`,
     "",
   ].join("\n");
+}
+
+function profilePath(root: string): string {
+  return path.join(root, "profiles", "codex-local.yaml");
+}
+
+async function profileMatchesExpected(root: string, port: number, healthPort: number, tunnelId: string): Promise<boolean> {
+  try {
+    const actual = await fs.readFile(profilePath(root), "utf8");
+    return actual.replace(/\r\n/g, "\n") === expectedProfileText(port, healthPort, tunnelId);
+  } catch {
+    return false;
+  }
+}
+
+async function writeProfile(root: string, port: number, healthPort: number, tunnelId: string): Promise<string> {
+  const profileDir = path.join(root, "profiles");
+  const profile = profilePath(root);
   await fs.mkdir(profileDir, { recursive: true });
-  await fs.writeFile(profile, yaml, "utf-8");
+  await fs.writeFile(profile, expectedProfileText(port, healthPort, tunnelId), "utf-8");
   return profile;
 }
 
@@ -116,6 +132,7 @@ export function createTunnelSupervisor(options: {
   let reusedExternal = false;
   let lastError: string | null = null;
   let logTail = "";
+  let healthMisses = 0;
 
   const snapshot = (): TunnelSnapshot => ({
     managed,
@@ -137,14 +154,41 @@ export function createTunnelSupervisor(options: {
   const pollHealth = async () => {
     if (stopping || status === "disabled" || status === "not_configured") return;
     if (await ready(healthPort)) {
+      if (!child && !reusedExternal) {
+        if (!(await profileMatchesExpected(root, options.mcpPort, healthPort, tunnelId))) {
+          healthMisses = 0;
+          status = "degraded";
+          lastError = "tunnel health port is ready, but the active profile does not match this Local Coder MCP endpoint";
+          return;
+        }
+        reusedExternal = true;
+      }
+      healthMisses = 0;
       status = "online";
       lastReadyAt = new Date().toISOString();
       restartAttempt = 0;
-    } else if (child && child.exitCode === null) {
-      status = "starting";
-    } else if (!reusedExternal) {
-      status = "degraded";
+      lastError = null;
+      return;
     }
+
+    healthMisses++;
+    if (reusedExternal) {
+      reusedExternal = false;
+      status = "degraded";
+      lastError = "previously reused tunnel health endpoint is no longer ready";
+      scheduleRestart(spawnManaged);
+      return;
+    }
+    if (child && child.exitCode === null) {
+      status = lastReadyAt ? "degraded" : "starting";
+      if (healthMisses >= 3 && lastReadyAt && healthMisses === 3) {
+        lastError = "managed tunnel stopped reporting healthy state; restarting it";
+        try { child.kill("SIGTERM"); } catch {}
+      }
+      return;
+    }
+    status = "degraded";
+    scheduleRestart(spawnManaged);
   };
 
   const scheduleHealth = () => {
@@ -176,6 +220,8 @@ export function createTunnelSupervisor(options: {
     }
     try {
       const profile = await writeProfile(root, options.mcpPort, healthPort, tunnelId);
+      reusedExternal = false;
+      healthMisses = 0;
       status = "starting";
       startedAt = new Date().toISOString();
       lastError = null;
@@ -234,10 +280,17 @@ export function createTunnelSupervisor(options: {
     }
     stopping = false;
     if (await ready(healthPort)) {
-      reusedExternal = true;
-      status = "online";
-      startedAt = new Date().toISOString();
-      lastReadyAt = startedAt;
+      if (await profileMatchesExpected(root, options.mcpPort, healthPort, tunnelId)) {
+        reusedExternal = true;
+        status = "online";
+        startedAt = new Date().toISOString();
+        lastReadyAt = startedAt;
+        lastError = null;
+      } else {
+        reusedExternal = false;
+        status = "degraded";
+        lastError = "tunnel health port is ready, but the active profile does not match this Local Coder MCP endpoint";
+      }
       scheduleHealth();
       return;
     }
@@ -251,6 +304,7 @@ export function createTunnelSupervisor(options: {
     if (healthTimer) clearInterval(healthTimer);
     restartTimer = null;
     healthTimer = null;
+    healthMisses = 0;
     const current = child;
     child = null;
     if (current && current.exitCode === null) {

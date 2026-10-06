@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../dist/server-factory.js";
@@ -22,6 +23,9 @@ process.env.MCP_CONTEXT_CAPSULE_ROLLOVER_CYCLES = "3";
 process.env.PERMISSIONS_CONFIG = path.join(state, "permissions.json");
 process.env.LOCAL_HOOKS_CONFIG = path.join(state, "hooks.json");
 process.env.SUBAGENT_CONFIG = path.join(state, "subagents.json");
+
+const taskStore = await import("../dist/lib/agent-task-store.js");
+const capsuleStore = await import("../dist/lib/context-capsule-store.js");
 
 let passed = 0;
 let failed = 0;
@@ -52,6 +56,7 @@ async function openSession(label, defaultWorkspace = fixture) {
 await fs.rm(tmp, { recursive: true, force: true });
 await fs.mkdir(fixture, { recursive: true });
 await fs.writeFile(path.join(fixture, "note.txt"), "durable context marker\n", "utf-8");
+await fs.writeFile(path.join(fixture, "package.json"), JSON.stringify({ name: "context-capsule-fixture", private: true }), "utf-8");
 
 let session = await openSession("context-capsule-first");
 let taskId;
@@ -124,10 +129,13 @@ await run("new MCP/chat session resumes by id from stored workspace", async () =
 });
 
 await run("tool-budget heuristic emits semantic checkpoint hint", async () => {
-  let fourth;
-  for (let i = 0; i < 4; i++) {
-    fourth = await session.call("read_text_file", { path: path.join(fixture, "note.txt"), head: 10 });
+  for (let i = 0; i < 2; i++) {
+    await session.call("read_text_file", { path: path.join(fixture, "note.txt"), head: 10 });
   }
+  await session.close();
+  session = await openSession("context-budget-new-transport", unrelatedDefault);
+  await session.call("read_text_file", { path: path.join(fixture, "note.txt"), head: 10 });
+  const fourth = await session.call("read_text_file", { path: path.join(fixture, "note.txt"), head: 10 });
   const hint = fourth?.structuredContent?.data?.context_checkpoint_hint;
   if (!hint?.due || !hint?.capsule_id || !String(hint.reason).includes("context budget")) {
     throw new Error(JSON.stringify(fourth));
@@ -212,6 +220,49 @@ await run("corrupt capsule file is isolated instead of poisoning status", async 
 });
 
 await session.close();
+
+await run("automatic budget checkpoint ignores ambiguous completed capsule history", async () => {
+  const historical = path.join(tmp, "historical-capsules");
+  await fs.mkdir(historical, { recursive: true });
+  await fs.writeFile(path.join(historical, "package.json"), JSON.stringify({ name: "historical-capsules", private: true }), "utf-8");
+  await fs.writeFile(path.join(historical, "note.txt"), "history should not break automatic snapshots\n", "utf-8");
+
+  for (let index = 0; index < 2; index++) {
+    const task = await taskStore.createAgentTask({
+      title: `historical task ${index + 1}`,
+      objective: `completed historical task ${index + 1}`,
+      workspace: historical,
+      plan: ["done"],
+    });
+    await capsuleStore.checkpointContextCapsule({
+      workspace: historical,
+      task_id: task.id,
+      summary: `historical capsule ${index + 1}`,
+      semantic_mode: "replace",
+    });
+    await taskStore.updateAgentTask(task.id, { status: "completed" });
+  }
+  const historicalCapsules = (await capsuleStore.listContextCapsules(50))
+    .filter((capsule) => capsule.workspace === path.resolve(historical));
+  if (historicalCapsules.length !== 2) throw new Error(`expected 2 historical capsules, got ${historicalCapsules.length}`);
+  await assert.rejects(
+    () => capsuleStore.resumeContextCapsule({ workspace: historical }),
+    /Multiple context capsules exist/
+  );
+
+  const historicalSession = await openSession("historical-budget-session", historical);
+  try {
+    let last;
+    for (let index = 0; index < 4; index++) {
+      last = await historicalSession.call("read_text_file", { path: path.join(historical, "note.txt"), head: 10 });
+    }
+    const hint = last?.structuredContent?.data?.context_checkpoint_hint;
+    if (hint?.snapshot_failed) throw new Error(`automatic snapshot became ambiguous: ${JSON.stringify(hint)}`);
+  } finally {
+    await historicalSession.close();
+  }
+});
+
 await fs.rm(tmp, { recursive: true, force: true });
 
 console.log(`\n${passed} passed, ${failed} failed`);

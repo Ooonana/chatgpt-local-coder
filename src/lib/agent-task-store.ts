@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { randomUUID } from "node:crypto";
 import { getCurrentSessionId } from "./session-context.js";
+import { sameResolvedPath } from "./path-identity.js";
 
 export type AgentTaskStatus = "active" | "blocked" | "completed" | "cancelled" | "abandoned" | "archived";
 export type AgentTaskStepStatus = "pending" | "in_progress" | "completed" | "blocked" | "skipped";
@@ -214,10 +215,9 @@ export async function getResumableAgentTask(id?: string, workspace?: string): Pr
     return task && (task.status === "active" || task.status === "blocked") ? task : null;
   }
   const tasks = await listAgentTasks();
-  const root = workspace ? path.resolve(workspace) : null;
   return tasks.find((task) =>
     (task.status === "active" || task.status === "blocked") &&
-    (!root || path.resolve(task.workspace) === root)
+    (!workspace || sameResolvedPath(task.workspace, workspace))
   ) ?? null;
 }
 

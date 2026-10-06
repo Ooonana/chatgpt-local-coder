@@ -3,6 +3,7 @@ import path from "path";
 import { createHash, randomUUID } from "crypto";
 import { buildSimpleDiff } from "./patch.js";
 import { getCurrentSessionId } from "./session-context.js";
+import { isPathInside } from "./path-identity.js";
 
 export type EditTransactionStatus = "active" | "accepted" | "rolled_back" | "abandoned";
 
@@ -121,11 +122,6 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function isInside(root: string, target: string): boolean {
-  const rel = path.relative(root, target);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-}
-
 function pathKey(filePath: string): string {
   const resolved = path.resolve(filePath);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
@@ -152,14 +148,14 @@ async function canonicalizePotentialPath(inputPath: string): Promise<string> {
 async function assertTransactionPathInsideWorkspace(workspace: string, filePath: string): Promise<void> {
   const resolvedWorkspace = path.resolve(workspace);
   const resolvedFile = path.resolve(filePath);
-  if (!isInside(resolvedWorkspace, resolvedFile)) {
+  if (!isPathInside(resolvedWorkspace, resolvedFile)) {
     throw new Error(`Transaction path is outside workspace: ${resolvedFile}`);
   }
   const [canonicalWorkspace, canonicalFile] = await Promise.all([
     canonicalizePotentialPath(resolvedWorkspace),
     canonicalizePotentialPath(resolvedFile),
   ]);
-  if (!isInside(canonicalWorkspace, canonicalFile)) {
+  if (!isPathInside(canonicalWorkspace, canonicalFile)) {
     throw new Error(`Transaction path escapes workspace through a symlink/junction: ${resolvedFile} -> ${canonicalFile}`);
   }
 }
@@ -202,20 +198,20 @@ async function readRecord(id: string): Promise<EditTransactionRecord> {
     }
     const workspace = path.resolve(parsed.workspace);
     for (const snapshot of parsed.snapshots) {
-      if (!snapshot || typeof snapshot.path !== "string" || !isInside(workspace, path.resolve(snapshot.path))) {
+      if (!snapshot || typeof snapshot.path !== "string" || !isPathInside(workspace, path.resolve(snapshot.path))) {
         throw new Error(`invalid transaction snapshot path: ${String(snapshot?.path)}`);
       }
       if (snapshot.snapshot_file) {
         const payloadRoot = path.resolve(payloadDir(id));
         const snapshotFile = path.resolve(snapshot.snapshot_file);
-        if (!isInside(payloadRoot, snapshotFile)) {
+        if (!isPathInside(payloadRoot, snapshotFile)) {
           throw new Error(`invalid transaction snapshot payload path: ${snapshot.snapshot_file}`);
         }
         const [canonicalPayloadRoot, canonicalSnapshotFile] = await Promise.all([
           canonicalizePotentialPath(payloadRoot),
           canonicalizePotentialPath(snapshotFile),
         ]);
-        if (!isInside(canonicalPayloadRoot, canonicalSnapshotFile)) {
+        if (!isPathInside(canonicalPayloadRoot, canonicalSnapshotFile)) {
           throw new Error(`transaction snapshot payload escapes payload directory through a symlink/junction: ${snapshot.snapshot_file}`);
         }
       }

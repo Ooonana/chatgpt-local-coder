@@ -14,9 +14,10 @@ import {
   type VerificationCommand,
 } from "../lib/verification.js";
 import { runOneShotCommand } from "./shell.js";
-import { updateAgentTask } from "../lib/agent-task-store.js";
+import { getAgentTask, updateAgentTask } from "../lib/agent-task-store.js";
 import { recordProjectAffinity, resolveProjectReference } from "../lib/project-affinity.js";
 import { getShellStatus } from "../lib/persistent-shell.js";
+import { sameResolvedPath } from "../lib/path-identity.js";
 import {
   hasVerificationCache,
   saveVerificationCache,
@@ -99,6 +100,13 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
       const affinityRoot = await resolveProjectReference(projectPath, getShellStatus().cwd || defaultCwd);
       const root = await validatePath(affinityRoot);
       await recordProjectAffinity(root).catch(() => undefined);
+      if (task_id) {
+        const task = await getAgentTask(task_id);
+        if (!task) throw new Error(`Unknown agent task id: ${task_id}`);
+        if (!sameResolvedPath(task.workspace, root)) {
+          throw new Error(`Agent task ${task_id} belongs to '${task.workspace}', not verification workspace '${root}'.`);
+        }
+      }
       if (preset === "custom" && !commands?.length) throw new Error("commands are required when preset=custom");
       if (preset !== "custom" && commands?.length) throw new Error("commands may only be supplied when preset=custom");
       const safeAffectedFiles = await validateAffectedFiles(root, affected_files);

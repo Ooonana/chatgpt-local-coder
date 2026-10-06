@@ -53,6 +53,7 @@ import {
   assertCurrentSessionMutationPath,
   getCurrentSessionState,
 } from "../lib/session-context.js";
+import { sameResolvedPath } from "../lib/path-identity.js";
 
 const actionSchema = z.enum(["begin", "resume", "refresh", "verify", "finish", "rollback", "abandon", "archive", "cleanup"]);
 const presetSchema = z.enum(["quick", "full", "custom"]);
@@ -520,12 +521,12 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
           session?.workspace_kind === "project" && session.project_root ? session.project_root : defaultCwd;
         const sourceCandidate = await resolveProjectReference(workspace, fallbackWorkspace);
         const sourceWorkspace = await validatePath(sourceCandidate);
-        assertCurrentSessionMutationPath(sourceWorkspace, "coding_loop begin");
+        await assertCurrentSessionMutationPath(sourceWorkspace, "coding_loop begin");
         await recordProjectAffinity(sourceWorkspace).catch(() => undefined);
         if (task_id) {
           const linkedTask = await getAgentTask(task_id);
           if (!linkedTask) throw new Error(`Unknown agent task id: ${task_id}`);
-          if (path.resolve(linkedTask.workspace) !== path.resolve(sourceWorkspace)) {
+          if (!sameResolvedPath(linkedTask.workspace, sourceWorkspace)) {
             throw new Error(`Agent task ${task_id} belongs to ${linkedTask.workspace}, not coding-loop workspace ${sourceWorkspace}`);
           }
         }

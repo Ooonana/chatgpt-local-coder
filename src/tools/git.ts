@@ -92,6 +92,15 @@ async function gitOrThrow(args: string[], cwd: string): Promise<GitRunResult> {
   return result;
 }
 
+function assertSafeGitPositional(value: string | undefined, label: string): void {
+  if (value === undefined) return;
+  if (!value.trim()) throw new Error(`${label} must not be empty`);
+  if (value.startsWith("-")) {
+    throw new Error(`${label} must not start with '-' because Git could interpret it as an option`);
+  }
+  if (/[\r\n\0]/.test(value)) throw new Error(`${label} contains an invalid control character`);
+}
+
 export function registerGitTools(server: McpServer, defaultCwd: string): void {
   const repo = async (p?: string) => {
     const session = getCurrentSessionState();
@@ -103,7 +112,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   };
   const mutableRepo = async (p: string | undefined, operation: string) => {
     const cwd = await repo(p);
-    assertCurrentSessionMutationPath(cwd, operation);
+    await assertCurrentSessionMutationPath(cwd, operation);
     return cwd;
   };
 
@@ -187,6 +196,9 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     }
 
     if (branch && new_branch) throw new Error("Use branch or new_branch, not both");
+    assertSafeGitPositional(branch, "branch");
+    assertSafeGitPositional(new_branch, "new_branch");
+    assertSafeGitPositional(start_point, "start_point");
     const args = ["worktree", "add"];
     if (force) args.push("--force");
     if (new_branch) args.push("-b", new_branch);
@@ -223,7 +235,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     const cwd = await mutableRepo(repoPath, "git_add");
     const args = ["add"];
     if (all && (!files || files.length === 0)) args.push("-A");
-    else if (files?.length) args.push(...files);
+    else if (files?.length) args.push("--", ...files);
     const r = await gitOrThrow(args, cwd);
     return toolResult("git_add", { path: cwd, files: files || ["-A"], output: r.stdout });
   });
@@ -262,6 +274,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     else {
       requireWriteAllowed();
       if (!name) throw new Error("name is required");
+      assertSafeGitPositional(name, "branch name");
       args = action === "create" ? ["branch", name] : action === "switch" ? ["switch", name] : ["switch", "-c", name];
     }
     const r = await gitOrThrow(args, cwd);
@@ -281,6 +294,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   }, async ({ path: repoPath, branch }) => {
     requireWriteAllowed();
     const cwd = await mutableRepo(repoPath, "git_checkout");
+    assertSafeGitPositional(branch, "branch");
     const r = await gitOrThrow(["switch", branch], cwd);
     return toolResult("git_checkout", {
       path: cwd,
@@ -308,6 +322,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   }, async ({ path: repoPath, files, source }) => {
     requireWriteAllowed();
     const cwd = await mutableRepo(repoPath, "git_restore");
+    assertSafeGitPositional(source, "source");
     let r: GitRunResult;
     const restore = await runGit(["restore", "--source", source, "--", ...files], cwd);
     if (restore.exit_code === 0) {
@@ -339,6 +354,8 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   }, async ({ path: repoPath, remote, branch, set_upstream }) => {
     requireWriteAllowed();
     const cwd = await mutableRepo(repoPath, "git_push");
+    assertSafeGitPositional(remote, "remote");
+    assertSafeGitPositional(branch, "branch");
     const args = ["push"];
     if (set_upstream) args.push("-u");
     args.push(remote);
@@ -366,6 +383,8 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   }, async ({ path: repoPath, remote, branch }) => {
     requireWriteAllowed();
     const cwd = await mutableRepo(repoPath, "git_pull");
+    assertSafeGitPositional(remote, "remote");
+    assertSafeGitPositional(branch, "branch");
     const args = ["pull", remote];
     if (branch) args.push(branch);
     const r = await gitOrThrow(args, cwd);
@@ -410,6 +429,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   }, async ({ path: repoPath, mode, ref }) => {
     requireWriteAllowed();
     const cwd = await mutableRepo(repoPath, "git_reset");
+    assertSafeGitPositional(ref, "ref");
     const r = await gitOrThrow(["reset", `--${mode}`, ref], cwd);
     return toolResult("git_reset", { path: cwd, mode, ref, output: r.stdout || r.stderr });
   });

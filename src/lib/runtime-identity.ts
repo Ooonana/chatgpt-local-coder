@@ -21,7 +21,7 @@ export interface RuntimeIdentity {
 
 const RUN_ID = `run_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
 const STARTED_AT = new Date().toISOString();
-export const SCHEMA_CONTRACT_VERSION = 6;
+export const SCHEMA_CONTRACT_VERSION = 7;
 
 function packageVersion(): string {
   try {

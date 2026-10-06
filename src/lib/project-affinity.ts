@@ -7,6 +7,7 @@ import {
   getCurrentSessionId,
   getCurrentSessionState,
 } from "./session-context.js";
+import { sameResolvedPath } from "./path-identity.js";
 
 interface ProjectRegistryEntry {
   root: string;
@@ -56,9 +57,12 @@ function normalizeRemote(raw: string): string {
     const url = new URL(value);
     const host = url.hostname.toLowerCase();
     const pathname = url.pathname.replace(/^\/+|\/+$/g, "");
-    return host + "/" + pathname.toLowerCase();
+    // GitHub repository paths are case-insensitive. Preserve pathname case for
+    // generic/self-hosted Git servers where repository paths may be case-sensitive.
+    const normalizedPathname = host === "github.com" ? pathname.toLowerCase() : pathname;
+    return host + "/" + normalizedPathname;
   } catch {
-    return value.toLowerCase();
+    return value;
   }
 }
 
@@ -76,10 +80,12 @@ async function projectIdentity(root: string): Promise<string | undefined> {
   }
 }
 
-function samePath(left: string, right: string): boolean {
-  const a = path.resolve(left);
-  const b = path.resolve(right);
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+async function pathMissingOnAvailableFilesystem(candidate: string): Promise<boolean> {
+  if (await exists(candidate)) return false;
+  const filesystemRoot = path.parse(path.resolve(candidate)).root;
+  // A temporarily detached/unavailable drive must not make a project look
+  // "moved"; wait until that filesystem is reachable again.
+  return Boolean(filesystemRoot && await exists(filesystemRoot));
 }
 
 function cacheDetection(key: string, root: string): void {
@@ -167,14 +173,24 @@ export async function recordProjectAffinity(inputPath: string): Promise<string> 
   await mutateRegistry(async () => {
     const registry = await readRegistry();
     const now = new Date().toISOString();
+    const exactPath = registry.entries.find((entry) => sameResolvedPath(entry.root, root));
     const identityMatches = identity
       ? registry.entries.filter((entry) => entry.identity === identity)
       : [];
-    const existing = identityMatches[0] || registry.entries.find((entry) => samePath(entry.root, root));
+    const staleIdentityMatches: ProjectRegistryEntry[] = [];
+    if (identity) {
+      for (const entry of identityMatches) {
+        if (sameResolvedPath(entry.root, root)) continue;
+        if (await pathMissingOnAvailableFilesystem(entry.root)) staleIdentityMatches.push(entry);
+      }
+    }
+    // Exact path always wins. Remote identity only reconciles a genuinely stale
+    // path; two live clones of the same remote remain distinct projects.
+    const existing = exactPath || staleIdentityMatches[0];
     if (existing) {
-      if (!samePath(existing.root, root)) {
+      if (!sameResolvedPath(existing.root, root)) {
         existing.previous_roots = [...new Set([...(existing.previous_roots || []), existing.root])]
-          .filter((candidate) => !samePath(candidate, root))
+          .filter((candidate) => !sameResolvedPath(candidate, root))
           .slice(-8);
         existing.root = root;
         existing.alias = aliasFor(root);
@@ -182,15 +198,16 @@ export async function recordProjectAffinity(inputPath: string): Promise<string> 
       if (identity) existing.identity = identity;
       existing.last_used_at = now;
       existing.uses = Math.max(0, existing.uses || 0) + 1;
-      if (identityMatches.length > 1) {
-        const duplicateSet = new Set(identityMatches.slice(1));
-        for (const duplicate of identityMatches.slice(1)) {
+      const staleDuplicates = staleIdentityMatches.filter((entry) => entry !== existing);
+      if (staleDuplicates.length) {
+        const duplicateSet = new Set(staleDuplicates);
+        for (const duplicate of staleDuplicates) {
           existing.uses += Math.max(0, duplicate.uses || 0);
           existing.previous_roots = [...new Set([
             ...(existing.previous_roots || []),
             duplicate.root,
             ...(duplicate.previous_roots || []),
-          ])].filter((candidate) => !samePath(candidate, root)).slice(-8);
+          ])].filter((candidate) => !sameResolvedPath(candidate, root)).slice(-8);
         }
         registry.entries = registry.entries.filter((entry) => !duplicateSet.has(entry));
       }
@@ -234,7 +251,7 @@ export async function getProjectAffinity(fallback?: string): Promise<{
   }
   const registry = await readRegistry();
   const root = (sessionId ? activeRoots.get(sessionId) : undefined) || null;
-  const entry = root ? registry.entries.find((item) => path.resolve(item.root) === path.resolve(root)) : undefined;
+  const entry = root ? registry.entries.find((item) => sameResolvedPath(item.root, root)) : undefined;
   return { active_root: root, active_alias: entry?.alias || (root ? aliasFor(root) : null), recents: registry.entries.slice(0, 12) };
 }
 

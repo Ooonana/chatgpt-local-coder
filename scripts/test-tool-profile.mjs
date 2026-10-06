@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { LOCAL_TOOL_CATALOG, LOCAL_TOOL_COUNT, SLIM_CHATGPT_TOOLS, shouldExposeTool } from "../dist/lib/tool-profile.js";
+import { MCP_QUICKSTART } from "../dist/lib/quickstart.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const toolsDir = path.resolve(here, "../src/tools");
@@ -92,6 +93,18 @@ try {
 
   if (!shouldExposeTool("mcp_call", "full")) throw new Error("full should expose all");
   ok("full profile exposes all");
+
+  if (/persistent shell \(cd persists\)|persistent cwd/i.test(MCP_QUICKSTART)) {
+    throw new Error("quickstart still advertises hidden/persistent cwd semantics");
+  }
+  const optionalMarker = MCP_QUICKSTART.indexOf("Full/optional-profile helpers");
+  const slimCheatSheet = optionalMarker >= 0 ? MCP_QUICKSTART.slice(0, optionalMarker) : MCP_QUICKSTART;
+  for (const hidden of ["delegate_status", "multi_edit", "git_add", "git_restore"]) {
+    if (new RegExp(`\\b${hidden}\\b`).test(slimCheatSheet)) {
+      throw new Error(`quickstart advertises hidden slim tool before optional-profile section: ${hidden}`);
+    }
+  }
+  ok("quickstart matches slim tool routing");
 } catch (e) {
   fail("tool profile", e.message || e);
 }

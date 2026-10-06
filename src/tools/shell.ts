@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import path from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { validatePath } from "../lib/path-security.js";
+import { canonicalizePotentialPath, validatePath } from "../lib/path-security.js";
 import { requireCommandAllowed } from "../lib/permissions.js";
 import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
@@ -33,9 +33,16 @@ import {
   type ParallelCommandSpec,
 } from "../lib/parallel-batch-store.js";
 import { detectProjectRoot, isProjectRoot } from "../lib/project-affinity.js";
+import { isPathInside, sameResolvedPath } from "../lib/path-identity.js";
+import {
+  canonicalProjectRootForPath,
+  resolveWorkspaceScope,
+  sameProjectRoot,
+} from "../lib/workspace-scope.js";
 import { captureWorkingTree, commandMayMutate, compareWorkingTrees } from "../lib/shell-mutation.js";
 import { loadIdempotent, requestFingerprint, saveIdempotent, withIdempotencyKeyLock } from "../lib/idempotency-store.js";
 import { captureTransactionPaths, getEditTransaction, recordTransactionEdit, withEditTransactionLock } from "../lib/edit-transaction-store.js";
+import { listCodingLoops } from "../lib/coding-loop-store.js";
 import {
   getCurrentSessionId,
   getCurrentSessionState,
@@ -118,15 +125,55 @@ export function getManagedProcessSnapshot() {
 }
 
 function sameRoot(left?: string | null, right?: string | null): boolean {
-  if (!left || !right) return left == null && right == null;
-  const a = path.resolve(left);
-  const b = path.resolve(right);
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  return sameProjectRoot(left, right);
 }
 
 async function projectRootForCwd(cwd: string): Promise<string | null> {
-  const root = await detectProjectRoot(cwd).catch(() => cwd);
-  return await isProjectRoot(root).catch(() => false) ? root : null;
+  return await canonicalProjectRootForPath(cwd);
+}
+
+async function resolveProcessWorkspaceScope(workspace?: string): Promise<{ scoped: boolean; projectRoot: string | null }> {
+  return await resolveWorkspaceScope(workspace);
+}
+
+async function assertTaskAllowsWorkingDirectory(taskId: string, cwd: string): Promise<void> {
+  const task = await getAgentTask(taskId);
+  if (!task) throw new Error(`Unknown agent task id: ${taskId}`);
+  const canonicalCwd = await canonicalizePotentialPath(cwd);
+  const canonicalTaskWorkspace = await canonicalizePotentialPath(task.workspace);
+  if (isPathInside(canonicalTaskWorkspace, canonicalCwd)) return;
+  const linkedLoops = (await listCodingLoops(100))
+    .filter((loop) => loop.task_id === taskId && loop.status === "active");
+  for (const loop of linkedLoops) {
+    const canonicalLoopWorkspace = await canonicalizePotentialPath(loop.workspace);
+    if (isPathInside(canonicalLoopWorkspace, canonicalCwd)) return;
+  }
+  throw new Error(
+    `Background process working directory '${cwd}' is outside agent task ${taskId} workspace '${task.workspace}'.`
+  );
+}
+
+async function assertProcessControlScope(item: ManagedProcess, workspace?: string): Promise<void> {
+  const scope = await resolveProcessWorkspaceScope(workspace);
+  if (!item.projectRoot) {
+    if (!scope.scoped) {
+      throw new Error(`workspace is required to control machine/host process ${item.id} from an unbound MCP transport.`);
+    }
+    if (scope.projectRoot) {
+      throw new Error(`Process ${item.id} belongs to machine/host work, not project '${scope.projectRoot}'.`);
+    }
+    return;
+  }
+  if (!scope.scoped || !scope.projectRoot) {
+    throw new Error(
+      `workspace is required to control project process ${item.id} (${item.projectRoot}) from an unbound MCP transport.`
+    );
+  }
+  if (!sameRoot(item.projectRoot, scope.projectRoot)) {
+    throw new Error(
+      `Process ${item.id} belongs to project '${item.projectRoot}', not requested workspace '${scope.projectRoot}'.`
+    );
+  }
 }
 
 function getShellInvocation(command: string): { shell: string; args: string[]; effectiveCommand: string } {
@@ -144,6 +191,76 @@ function getShellInvocation(command: string): { shell: string; args: string[]; e
   return { shell, args, effectiveCommand };
 }
 
+async function windowsDescendantPids(rootPid: number): Promise<number[]> {
+  const shellInfo = getWinShell();
+  const script = [
+    `$rootPid = ${rootPid}`,
+    "$all = Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId",
+    "$pending = @($rootPid)",
+    "$found = @()",
+    "while ($pending.Count -gt 0) {",
+    "  $parent = $pending[0]",
+    "  if ($pending.Count -eq 1) { $pending = @() } else { $pending = @($pending[1..($pending.Count-1)]) }",
+    "  $children = @($all | Where-Object { $_.ParentProcessId -eq $parent } | ForEach-Object { [int]$_.ProcessId })",
+    "  foreach ($childPid in $children) {",
+    "    if ($found -notcontains $childPid) { $found += $childPid; $pending += $childPid }",
+    "  }",
+    "}",
+    "$found | ConvertTo-Json -Compress",
+  ].join("; ");
+  return await new Promise<number[]>((resolve) => {
+    const probe = spawn(shellInfo.shell, ["-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    probe.stdout.on("data", (data: Buffer) => { stdout += data.toString(); });
+    probe.on("error", () => resolve([]));
+    probe.on("close", (code) => {
+      if (code !== 0 || !stdout.trim()) {
+        resolve([]);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout.trim());
+        const values = Array.isArray(parsed) ? parsed : [parsed];
+        resolve(values.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0));
+      } catch {
+        resolve([]);
+      }
+    });
+  });
+}
+
+async function taskkillPid(pid: number, force: boolean, tree: boolean, tolerateMissing = false): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const args = ["/PID", String(pid)];
+    if (tree) args.push("/T");
+    if (force) args.push("/F");
+    const killer = spawn("taskkill.exe", args, { windowsHide: true });
+    let stderr = "";
+    killer.stderr.on("data", (data: Buffer) => {
+      stderr += data.toString();
+    });
+    killer.on("error", reject);
+    killer.on("close", (code) => {
+      if (code === 0 || (tolerateMissing && !osProcessAlive(pid))) resolve();
+      else reject(new Error(`taskkill failed for PID ${pid} with exit ${code}: ${stderr.trim()}`));
+    });
+  });
+}
+
+async function waitForOsPidsExit(pids: number[], timeoutMs: number): Promise<number[]> {
+  const unique = [...new Set(pids.filter((pid) => pid > 0))];
+  const deadline = Date.now() + timeoutMs;
+  let alive = unique.filter(osProcessAlive);
+  while (alive.length && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    alive = unique.filter(osProcessAlive);
+  }
+  return alive;
+}
+
 async function killChildProcessTree(child: ChildProcessWithoutNullStreams, force: boolean): Promise<void> {
   if (process.platform !== "win32" && child.pid) {
     try {
@@ -156,20 +273,21 @@ async function killChildProcessTree(child: ChildProcessWithoutNullStreams, force
     return;
   }
 
-  await new Promise<void>((resolve, reject) => {
-    const args = ["/PID", String(child.pid), "/T"];
-    if (force) args.push("/F");
-    const killer = spawn("taskkill.exe", args, { windowsHide: true });
-    let stderr = "";
-    killer.stderr.on("data", (data: Buffer) => {
-      stderr += data.toString();
-    });
-    killer.on("error", reject);
-    killer.on("close", (code) => {
-      if (code === 0 || child.exitCode !== null) resolve();
-      else reject(new Error(`taskkill failed with exit ${code}: ${stderr.trim()}`));
-    });
-  });
+  const rootPid = child.pid;
+  const descendants = force ? await windowsDescendantPids(rootPid) : [];
+  await taskkillPid(rootPid, force, true, child.exitCode !== null);
+  if (!force) return;
+
+  // taskkill /T can miss a descendant that reparents while the root shell is
+  // being terminated. Kill the pre-snapshotted descendants individually too.
+  for (const pid of descendants.reverse()) {
+    if (!osProcessAlive(pid)) continue;
+    await taskkillPid(pid, true, true, true).catch(() => undefined);
+  }
+  const survivors = await waitForOsPidsExit([rootPid, ...descendants], 3_000);
+  if (survivors.length) {
+    throw new Error(`Forced termination left process(es) alive: ${survivors.join(", ")}`);
+  }
 }
 
 export async function runOneShotCommand(
@@ -247,6 +365,17 @@ function processRunning(item: ManagedProcess): boolean {
   return item.exitCode === null && item.signal === null && !item.spawnError;
 }
 
+function osProcessAlive(pid: number | undefined): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "EPERM";
+  }
+}
+
 async function waitForProcessCondition(
   item: ManagedProcess,
   options: { waitFor: "exit" | "text"; waitText?: string; timeoutMs: number }
@@ -317,12 +446,30 @@ async function terminateProcessTree(item: ManagedProcess, force: boolean): Promi
 async function waitForManagedProcessExit(item: ManagedProcess, timeoutMs = 2_000): Promise<void> {
   if (item.exitCode !== null || item.signal !== null || item.spawnError) return;
   await new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, timeoutMs);
-    timer.unref?.();
-    item.child.once("close", () => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      clearInterval(pidPoll);
+      item.child.off("close", finish);
       resolve();
-    });
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    timer.unref?.();
+    const pidPoll = setInterval(() => {
+      if (!item.stopRequested || osProcessAlive(item.child.pid)) return;
+      // Windows can report a successful taskkill before Node observes close.
+      // Reconcile managed state from the OS PID instead of reporting a dead
+      // process as still running while stdio cleanup is delayed.
+      if (item.exitCode === null && item.signal === null) item.exitCode = item.child.exitCode ?? 1;
+      item.child.stdin.destroy();
+      item.child.stdout.destroy();
+      item.child.stderr.destroy();
+      finish();
+    }, 100);
+    pidPoll.unref?.();
+    item.child.once("close", finish);
   });
 }
 
@@ -346,7 +493,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         "Run a short bounded shell command in this MCP session's cwd. For long work use start_process + process_status/process_output; do not build Start-Sleep polling loops. success_exit_codes marks expected domain exits as successful.",
       inputSchema: {
         command: z.string().max(MAX_COMMAND_CHARS),
-        working_directory: z.string().optional().describe("One-off override; does not reset persistent cwd unless you use shell_reset"),
+        working_directory: z.string().optional().describe("One-off override for this command; fresh ChatGPT MCP transports do not inherit hidden cwd"),
         timeout_seconds: z.number().int().positive().max(3600).optional()
           .describe("Per-call timeout in seconds. Defaults to SHELL_TIMEOUT (300s by default). Use start_process for continuous jobs."),
         success_exit_codes: z.array(z.number().int()).min(1).max(16).optional().default([0]),
@@ -372,7 +519,16 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         const beforeTree = shouldTrack ? await captureWorkingTree(policyCwd) : undefined;
         if (transaction_id) {
           if (!txPaths.length) throw new Error("mutation_paths is required when run_command uses transaction_id");
-          await getEditTransaction(transaction_id);
+          const transaction = await getEditTransaction(transaction_id);
+          const [canonicalTransactionWorkspace, canonicalPolicyCwd] = await Promise.all([
+            canonicalizePotentialPath(transaction.workspace),
+            canonicalizePotentialPath(policyCwd),
+          ]);
+          if (!isPathInside(canonicalTransactionWorkspace, canonicalPolicyCwd)) {
+            throw new Error(
+              `run_command cwd '${policyCwd}' is outside edit transaction ${transaction_id} workspace '${transaction.workspace}'.`
+            );
+          }
           await captureTransactionPaths(transaction_id, txPaths);
         }
         const rawResult = await execInShellSession(command, defaultCwd, (timeout_seconds ?? timeoutSec) * 1000, cwdOverride);
@@ -653,8 +809,9 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       const duplicate = [...processes.values()].find((item) =>
         processRunning(item) &&
         sameRoot(item.projectRoot, projectRoot) &&
-        path.resolve(item.cwd) === path.resolve(cwd) &&
-        item.command.trim() === command.trim()
+        sameResolvedPath(item.cwd, cwd) &&
+        item.command.trim() === command.trim() &&
+        item.taskId === task_id
       );
       if (duplicate) {
         return toolResult("start_process", {
@@ -672,8 +829,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         }, { summary: `reused running ${duplicate.label || duplicate.id}` });
       }
       if (task_id) {
-        const task = await getAgentTask(task_id);
-        if (!task) throw new Error(`Unknown agent task id: ${task_id}`);
+        await assertTaskAllowsWorkingDirectory(task_id, cwd);
       }
       const { shell, args } = getShellInvocation(command);
 
@@ -752,10 +908,10 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       child.on("close", (code, signal) => {
         item.exitCode = code ?? item.exitCode ?? (item.spawnError ? 1 : null);
         item.signal = signal;
-        const status = item.spawnError || (item.exitCode !== null && item.exitCode !== 0)
-          ? "failed"
-          : item.stopRequested || signal
-            ? "stopped"
+        const status = item.stopRequested || signal
+          ? "stopped"
+          : item.spawnError || (item.exitCode !== null && item.exitCode !== 0)
+            ? "failed"
             : "completed";
         item.historyWrite = (async () => {
           // A very fast process can exit before the durable start record has
@@ -798,22 +954,28 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       description: "Show background process status; optionally wait for one process to exit without polling.",
       inputSchema: {
         id: z.string().optional(),
+        workspace: z.string().optional().describe("Optional project/machine scope filter; a bound transport is filtered automatically"),
         wait_for: z.enum(["none", "exit"]).optional().default("none"),
         wait_seconds: z.number().int().min(0).max(60).optional().default(30),
       },
 
       annotations: toolAnnotations("read"),
     },
-    async ({ id, wait_for, wait_seconds }) => {
+    async ({ id, workspace, wait_for, wait_seconds }) => {
+      const scope = await resolveProcessWorkspaceScope(workspace);
       let wait: { condition_met: boolean; timed_out: boolean; waited_ms: number } | undefined;
       if (wait_for === "exit") {
         if (!id) throw new Error("id is required when wait_for=exit");
         const item = processes.get(id);
         if (!item) throw new Error(`Unknown process id: ${id}`);
+        if (scope.scoped && !sameRoot(item.projectRoot, scope.projectRoot)) {
+          throw new Error(`Process ${id} is outside the requested workspace scope.`);
+        }
         wait = await waitForProcessCondition(item, { waitFor: "exit", timeoutMs: wait_seconds * 1000 });
       }
       const processes_list = [...processes.values()]
         .filter((p) => !id || p.id === id)
+        .filter((p) => !scope.scoped || sameRoot(p.projectRoot, scope.projectRoot))
         .map((p) => ({
           id: p.id,
           label: p.label,
@@ -852,13 +1014,18 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       inputSchema: {
         id: z.string().optional(),
         task_id: z.string().optional(),
+        workspace: z.string().optional().describe("Optional project/machine scope filter; a bound transport is filtered automatically"),
         limit: z.number().int().positive().max(200).optional().default(50),
       },
       annotations: toolAnnotations("read"),
     },
-    async ({ id, task_id, limit }) => {
+    async ({ id, task_id, workspace, limit }) => {
+      const scope = await resolveProcessWorkspaceScope(workspace);
       if (id) {
         const live = processes.get(id);
+        if (live && scope.scoped && !sameRoot(live.projectRoot, scope.projectRoot)) {
+          throw new Error(`Process ${id} is outside the requested workspace scope.`);
+        }
         if (live?.historyWrite) await live.historyWrite;
         if (live?.historyError) throw new Error(`Operation history persistence failed: ${live.historyError}`);
       } else {
@@ -872,9 +1039,17 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       if (id) {
         const operation = await getOperationRecord(id, activeIds);
         if (!operation) throw new Error(`Unknown operation id: ${id}`);
+        if (scope.scoped && !sameRoot(operation.project_root, scope.projectRoot)) {
+          throw new Error(`Operation ${id} is outside the requested workspace scope.`);
+        }
         return toolResult("process_history", { operation }, { summary: `${operation.label || operation.id} — ${operation.effective_status}` });
       }
-      const operations = await listOperationHistory({ limit, task_id, active_ids: activeIds });
+      const operations = await listOperationHistory({
+        limit,
+        task_id,
+        ...(scope.scoped ? { project_root: scope.projectRoot } : {}),
+        active_ids: activeIds,
+      });
       return toolResult("process_history", { operations, count: operations.length }, { summary: `${operations.length} operation(s)` });
     }
   );
@@ -887,6 +1062,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       inputSchema: {
         id: z.string().optional(),
         result_handle: z.string().optional(),
+        workspace: z.string().optional().describe("Optional project/machine scope check for process-id reads"),
         tail_chars: z.number().int().positive().max(200000).optional().default(40000),
         offset: z.number().int().nonnegative().optional().default(0),
         limit: z.number().int().positive().max(200000).optional().default(40000),
@@ -897,7 +1073,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
 
       annotations: toolAnnotations("read"),
     },
-    async ({ id, result_handle, tail_chars, offset, limit, wait_for, wait_text, wait_seconds }) => {
+    async ({ id, result_handle, workspace, tail_chars, offset, limit, wait_for, wait_text, wait_seconds }) => {
       if (result_handle) {
         if (id) throw new Error("Provide either id or result_handle, not both");
         const stored = await readTextResult(result_handle, offset, limit);
@@ -906,6 +1082,10 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       if (!id) throw new Error("id or result_handle is required");
       const item = processes.get(id);
       if (!item) throw new Error(`Unknown process id: ${id}`);
+      const scope = await resolveProcessWorkspaceScope(workspace);
+      if (scope.scoped && !sameRoot(item.projectRoot, scope.projectRoot)) {
+        throw new Error(`Process ${id} is outside the requested workspace scope.`);
+      }
       if (wait_for === "text" && !wait_text) throw new Error("wait_text is required when wait_for=text");
       let wait: { condition_met: boolean; timed_out: boolean; waited_ms: number } | undefined;
       if (wait_for !== "none") {
@@ -951,15 +1131,17 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         "Send text to stdin of a running background process. Useful for prompts, REPLs, and dev tools that wait for input. This is piped stdin, not a full PTY.",
       inputSchema: {
         id: z.string(),
+        workspace: z.string().optional().describe("Required for project processes when this MCP transport is not already bound to that project"),
         input: z.string().max(MAX_PROCESS_INPUT_CHARS),
         append_newline: z.boolean().optional().default(true),
         close_stdin: z.boolean().optional().default(false),
       },
       annotations: toolAnnotations("command"),
     },
-    async ({ id, input, append_newline, close_stdin }) => {
+    async ({ id, workspace, input, append_newline, close_stdin }) => {
       const item = processes.get(id);
       if (!item) throw new Error(`Unknown process id: ${id}`);
+      await assertProcessControlScope(item, workspace);
       if (item.exitCode !== null || item.signal !== null) {
         throw new Error(`Process ${id} has already exited`);
       }
@@ -994,20 +1176,54 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     {
       title: "Stop Process",
       description: "Stop a background process by id.",
-      inputSchema: { id: z.string(), force: z.boolean().optional().default(false) },
+      inputSchema: {
+        id: z.string(),
+        workspace: z.string().optional().describe("Required for project processes when this MCP transport is not already bound to that project"),
+        force: z.boolean().optional().default(false),
+      },
 
       annotations: toolAnnotations("edit"),
     },
-    async ({ id, force }) => {
+    async ({ id, workspace, force }) => {
       const item = processes.get(id);
       if (!item) throw new Error(`Unknown process id: ${id}`);
+      await assertProcessControlScope(item, workspace);
       if (item.exitCode !== null || item.signal !== null) {
         return toolResult("stop_process", { id, already_exited: true }, { summary: `${id} already exited` });
       }
       item.stopRequested = true;
       await terminateProcessTree(item, force);
+      await waitForManagedProcessExit(item, force ? 3_000 : 1_500);
+      const stillRunning = processRunning(item);
+      if (force && stillRunning) {
+        throw new Error(`Process ${id} did not exit after forced termination`);
+      }
+      if (!stillRunning && !item.historyWrite) {
+        item.historyWrite = (async () => {
+          await item.startWrite;
+          await recordOperationFinish(item.id, {
+            status: "stopped",
+            finished_at: new Date().toISOString(),
+            exit_code: item.exitCode,
+            signal: item.signal,
+            spawn_error: item.spawnError,
+            stdout_tail: item.stdout.join(""),
+            stderr_tail: item.stderr.join(""),
+            last_progress_at: item.lastActivityAt,
+          });
+        })().catch((error) => {
+          item.historyError = error instanceof Error ? error.message : String(error);
+        });
+        await item.historyWrite;
+      }
       await audit({ tool: "stop_process", action: "stop", target: item.cwd, status: "ok", details: { id, force } });
-      return toolResult("stop_process", { id, force }, { summary: `stop sent to ${id}` });
+      return toolResult("stop_process", {
+        id,
+        force,
+        running: stillRunning,
+        exit_code: item.exitCode,
+        signal: item.signal,
+      }, { summary: stillRunning ? `stop requested for ${id}` : `stopped ${id}` });
     }
   );
 

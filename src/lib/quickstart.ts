@@ -3,7 +3,7 @@ import { describePermissionProfile } from "./permissions.js";
 export const MCP_QUICKSTART = `
 ## Tool workflow (when agent_status is called)
 1. Project memory + git state are already in MCP instructions from WORKSPACE_PATH.
-2. Call project_context(path) only for a different repo than WORKSPACE_PATH.
+2. Call project_context(path) to load another repo's instructions/context, but keep passing explicit path/workspace/working_directory on later calls because ChatGPT may use a fresh MCP transport.
 3. Explore with inspect_project first, then repo_intel for symbol/reference/impact questions; use glob/grep/read_files/read_text_file for lower-level inspection.
 4. For substantial implementation/fix/refactor work, create/resume agent_task and begin coding_loop. Use the returned transaction_id on supported edits, verify through coding_loop, repair in the same transaction, then finish or rollback. For small atomic edits, use edit_transaction directly.
 5. Run builds/tests with coding_loop/verify_project when appropriate, run_command for short commands, run_commands_parallel for independent commands, or start_process + process_status/process_output for long jobs. Use pty for truly interactive terminal programs.
@@ -23,19 +23,17 @@ All tools return JSON: { ok, tool, summary, data }
 - glob / grep / read_files / read_text_file: lower-level exploration (keep large results bounded)
 - apply_patch: preferred patch editor; single-file @@ hunks OR multi-file *** Begin Patch format; pass transaction_id when a coding loop/transaction is active
 - verify_project: discover/run bounded repository verification recipes
-- run_command: persistent shell (cd persists); shell_status / shell_reset
-- run_commands_parallel: run independent commands concurrently without mutating persistent cwd
+- run_command: short bounded shell command; pass working_directory for project work because ChatGPT transports do not share hidden cwd by default
+- run_commands_parallel: run independent commands concurrently without mutating transport-local cwd
 - start_process / process_status / process_output / process_input / stop_process: background process lifecycle
 - pty: real PTY/ConPTY for TUIs, debuggers, interactive installers, and terminal-native CLIs
-- lsp: semantic hover/definition/references/symbols/diagnostics; TypeScript/JS + Python bundled
 - view_image: return an arbitrary local image path as MCP image content for host visual analysis
 - subagent: manage a separately configured model-capable runner; it does not reuse the parent ChatGPT subscription
-- delegate_status: detect supported Claude/Codex/Grok/OpenCode CLIs without starting them
-- git_status / git_diff / git_worktree / git_add / git_commit / git_restore
+- git_status / git_diff / git_worktree / git_commit
 - rewind: action=list|preview|restore|status — undo file edits via automatic checkpoints
 - enabled upstream MCP tools are exposed directly as <server>__<tool> (for example chrome-devtools__list_pages, linear__get_user); prefer direct tools
 - mcp_servers: upstream status. mcp_tools / mcp_call are low-level full-profile diagnostics/fallbacks
-- Full/optional-profile helpers not normally advertised in slim include raw binary I/O, search_files/list_allowed_directories, delete_directory, git_checkout/git_push/git_pull/git_reset, and mcp_tools/mcp_call
+- Full/optional-profile helpers not normally advertised in slim include raw lsp, delegate_status, multi_edit, git_add/git_restore, raw binary I/O, search_files/list_allowed_directories, delete_directory, git_checkout/git_push/git_pull/git_reset, and mcp_tools/mcp_call
 - If a helper is hidden by the active profile, use an appropriate run_command equivalent or enable it in Admin UI, then open a new MCP chat
 
 ## apply_patch — single file

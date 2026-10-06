@@ -1,4 +1,3 @@
-import { spawn } from "child_process";
 import { z } from "zod";
 import * as pty from "node-pty";
 import type { IPty } from "node-pty";
@@ -9,11 +8,14 @@ import { getShellStatus, getWinShell } from "../lib/persistent-shell.js";
 import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
+import { canonicalProjectRootForPath, resolveWorkspaceScope, sameProjectRoot } from "../lib/workspace-scope.js";
+import { terminateWindowsProcessTree } from "../lib/process-tree.js";
 
 interface ManagedPty {
   id: string;
   command?: string;
   cwd: string;
+  projectRoot?: string | null;
   startedAt: string;
   terminal: IPty;
   output: string[];
@@ -22,6 +24,19 @@ interface ManagedPty {
   signal: number | null;
   cols: number;
   rows: number;
+}
+
+interface WindowsPtyAgentInternals {
+  _inSocket?: { readable: boolean; destroy(): void };
+  _outSocket?: { readable: boolean; destroy(): void };
+  _conoutSocketWorker?: { dispose(): void };
+  _ptyNative?: { kill(ptyId: number, useConptyDll: boolean): void };
+  _pty?: number;
+  _useConptyDll?: boolean;
+}
+
+interface WindowsPtyInternals extends IPty {
+  _agent?: WindowsPtyAgentInternals;
 }
 
 const terminals = new Map<string, ManagedPty>();
@@ -91,6 +106,7 @@ function statusOf(item: ManagedPty) {
     pid: item.terminal.pid,
     command: item.command ?? null,
     cwd: item.cwd,
+    project_root: item.projectRoot ?? null,
     started_at: item.startedAt,
     running: item.exitCode === null,
     exit_code: item.exitCode,
@@ -116,28 +132,35 @@ async function terminatePty(item: ManagedPty): Promise<void> {
   // delaying descendant cleanup. Kill the shell tree ourselves on Windows and
   // let ConPTY observe the process exit instead of entering that buggy path.
   if (process.platform === "win32" && item.terminal.pid) {
-    const outcome = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-      const child = spawn(
-        "taskkill.exe",
-        ["/PID", String(item.terminal.pid), "/T", "/F"],
-        { windowsHide: true }
-      );
-      let stderr = "";
-      child.stderr.on("data", (data: Buffer) => (stderr += data.toString()));
-      child.on("error", (error) => resolve({ code: null, stderr: error.message }));
-      child.on("close", (code) => resolve({ code, stderr: stderr.trim() }));
-    });
-    if (outcome.code === 0 || item.exitCode !== null) return;
-
-    // The shell can exit naturally between the last status check and taskkill.
-    // Avoid falling back to node-pty.kill() on Windows because that is exactly
-    // the ConPTY path with the AttachConsole race described above.
-    try {
-      process.kill(item.terminal.pid, 0);
-    } catch {
-      return;
+    await terminateWindowsProcessTree(item.terminal.pid, true);
+    // node-pty's public Windows kill() first calls _getConsoleProcessList(),
+    // which uses AttachConsole and can race after the shell has already died.
+    // We have already terminated the real process tree, so close only the
+    // remaining ConPTY resources directly: pseudo-console handle, pipes, and
+    // conout worker. This also handles silent PTYs that never become "ready"
+    // and therefore never execute node-pty's deferred kill().
+    const agent = (item.terminal as WindowsPtyInternals)._agent;
+    if (agent) {
+      try {
+        if (agent._inSocket) {
+          agent._inSocket.readable = false;
+        }
+      } catch {}
+      try {
+        if (agent._outSocket) {
+          agent._outSocket.readable = false;
+        }
+      } catch {}
+      try {
+        if (agent._ptyNative && typeof agent._pty === "number") {
+          agent._ptyNative.kill(agent._pty, Boolean(agent._useConptyDll));
+        }
+      } catch {}
+      try {
+        agent._conoutSocketWorker?.dispose();
+      } catch {}
     }
-    throw new Error(`taskkill failed for PTY ${item.id}: ${outcome.stderr || `exit ${outcome.code}`}`);
+    return;
   }
 
   item.terminal.kill();
@@ -188,6 +211,7 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
         id: z.string().optional(),
         command: z.string().max(500_000).optional(),
         working_directory: z.string().optional(),
+        workspace: z.string().optional().describe("Project/machine scope for list/read/control after transport recreation"),
         input: z.string().max(MAX_INPUT_CHARS).optional(),
         append_newline: z.boolean().optional().default(true),
         cols: z.number().int().min(20).max(500).optional().default(120),
@@ -199,15 +223,19 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
       },
       annotations: toolAnnotations("command"),
     },
-    async ({ action, id, command, working_directory, input, append_newline, cols, rows, tail_chars, strip_ansi, wait_ms, wait_for }) => {
+    async ({ action, id, command, working_directory, workspace, input, append_newline, cols, rows, tail_chars, strip_ansi, wait_ms, wait_for }) => {
+      const scope = action === "start" ? null : await resolveWorkspaceScope(workspace);
       if (action === "list") {
-        const list = [...terminals.values()].map(statusOf);
+        const list = [...terminals.values()]
+          .filter((item) => !scope?.scoped || sameProjectRoot(item.projectRoot, scope.projectRoot))
+          .map(statusOf);
         return toolResult("pty", { action, terminals: list }, { summary: `${list.length} PTY session(s)` });
       }
 
       if (action === "clear") {
         let cleared = 0;
         for (const [terminalId, item] of terminals) {
+          if (scope?.scoped && !sameProjectRoot(item.projectRoot, scope.projectRoot)) continue;
           if (item.exitCode !== null) {
             terminals.delete(terminalId);
             cleared++;
@@ -221,6 +249,7 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
         const cwd = working_directory
           ? await validatePath(working_directory)
           : getShellStatus().cwd || defaultCwd;
+        const projectRoot = await canonicalProjectRootForPath(cwd);
         if (command) requireCommandAllowed(command, cwd);
         const spec = shellSpec(command);
         const terminal = pty.spawn(spec.file, spec.args, {
@@ -236,6 +265,7 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
           id: terminalId,
           command,
           cwd,
+          projectRoot,
           startedAt: new Date().toISOString(),
           terminal,
           output: [],
@@ -265,6 +295,9 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
       if (!id) throw new Error(`id is required for PTY action '${action}'`);
       const item = terminals.get(id);
       if (!item) throw new Error(`Unknown PTY id: ${id}`);
+      if (scope?.scoped && !sameProjectRoot(item.projectRoot, scope.projectRoot)) {
+        throw new Error(`PTY ${id} is outside the requested workspace scope.`);
+      }
 
       if (action === "status") {
         return toolResult("pty", { action, ...statusOf(item) }, { summary: `${id}: ${item.exitCode === null ? "running" : `exit ${item.exitCode}`}` });
@@ -298,6 +331,9 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
       if (item.exitCode !== null) throw new Error(`PTY ${id} has already exited with code ${item.exitCode}`);
 
       if (action === "write") {
+        if (!scope?.scoped) {
+          throw new Error(`workspace is required to control PTY ${id} from an unbound MCP transport.`);
+        }
         requireUnsafeRuntimeAllowed("PTY/ConPTY input");
         if (input === undefined) throw new Error("input is required for PTY write");
         const payload = append_newline ? `${input}\r` : input;
@@ -313,6 +349,9 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
       }
 
       if (action === "resize") {
+        if (!scope?.scoped) {
+          throw new Error(`workspace is required to control PTY ${id} from an unbound MCP transport.`);
+        }
         item.terminal.resize(cols, rows);
         item.cols = cols;
         item.rows = rows;
@@ -320,6 +359,9 @@ export function registerPtyTool(server: McpServer, defaultCwd: string): void {
         return toolResult("pty", { action, ...statusOf(item) }, { summary: `resized PTY ${id} to ${cols}x${rows}` });
       }
 
+      if (!scope?.scoped) {
+        throw new Error(`workspace is required to control PTY ${id} from an unbound MCP transport.`);
+      }
       await terminatePty(item);
       const exited = await waitForPtyExit(item);
       await audit({ tool: "pty", action: "stop", target: item.cwd, status: "ok", details: { id } });

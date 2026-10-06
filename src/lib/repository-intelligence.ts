@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { getLspClient, type LspServerId } from "./lsp-client.js";
+import { isPathInside } from "./path-identity.js";
 
 export type RepoIntelAction = "symbol_search" | "references" | "impact";
 
@@ -43,11 +44,6 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function isInside(root: string, target: string): boolean {
-  const rel = path.relative(root, target);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-}
-
 async function canonicalPath(inputPath: string): Promise<string> {
   return path.resolve(await fs.realpath(path.resolve(inputPath)));
 }
@@ -55,14 +51,14 @@ async function canonicalPath(inputPath: string): Promise<string> {
 export async function assertRepositoryPathInsideWorkspace(workspace: string, filePath: string): Promise<void> {
   const resolvedWorkspace = path.resolve(workspace);
   const resolvedFile = path.resolve(filePath);
-  if (!isInside(resolvedWorkspace, resolvedFile)) {
+  if (!isPathInside(resolvedWorkspace, resolvedFile)) {
     throw new Error(`Repository path is outside selected workspace: ${resolvedFile}`);
   }
   const [canonicalWorkspace, canonicalFile] = await Promise.all([
     canonicalPath(resolvedWorkspace),
     canonicalPath(resolvedFile),
   ]);
-  if (!isInside(canonicalWorkspace, canonicalFile)) {
+  if (!isPathInside(canonicalWorkspace, canonicalFile)) {
     throw new Error(`Repository path escapes selected workspace through a symlink/junction: ${resolvedFile}`);
   }
 }

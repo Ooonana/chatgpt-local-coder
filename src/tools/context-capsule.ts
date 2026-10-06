@@ -16,17 +16,12 @@ import {
   listContextCapsules,
   resumeContextCapsule,
 } from "../lib/context-capsule-store.js";
+import { sameResolvedPath } from "../lib/path-identity.js";
 
 const fileSchema = z.object({
   path: z.string().min(1).max(2_000),
   note: z.string().max(1_000).optional(),
 });
-
-function sameWorkspace(left: string, right: string): boolean {
-  const a = path.resolve(left);
-  const b = path.resolve(right);
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
-}
 
 export function registerContextCapsuleTool(server: McpServer, defaultCwd: string): void {
   server.registerTool(
@@ -58,7 +53,7 @@ export function registerContextCapsuleTool(server: McpServer, defaultCwd: string
       if (action === "status") {
         const resolvedWorkspace = await validatePath(workspace || defaultCwd);
         const capsules = (await listContextCapsules(200))
-          .filter((capsule) => capsule.workspace === resolvedWorkspace)
+          .filter((capsule) => sameResolvedPath(capsule.workspace, resolvedWorkspace))
           .filter((capsule) => !task_id || capsule.task_id === task_id)
           .filter((capsule) => !coding_loop_id || capsule.coding_loop_id === coding_loop_id)
           .slice(0, limit);
@@ -73,6 +68,12 @@ export function registerContextCapsuleTool(server: McpServer, defaultCwd: string
       if (action === "resume") {
         const stored = id && !workspace ? await getContextCapsule(id) : null;
         const resolvedWorkspace = await validatePath(workspace || stored?.workspace || defaultCwd);
+        if (id && !stored) {
+          const explicit = await getContextCapsule(id);
+          if (!sameResolvedPath(explicit.workspace, resolvedWorkspace)) {
+            throw new Error(`Context capsule ${id} belongs to a different workspace: ${explicit.workspace}`);
+          }
+        }
         const capsule = await resumeContextCapsule({
           workspace: resolvedWorkspace,
           id,
@@ -107,7 +108,7 @@ export function registerContextCapsuleTool(server: McpServer, defaultCwd: string
       const stored = id ? await getContextCapsule(id) : null;
       const storedWorkspace = stored ? await validatePath(stored.workspace) : null;
       const resolvedWorkspace = await validatePath(workspace || storedWorkspace || defaultCwd);
-      if (storedWorkspace && !sameWorkspace(resolvedWorkspace, storedWorkspace)) {
+      if (storedWorkspace && !sameResolvedPath(resolvedWorkspace, storedWorkspace)) {
         throw new Error(`Context capsule ${id} belongs to a different workspace: ${storedWorkspace}`);
       }
       const capsule = await checkpointContextCapsule({

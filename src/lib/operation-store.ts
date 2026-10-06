@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { sameResolvedPath } from "./path-identity.js";
 
 export type OperationStatus = "running" | "completed" | "failed" | "stopped" | "interrupted";
 
@@ -128,12 +129,18 @@ export async function recordOperationFinish(
 export async function listOperationHistory(options: {
   limit?: number;
   task_id?: string;
+  project_root?: string | null;
   active_ids?: Set<string>;
 } = {}): Promise<Array<OperationRecord & { effective_status: OperationStatus }>> {
   const index = await readIndex();
   const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
   return index.operations
     .filter((record) => !options.task_id || record.task_id === options.task_id)
+    .filter((record) => {
+      if (options.project_root === undefined) return true;
+      if (options.project_root === null) return !record.project_root;
+      return Boolean(record.project_root && sameResolvedPath(record.project_root, options.project_root));
+    })
     .slice(0, limit)
     .map((record) => ({
       ...record,

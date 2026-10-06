@@ -29,6 +29,7 @@ import {
   getCurrentSessionState,
 } from "../lib/session-context.js";
 import { recordProjectAffinity } from "../lib/project-affinity.js";
+import { sameResolvedPath } from "../lib/path-identity.js";
 
 const actionSchema = z.enum(["begin", "resume", "status", "list", "preview", "verify", "accept", "rollback", "abandon"]);
 const commandSchema = z.object({
@@ -61,7 +62,7 @@ export function registerEditTransactionTool(server: McpServer, defaultCwd: strin
       if (action === "list") {
         const root = workspace ? await validatePath(workspace) : null;
         const transactions = (await listEditTransactions(limit))
-          .filter((transaction) => !root || path.resolve(transaction.workspace) === path.resolve(root));
+          .filter((transaction) => !root || sameResolvedPath(transaction.workspace, root));
         return toolResult("edit_transaction", {
           action,
           config: getEditTransactionConfig(),
@@ -77,7 +78,7 @@ export function registerEditTransactionTool(server: McpServer, defaultCwd: strin
           : session?.workspace_kind === "project" && session.project_root
             ? session.project_root
             : defaultCwd;
-        assertCurrentSessionMutationPath(root, "edit_transaction begin");
+        await assertCurrentSessionMutationPath(root, "edit_transaction begin");
         const transaction = await beginEditTransaction(root, label);
         await audit({
           tool: "edit_transaction",

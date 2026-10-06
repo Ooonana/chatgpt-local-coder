@@ -12,6 +12,8 @@ import {
 import { runLocalHooks } from "./local-hooks.js";
 import { validatePath } from "./path-security.js";
 import { resolveSafeSpawnSpec } from "./safe-spawn.js";
+import { terminateWindowsProcessTree } from "./process-tree.js";
+import { canonicalProjectRootForPath, sameProjectRoot } from "./workspace-scope.js";
 
 export type SubagentIsolation = "none" | "worktree";
 
@@ -243,11 +245,7 @@ function appendLog(item: ManagedSubagent, key: "stdout" | "stderr", chunk: Buffe
 async function terminate(item: ManagedSubagent): Promise<void> {
   if (!item.running) return;
   if (process.platform === "win32" && item.pid) {
-    await new Promise<void>((resolve) => {
-      const killer = spawn("taskkill.exe", ["/PID", String(item.pid), "/T", "/F"], { windowsHide: true });
-      killer.on("error", () => resolve());
-      killer.on("close", () => resolve());
-    });
+    await terminateWindowsProcessTree(item.pid, true);
     return;
   }
 
@@ -456,11 +454,18 @@ export async function stopSubagent(id: string): Promise<SubagentRecord> {
   return publicRecord(item);
 }
 
-export async function clearSubagents(removeWorktrees = false): Promise<{ cleared: number; removed_worktrees: number }> {
+export async function clearSubagents(
+  removeWorktrees = false,
+  projectRoot?: string | null
+): Promise<{ cleared: number; removed_worktrees: number }> {
   let cleared = 0;
   let removedWorktrees = 0;
   for (const [id, item] of [...agents.entries()]) {
     if (item.running) continue;
+    if (projectRoot !== undefined) {
+      const itemProjectRoot = await canonicalProjectRootForPath(item.requested_workspace);
+      if (!sameProjectRoot(itemProjectRoot, projectRoot)) continue;
+    }
     agents.delete(id);
     cleared++;
     if (removeWorktrees && item.worktree_path) {

@@ -171,10 +171,9 @@ try {
     "process_history",
     "run_commands_parallel",
     "pty",
-    "lsp",
     "view_image",
     "subagent",
-    "delegate_status",
+    "repo_intel",
   ]) {
     if (!names.has(required)) throw new Error(`${required} missing from tools/list`);
   }
