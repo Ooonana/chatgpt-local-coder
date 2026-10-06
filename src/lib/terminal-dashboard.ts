@@ -450,7 +450,10 @@ function finishFrame(lines: string[], width: number, height: number, color = fal
 export function renderDashboardFrame(model: DashboardRenderModel): string {
   const width = Math.max(1, Math.min(Math.trunc(model.width || 80), 160));
   const height = Math.max(1, Math.trunc(model.height || 24));
-  if (width < 64 || height < 16) return compactDashboard(model, width, height);
+  // The full operator layout needs 20 rows in its most compact crowded state
+  // (tunnel + loop + active call + project overflow + worker overflow + Health).
+  // Below that, prefer the compact view instead of clipping the pinned alert.
+  if (width < 64 || height < 20) return compactDashboard(model, width, height);
   const inner = width - 2;
   const lines: string[] = [];
   const nowMs = model.now.getTime();

@@ -380,6 +380,45 @@ await test("dashboard never exceeds a narrow viewport", async () => {
   assertFits(frame, 46, 12);
 });
 
+await test("short terminals keep the compact health alert instead of clipping desktop footer", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-09-14T13:40:00.000Z");
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 120,
+    height: 19,
+    sessionCount: 1,
+    sessions: [{
+      session_id: "short-lost-session",
+      default_workspace: "C:\\work\\short",
+      workspace_kind: "project",
+      project_root: "C:\\work\\short",
+      project_alias: "short-active",
+      connection: "disconnected",
+      created_at: now.toISOString(),
+      last_client_activity_at: new Date(now.getTime() - 10_000).toISOString(),
+      disconnected_at: new Date(now.getTime() - 8_000).toISOString(),
+      closed_at: null,
+    }],
+    processes: [{
+      id: "short-worker",
+      pid: 999,
+      label: "long build",
+      command: "npm test",
+      cwd: "C:\\work\\short",
+      project_root: "C:\\work\\short",
+      started_at: new Date(now.getTime() - 60_000).toISOString(),
+      running: true,
+      exit_code: null,
+      signal: null,
+      last_activity_at: new Date(now.getTime() - 1_000).toISOString(),
+      liveness: "active",
+    }],
+  }));
+  assert.match(frame, /WARN CHAT TRANSPORT LOST/);
+  assert.match(frame, /work continues/);
+  assertFits(frame, 120, 19);
+});
+
 await test("dashboard compact mode respects tiny resize dimensions", async () => {
   const now = new Date("2026-09-14T13:00:00.000Z");
   for (const [width, height] of [[27, 6], [12, 4], [1, 1]]) {
