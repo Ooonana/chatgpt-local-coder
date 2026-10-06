@@ -84,14 +84,49 @@ await test("dashboard renders stable operational sections", async () => {
     rssBytes: 160 * 1024 * 1024,
     heapBytes: 64 * 1024 * 1024,
     runtime: snapshot,
-    processes: [{ id: "bg1", pid: 123, command: "npm run dev", cwd: "C:\\x", started_at: now.toISOString(), running: true, exit_code: null, signal: null }],
-    codingLoops: [{ status: "active", phase: "repair", attempts: [{}], max_attempts: 4, goal: "repair loop" }],
+    sessions: [{
+      session_id: "session-project",
+      default_workspace: "C:\\x",
+      workspace_kind: "project",
+      project_root: "C:\\x",
+      project_alias: "project-x",
+      connection: "connected",
+      created_at: now.toISOString(),
+      last_client_activity_at: now.toISOString(),
+      disconnected_at: null,
+      closed_at: null,
+    }],
+    processes: [{
+      id: "bg1",
+      pid: 123,
+      label: "dev server",
+      command: "npm run dev",
+      cwd: "C:\\x",
+      project_root: "C:\\x",
+      started_at: new Date(now.getTime() - 30_000).toISOString(),
+      running: true,
+      exit_code: null,
+      signal: null,
+      last_activity_at: new Date(now.getTime() - 1_000).toISOString(),
+      liveness: "active",
+    }],
+    codingLoops: [{
+      status: "active",
+      phase: "repair",
+      attempts: [{ passed: 3, failed: 1 }],
+      max_attempts: 4,
+      goal: "repair loop",
+      source_workspace: "C:\\x",
+      workspace: "C:\\x",
+    }],
   }));
-  for (const label of ["Local Coder", "Connection", "Active tools", "Workers", "Activity", "Usage", "CPU 12.5%", "last tool 0ms ago", "SSE keepalive 10s", "LOOPS 1", "LOOP REPAIR 1/4", "repair loop", "npm run dev"]) {
+  for (const label of ["Local Coder", "Overview", "Current work", "Projects / transports", "Workers", "Activity", "Health", "CPU 12.5%", "last tool 0ms ago", "SSE keepalive 10s", "LOOP REPAIR", "repair loop", "project-x", "dev server"]) {
     assert.match(frame, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
   assertFits(frame, 110, 30);
-  assert.equal(frame.split("\n").length, 30, "desktop dashboard should fill its fixed canvas height");
+  const frameLines = frame.split("\n");
+  assert.equal(frameLines.length, 30, "desktop dashboard should fill its fixed canvas height");
+  assert.match(frameLines.at(-3) || "", /Health/, "Health section should stay pinned above the footer");
 });
 
 await test("dashboard uses restrained state colors without changing terminal width", async () => {
@@ -130,7 +165,7 @@ await test("desktop activity renders the 20 latest completed tool calls", async 
     height: 44,
     runtime: runtime.getRuntimeSnapshot(),
   }));
-  const activitySection = frame.split("├─ Activity ")[1]?.split("├─ Usage ")[0] || "";
+  const activitySection = frame.split("├─ Activity ")[1]?.split("├─ Health ")[0] || "";
   for (let index = 5; index < 25; index++) assert.match(activitySection, new RegExp(`activity_${String(index).padStart(2, "0")}`));
   for (let index = 0; index < 5; index++) assert.doesNotMatch(activitySection, new RegExp(`activity_${String(index).padStart(2, "0")}`));
   assertFits(frame, 120, 44);
@@ -152,6 +187,185 @@ await test("dashboard shows elapsed time since last tool activity", async () => 
   assertFits(frame, 90, 20);
 });
 
+await test("dashboard makes disconnected active transport obvious while work continues", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-09-14T13:00:10.000Z");
+  const snapshot = runtime.getRuntimeSnapshot();
+  snapshot.active = [{
+    id: "active-lost",
+    tool: "run_command",
+    kind: "EXEC",
+    summary: "npm test",
+    started_at: new Date(now.getTime() - 8_000).toISOString(),
+    started_ms: now.getTime() - 8_000,
+    session_id: "lost-session",
+    project_root: "C:\\work\\alpha",
+    workspace_kind: "project",
+  }];
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 120,
+    height: 30,
+    sessionCount: 1,
+    runtime: snapshot,
+    sessions: [{
+      session_id: "lost-session",
+      default_workspace: "C:\\work\\alpha",
+      workspace_kind: "project",
+      project_root: "C:\\work\\alpha",
+      project_alias: "alpha",
+      connection: "disconnected",
+      created_at: new Date(now.getTime() - 60_000).toISOString(),
+      last_client_activity_at: new Date(now.getTime() - 9_000).toISOString(),
+      disconnected_at: new Date(now.getTime() - 7_000).toISOString(),
+      closed_at: null,
+    }],
+  }));
+  assert.match(frame, /CHAT TRANSPORT LOST/);
+  assert.match(frame, /work continues/i);
+  assert.match(frame, /WORK CONTINUES/);
+  assert.match(frame, /alpha/);
+  assert.match(frame, /CHAT 0\/1/);
+  assertFits(frame, 120, 30);
+});
+
+await test("dashboard warns when background work continues after chat transport disconnects", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-09-14T13:10:00.000Z");
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 124,
+    height: 30,
+    sessionCount: 1,
+    sessions: [{
+      session_id: "worker-lost-session",
+      default_workspace: "C:\\work\\worker-project",
+      workspace_kind: "project",
+      project_root: "C:\\work\\worker-project",
+      project_alias: "worker-project",
+      connection: "disconnected",
+      created_at: new Date(now.getTime() - 60_000).toISOString(),
+      last_client_activity_at: new Date(now.getTime() - 12_000).toISOString(),
+      disconnected_at: new Date(now.getTime() - 10_000).toISOString(),
+      closed_at: null,
+    }],
+    processes: [{
+      id: "worker-still-running",
+      pid: 321,
+      label: "full test suite",
+      command: "npm test",
+      cwd: "C:\\work\\worker-project",
+      project_root: "C:\\work\\worker-project",
+      started_at: new Date(now.getTime() - 70_000).toISOString(),
+      running: true,
+      exit_code: null,
+      signal: null,
+      last_activity_at: new Date(now.getTime() - 2_000).toISOString(),
+      liveness: "active",
+    }],
+  }));
+  assert.match(frame, /CHAT TRANSPORT LOST/);
+  assert.match(frame, /work continues in worker-project/);
+  assert.match(frame, /WORK CONTINUES/);
+  assert.match(frame, /full test suite/);
+  assertFits(frame, 124, 30);
+});
+
+await test("dashboard highlights stalled worker with project and activity age", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-09-14T13:20:00.000Z");
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 132,
+    height: 30,
+    processes: [{
+      id: "stalled-bg",
+      pid: 777,
+      label: "long verification",
+      command: "npm test",
+      cwd: "C:\\work\\alpha",
+      project_root: "C:\\work\\alpha",
+      started_at: new Date(now.getTime() - 15 * 60_000).toISOString(),
+      running: true,
+      exit_code: null,
+      signal: null,
+      last_activity_at: new Date(now.getTime() - 11 * 60_000).toISOString(),
+      liveness: "possibly_stalled",
+    }],
+  }));
+  assert.match(frame, /STALLED\?/);
+  assert.match(frame, /WORKER MAY BE STALLED/);
+  assert.match(frame, /alpha/);
+  assert.match(frame, /activity 11m00s ago/);
+  assertFits(frame, 132, 30);
+});
+
+await test("active projects are automatically listed before connected idle and offline projects", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-09-14T13:30:00.000Z");
+  const snapshot = runtime.getRuntimeSnapshot();
+  snapshot.active = [{
+    id: "active-beta",
+    tool: "run_command",
+    kind: "EXEC",
+    summary: "npm test",
+    started_at: new Date(now.getTime() - 5_000).toISOString(),
+    started_ms: now.getTime() - 5_000,
+    session_id: "beta-session",
+    project_root: "C:\\work\\beta",
+    workspace_kind: "project",
+  }];
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 132,
+    height: 36,
+    sessionCount: 3,
+    runtime: snapshot,
+    sessions: [
+      {
+        session_id: "alpha-session",
+        default_workspace: "C:\\work\\alpha",
+        workspace_kind: "project",
+        project_root: "C:\\work\\alpha",
+        project_alias: "alpha-idle",
+        connection: "connected",
+        created_at: now.toISOString(),
+        last_client_activity_at: now.toISOString(),
+        disconnected_at: null,
+        closed_at: null,
+      },
+      {
+        session_id: "beta-session",
+        default_workspace: "C:\\work\\beta",
+        workspace_kind: "project",
+        project_root: "C:\\work\\beta",
+        project_alias: "beta-active",
+        connection: "connected",
+        created_at: now.toISOString(),
+        last_client_activity_at: now.toISOString(),
+        disconnected_at: null,
+        closed_at: null,
+      },
+      {
+        session_id: "gamma-session",
+        default_workspace: "C:\\work\\gamma",
+        workspace_kind: "project",
+        project_root: "C:\\work\\gamma",
+        project_alias: "gamma-offline",
+        connection: "disconnected",
+        created_at: now.toISOString(),
+        last_client_activity_at: new Date(now.getTime() - 60_000).toISOString(),
+        disconnected_at: new Date(now.getTime() - 30_000).toISOString(),
+        closed_at: null,
+      },
+    ],
+  }));
+  const projectsSection = frame.split("├─ Projects / transports ")[1]?.split("├─ Workers ")[0] || "";
+  const beta = projectsSection.indexOf("beta-active");
+  const alpha = projectsSection.indexOf("alpha-idle");
+  const gamma = projectsSection.indexOf("gamma-offline");
+  assert.ok(beta >= 0 && alpha >= 0 && gamma >= 0, projectsSection);
+  assert.ok(beta < alpha, "active project should sort before connected idle project");
+  assert.ok(alpha < gamma, "connected idle project should sort before offline project");
+  assertFits(frame, 132, 36);
+});
+
 await test("dashboard never exceeds a narrow viewport", async () => {
   const now = new Date("2026-09-14T13:00:00.000Z");
   const frame = dashboard.renderDashboardFrame(baseModel(now, {
@@ -161,6 +375,8 @@ await test("dashboard never exceeds a narrow viewport", async () => {
     authEnabled: false,
     permission: "workspace: restricted",
   }));
+  assert.match(frame, /PROJECT/);
+  assert.match(frame, /WORK/);
   assertFits(frame, 46, 12);
 });
 

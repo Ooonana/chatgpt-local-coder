@@ -182,7 +182,7 @@ Health check: `http://127.0.0.1:3000/health`
 
 Admin UI: `http://127.0.0.1:<ADMIN_PORT>/ui` (default port: `3001`)
 
-The terminal dashboard is enabled automatically in an interactive terminal and shows current time, uptime, MCP transports, live/active tool calls, call kind (`READ` / `EDIT` / `EXEC` / `MCP`), running background processes/PTYs/subagents with liveness, recent completions, durations, per-tool usage, CPU, RSS, and heap. Set `LOCAL_CODER_TUI=off` for traditional scrolling logs.
+The terminal dashboard is enabled automatically in an interactive terminal. TUI v2 lists **active projects first**, then connected-idle/offline workspaces, with per-project ChatGPT transport, active-tool, worker, and coding-loop counts. Current tools and workers show project scope, background workers show liveness/last activity, and the pinned Health footer surfaces transport loss while work continues, stalled/silent workers, and tunnel degradation. It also shows recent completions, durations, CPU, RSS, heap, tunnel status, and responsive compact layouts. Set `LOCAL_CODER_TUI=off` for traditional scrolling logs.
 
 ## Troubleshooting
 

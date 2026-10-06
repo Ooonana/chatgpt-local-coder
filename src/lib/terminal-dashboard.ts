@@ -209,6 +209,203 @@ function lastToolLabel(runtime: RuntimeSnapshot, nowMs: number): string {
   return latest === null ? "last tool never" : `last tool ${formatDuration(Math.max(0, nowMs - latest))} ago`;
 }
 
+type ProjectSummaryKind = "project" | "machine" | "unbound";
+
+interface ProjectSummary {
+  key: string;
+  kind: ProjectSummaryKind;
+  root: string | null;
+  label: string;
+  transports: number;
+  connectedTransports: number;
+  activeTools: number;
+  workers: number;
+  loops: number;
+}
+
+interface DashboardAlert {
+  severity: "ok" | "warn" | "error";
+  label: string;
+  text: string;
+}
+
+function normalizedProjectKey(root: string): string {
+  return root.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
+}
+
+function projectSummaryKey(kind: ProjectSummaryKind, root?: string | null): string {
+  return kind === "project" && root ? `project:${normalizedProjectKey(root)}` : kind;
+}
+
+function projectSummaryLabel(kind: ProjectSummaryKind, root?: string | null, alias?: string | null): string {
+  if (kind === "machine") return "Machine / host";
+  if (kind === "unbound") return "Unbound";
+  return alias || (root ? shortWorkspace(root) : "Project");
+}
+
+function buildProjectSummaries(model: DashboardRenderModel): ProjectSummary[] {
+  const projects = new Map<string, ProjectSummary>();
+  const ensure = (kind: ProjectSummaryKind, root?: string | null, alias?: string | null): ProjectSummary => {
+    const key = projectSummaryKey(kind, root);
+    const existing = projects.get(key);
+    if (existing) {
+      if (alias && existing.kind === "project") existing.label = alias;
+      return existing;
+    }
+    const created: ProjectSummary = {
+      key,
+      kind,
+      root: kind === "project" ? root || null : null,
+      label: projectSummaryLabel(kind, root, alias),
+      transports: 0,
+      connectedTransports: 0,
+      activeTools: 0,
+      workers: 0,
+      loops: 0,
+    };
+    projects.set(key, created);
+    return created;
+  };
+
+  for (const session of model.sessions || []) {
+    const kind: ProjectSummaryKind = session.workspace_kind === "project"
+      ? "project"
+      : session.workspace_kind === "machine"
+        ? "machine"
+        : "unbound";
+    const summary = ensure(kind, session.project_root, session.project_alias);
+    summary.transports++;
+    if (session.connection === "connected") summary.connectedTransports++;
+  }
+
+  for (const call of model.runtime.active) {
+    const kind: ProjectSummaryKind = call.project_root
+      ? "project"
+      : call.workspace_kind === "machine"
+        ? "machine"
+        : "unbound";
+    ensure(kind, call.project_root).activeTools++;
+  }
+
+  for (const worker of model.processes.filter((item) => item.running)) {
+    ensure(worker.project_root ? "project" : "machine", worker.project_root).workers++;
+  }
+  for (const worker of model.ptys.filter((item) => item.running)) {
+    ensure(worker.project_root ? "project" : "machine", worker.project_root).workers++;
+  }
+  for (const worker of model.subagents.filter((item) => item.running)) {
+    ensure(worker.requested_workspace ? "project" : "machine", worker.requested_workspace || null).workers++;
+  }
+  for (const loop of (model.codingLoops || []).filter((item) => item.status === "active")) {
+    ensure("project", loop.source_workspace || loop.workspace).loops++;
+  }
+
+  return [...projects.values()].sort((a, b) => {
+    const activeA = a.activeTools + a.workers + a.loops;
+    const activeB = b.activeTools + b.workers + b.loops;
+    if (activeA !== activeB) return activeB - activeA;
+    if (a.connectedTransports !== b.connectedTransports) return b.connectedTransports - a.connectedTransports;
+    if (a.kind !== b.kind) return a.kind === "project" ? -1 : b.kind === "project" ? 1 : a.kind.localeCompare(b.kind);
+    return a.label.localeCompare(b.label);
+  });
+}
+
+function primaryProjectLabel(projects: ProjectSummary[], fallbackWorkspace: string): string {
+  const activeProject = projects.find((item) => item.kind === "project" && (item.activeTools + item.workers + item.loops) > 0);
+  if (activeProject) return activeProject.label;
+  const connectedProject = projects.find((item) => item.kind === "project" && item.connectedTransports > 0);
+  return connectedProject?.label || shortWorkspace(fallbackWorkspace);
+}
+
+function projectLabelForRoot(projects: ProjectSummary[], root?: string | null, machine = false): string {
+  if (root) {
+    return projects.find((item) => item.kind === "project" && item.root && normalizedProjectKey(item.root) === normalizedProjectKey(root))?.label
+      || shortWorkspace(root);
+  }
+  return machine ? "Machine" : "Unbound";
+}
+
+function disconnectedActiveCall(model: DashboardRenderModel, nowMs: number) {
+  const sessions = new Map((model.sessions || []).map((session) => [session.session_id, session]));
+  return model.runtime.active.find((call) => {
+    if (!call.session_id || nowMs - call.started_ms < 3_000) return false;
+    const owner = sessions.get(call.session_id);
+    return owner && owner.connection !== "connected";
+  });
+}
+
+function dashboardAlert(model: DashboardRenderModel, nowMs: number): DashboardAlert {
+  const latestProblem = [...model.messages].reverse().find(
+    (item) => item.level !== "info" && nowMs - Date.parse(item.time) < 15_000
+  );
+  if (latestProblem) {
+    return {
+      severity: latestProblem.level === "error" ? "error" : "warn",
+      label: latestProblem.level === "error" ? "ERROR" : "WARN",
+      text: latestProblem.text,
+    };
+  }
+
+  const lost = disconnectedActiveCall(model, nowMs);
+  if (lost) {
+    return {
+      severity: "warn",
+      label: "CHAT TRANSPORT LOST",
+      text: `work continues · ${lost.tool} · ${formatDuration(nowMs - lost.started_ms)}`,
+    };
+  }
+
+  const disconnectedProject = buildProjectSummaries(model).find((project) => {
+    const work = project.activeTools + project.workers + project.loops;
+    return project.kind === "project" &&
+      work > 0 &&
+      project.transports > 0 &&
+      project.connectedTransports === 0;
+  });
+  if (disconnectedProject) {
+    return {
+      severity: "warn",
+      label: "CHAT TRANSPORT LOST",
+      text: `work continues in ${disconnectedProject.label} · ${disconnectedProject.workers} worker(s) · ${disconnectedProject.loops} loop(s)`,
+    };
+  }
+
+  const stalled = model.processes.filter((item) => item.running && item.liveness === "possibly_stalled");
+  if (stalled.length) {
+    return {
+      severity: "warn",
+      label: "WORKER MAY BE STALLED",
+      text: `${stalled.length} background worker(s) · inspect last activity before stopping`,
+    };
+  }
+  const silent = model.processes.filter((item) => item.running && item.liveness === "silent");
+  if (silent.length) {
+    return {
+      severity: "warn",
+      label: "WORKER SILENT",
+      text: `${silent.length} background worker(s) have had no output for over 2 minutes`,
+    };
+  }
+  if (model.tunnel && !["online", "disabled", "not_configured", "stopped"].includes(model.tunnel.status)) {
+    return {
+      severity: "warn",
+      label: "TUNNEL DEGRADED",
+      text: model.tunnel.last_error || `status ${model.tunnel.status}`,
+    };
+  }
+  return {
+    severity: "ok",
+    label: "SYSTEM HEALTHY",
+    text: `${model.tunnel?.status === "online" ? "tunnel connected · " : ""}no stalled work · ${model.runtime.total_errors} runtime error(s)`,
+  };
+}
+
+function alertRow(alert: DashboardAlert, width: number, color: boolean): string {
+  const code = alert.severity === "error" ? "31;1" : alert.severity === "warn" ? "33;1" : "32;1";
+  const symbol = alert.severity === "ok" ? "●" : alert.severity === "warn" ? "⚠" : "✕";
+  return row(`${ansi(code, `${symbol} ${alert.label}`, color)}  ${alert.text}`, width, color);
+}
+
 function compactDashboard(model: DashboardRenderModel, width: number, height: number): string {
   const nowMs = model.now.getTime();
   const running =
@@ -218,12 +415,16 @@ function compactDashboard(model: DashboardRenderModel, width: number, height: nu
   const active = model.runtime.active[0];
   const activeLoops = (model.codingLoops || []).filter((loop) => loop.status === "active");
   const tunnel = model.tunnel;
-  const lastTool = lastToolLabel(model.runtime, nowMs);
+  const projects = buildProjectSummaries(model);
+  const alert = dashboardAlert(model, nowMs);
+  const project = primaryProjectLabel(projects, model.workspace);
+  const alertPrefix = alert.severity === "ok" ? "OK" : alert.severity === "warn" ? "WARN" : "ERROR";
   const lines = [
-    `Local Coder ONLINE ${clock(model.now)}`,
-    `MCP:${model.mcpPort} S:${model.sessionCount} ${model.transportMode.toUpperCase()} T:${tunnel?.status || "n/a"} A:${model.runtime.active.length} L:${activeLoops.length}`,
-    `calls:${model.runtime.total_calls} err:${model.runtime.total_errors} work:${running} ${lastTool}`,
-    active ? `${spinner(nowMs, false)} ${active.tool} ${formatDuration(nowMs - active.started_ms)}` : "idle",
+    `Local Coder  ONLINE  ${clock(model.now)}`,
+    `PROJECT ${project}  MCP:${model.mcpPort}  TUN:${tunnel?.status || "n/a"}`,
+    `WORK tools:${model.runtime.active.length} workers:${running} loops:${activeLoops.length} transports:${model.sessionCount}`,
+    active ? `${spinner(nowMs, false)} ${active.tool} ${formatDuration(nowMs - active.started_ms)}  ${active.summary}` : "idle · waiting for tool calls",
+    `${alertPrefix} ${alert.label} · ${alert.text}`,
   ];
   return lines.slice(0, height).map((line) => crop(line, width)).join("\n");
 }
@@ -249,13 +450,20 @@ function finishFrame(lines: string[], width: number, height: number, color = fal
 export function renderDashboardFrame(model: DashboardRenderModel): string {
   const width = Math.max(1, Math.min(Math.trunc(model.width || 80), 160));
   const height = Math.max(1, Math.trunc(model.height || 24));
-  if (width < 28 || height < 7) return compactDashboard(model, width, height);
+  if (width < 64 || height < 16) return compactDashboard(model, width, height);
   const inner = width - 2;
   const lines: string[] = [];
   const nowMs = model.now.getTime();
   const uptime = formatDuration(Math.max(0, nowMs - model.startedAtMs));
   const online = ansi("32;1", "● ONLINE", model.color);
   const activeLoops = (model.codingLoops || []).filter((loop) => loop.status === "active");
+  const runningProcesses = model.processes.filter((item) => item.running);
+  const runningPtys = model.ptys.filter((item) => item.running);
+  const runningAgents = model.subagents.filter((item) => item.running);
+  const projects = buildProjectSummaries(model);
+  const alert = dashboardAlert(model, nowMs);
+  const primaryProject = primaryProjectLabel(projects, model.workspace);
+  const connectedTransports = (model.sessions || []).filter((session) => session.connection === "connected").length;
 
   const titleLeft = ` Local Coder `;
   const titleRight = ` ${online} `;
@@ -266,23 +474,23 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
     lines.push(`${tone("┌", model.color, "2")}${ansi("1", pad(" Local Coder", width - 2), model.color)}${tone("┐", model.color, "2")}`);
   }
   lines.push(row([
+    metric("PROJECT", primaryProject, model.color, "37;1"),
     metric("TIME", clock(model.now), model.color),
     metric("UP", uptime, model.color),
     ansi("2", lastToolLabel(model.runtime, nowMs), model.color),
-    metric("PID", String(process.pid), model.color),
     metric("CPU", `${model.cpuPercent.toFixed(1)}%`, model.color, healthColor(model.cpuPercent)),
     metric("RSS", formatBytes(model.rssBytes), model.color),
-    metric("HEAP", formatBytes(model.heapBytes), model.color),
   ].join("  "), width, model.color));
 
-  lines.push(section("Connection", width, model.color));
+  lines.push(section("Overview", width, model.color));
   const keepAlive = model.transportMode === "sse" ? ` keepalive ${Math.round(model.keepAliveMs / 1000)}s` : "";
   lines.push(row([
     metric("MCP", `:${model.mcpPort}`, model.color),
     ansi("1", `${model.transportMode.toUpperCase()}${keepAlive}`, model.color),
-    metric("TRANSPORTS", String(model.sessionCount), model.color),
+    metric("TRANSPORTS", `${connectedTransports}/${model.sessionCount} connected`, model.color, connectedTransports ? "32;1" : "2"),
     metric("AUTH", model.authEnabled ? "ON" : "OFF", model.color, model.authEnabled ? "32;1" : "33;1"),
     metric("PROFILE", model.toolProfile, model.color),
+    metric("PID", String(process.pid), model.color),
   ].join("  "), width, model.color));
   if (model.tunnel) {
     const tunnelCode = model.tunnel.status === "online"
@@ -292,73 +500,105 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
         : "33;1";
     lines.push(row([
       metric("TUNNEL", model.tunnel.status.toUpperCase(), model.color, tunnelCode),
-      metric("HEALTH", `:${model.tunnel.health_port}`, model.color),
+      metric("READY", model.tunnel.status === "online" ? "YES" : "NO", model.color, model.tunnel.status === "online" ? "32;1" : "33;1"),
       metric("RESTARTS", String(model.tunnel.restarts), model.color),
+      model.tunnel.last_ready_at ? ansi("2", `last ready ${formatDuration(Math.max(0, nowMs - Date.parse(model.tunnel.last_ready_at)))} ago`, model.color) : "",
       model.tunnel.reused_external ? ansi("2", "reused existing tunnel", model.color) : "",
     ].filter(Boolean).join("  "), width, model.color));
   }
   lines.push(row([
-    metric("WORKSPACE", shortWorkspace(model.workspace), model.color),
     metric("POLICY", model.permission.split(":", 1)[0], model.color, model.permission.startsWith("open") ? "32;1" : "33;1"),
-    metric("LOOPS", String(activeLoops.length), model.color),
+    metric("HEAP", formatBytes(model.heapBytes), model.color),
+    metric("CALLS", `${model.runtime.total_calls}`, model.color),
+    metric("ERRORS", String(model.runtime.total_errors), model.color, model.runtime.total_errors ? "31;1" : "32;1"),
     metric("ADMIN", `:${model.adminPort}`, model.color),
   ].join("  "), width, model.color));
 
 
-  if (activeLoops.length && height >= 20) {
+  lines.push(section(`Current work (${model.runtime.active.length} tools · ${activeLoops.length} loops)`, width, model.color));
+  if (activeLoops.length) {
     const loop = activeLoops[0];
     const attempt = `${loop.attempts.length}/${loop.max_attempts}`;
-    lines.push(row(`${ansi("1", "LOOP", model.color)} ${loop.phase.toUpperCase()} ${ansi("2", attempt, model.color)}  ${loop.goal}`, width, model.color));
+    const lastAttempt = loop.attempts.at(-1);
+    const verify = lastAttempt ? `verify ${lastAttempt.passed}✓/${lastAttempt.failed}✕` : "not verified";
+    const loopProject = projectLabelForRoot(projects, loop.source_workspace || loop.workspace, false);
+    lines.push(row(
+      `${ansi("1", "LOOP", model.color)} ${ansi(loop.phase === "blocked" || loop.phase === "failed" ? "33;1" : "36;1", loop.phase.toUpperCase(), model.color)} ${ansi("2", attempt, model.color)}  ${loopProject}  ${loop.goal}  ·  ${verify}`,
+      width,
+      model.color
+    ));
   }
-
-  lines.push(section(`Active tools (${model.runtime.active.length})`, width, model.color));
-  const activeSlots = height >= 30 ? 5 : height >= 24 ? 4 : height >= 20 ? 3 : 1;
+  const activeSlots = height >= 36 ? 3 : height >= 24 ? 2 : 1;
   if (!model.runtime.active.length) {
     lines.push(row(`${ansi("2", "idle", model.color)}  ·  waiting for tool calls`, width, model.color));
   } else {
     for (const call of model.runtime.active.slice(0, activeSlots)) {
       const elapsed = formatDuration(nowMs - call.started_ms).padStart(6);
-      lines.push(row(`${spinner(nowMs, model.color)} ${kindLabel(call.kind, model.color)} ${ansi("1", call.tool.padEnd(22).slice(0, 22), model.color)} ${ansi("2", elapsed, model.color)}  ${call.summary}`, width, model.color));
+      const project = projectLabelForRoot(projects, call.project_root, call.workspace_kind === "machine");
+      lines.push(row(`${spinner(nowMs, model.color)} ${kindLabel(call.kind, model.color)} ${ansi("1", call.tool.padEnd(20).slice(0, 20), model.color)} ${ansi("2", elapsed, model.color)}  ${ansi("2", project, model.color)}  ${call.summary}`, width, model.color));
     }
     if (model.runtime.active.length > activeSlots) {
       lines.push(row(`… ${model.runtime.active.length - activeSlots} more active call(s)`, width));
     }
   }
 
-  const runningProcesses = model.processes.filter((item) => item.running);
-  const runningPtys = model.ptys.filter((item) => item.running);
-  const runningAgents = model.subagents.filter((item) => item.running);
+  lines.push(section(`Projects / transports (${projects.length})`, width, model.color));
+  const projectSlots = height >= 36 ? 3 : height >= 24 ? 2 : 1;
+  if (!projects.length) {
+    lines.push(row(ansi("2", "no project/transport activity yet", model.color), width, model.color));
+  } else {
+    for (const project of projects.slice(0, projectSlots)) {
+      const work = project.activeTools + project.workers + project.loops;
+      const workingWithoutChat = work > 0 && project.connectedTransports === 0;
+      const symbol = work > 0 ? ansi(workingWithoutChat ? "33;1" : "32;1", "●", model.color) : ansi("2", "○", model.color);
+      const state = workingWithoutChat
+        ? ansi("33;1", "WORK CONTINUES", model.color)
+        : work > 0
+          ? ansi("32;1", "ACTIVE", model.color)
+          : project.connectedTransports > 0
+            ? ansi("2", "IDLE", model.color)
+            : ansi("2", "OFFLINE", model.color);
+      lines.push(row([
+        symbol,
+        ansi("1", project.label.padEnd(24).slice(0, 24), model.color),
+        metric("CHAT", `${project.connectedTransports}/${project.transports}`, model.color),
+        metric("TOOLS", String(project.activeTools), model.color),
+        metric("WORKERS", String(project.workers), model.color),
+        metric("LOOPS", String(project.loops), model.color),
+        state,
+      ].join("  "), width, model.color));
+    }
+    if (projects.length > projectSlots) lines.push(row(`… ${projects.length - projectSlots} more workspace(s)`, width, model.color));
+  }
+
   const runningCount = runningProcesses.length + runningPtys.length + runningAgents.length;
-  if (height >= 15) lines.push(section(`Workers (${runningCount})`, width, model.color));
+  lines.push(section(`Workers (${runningCount})`, width, model.color));
   const runningRows: string[] = [];
   for (const item of runningProcesses) {
-    runningRows.push(`BG    ${String(item.pid ?? "-").padEnd(7)} ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${item.command}`);
+    const project = projectLabelForRoot(projects, item.project_root, !item.project_root);
+    const activityAge = Math.max(0, nowMs - Date.parse(item.last_activity_at));
+    const state = item.liveness === "possibly_stalled"
+      ? ansi("33;1", "STALLED?", model.color)
+      : item.liveness === "silent"
+        ? ansi("33;1", "SILENT", model.color)
+        : ansi("32;1", "ACTIVE", model.color);
+    runningRows.push(`BG    ${String(item.pid ?? "-").padEnd(7)} ${state}  ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${project}  activity ${formatDuration(activityAge)} ago  ${item.label || item.command}`);
   }
   for (const item of runningPtys) {
-    runningRows.push(`PTY   ${String(item.pid ?? "-").padEnd(7)} ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${item.command || "interactive shell"}`);
+    const project = projectLabelForRoot(projects, item.project_root, !item.project_root);
+    runningRows.push(`PTY   ${String(item.pid ?? "-").padEnd(7)} ${ansi("32;1", "ACTIVE", model.color)}  ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${project}  ${item.command || "interactive shell"}`);
   }
   for (const item of runningAgents) {
-    runningRows.push(`AGENT ${String(item.pid ?? "-").padEnd(7)} ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${item.label || item.objective}`);
+    const project = projectLabelForRoot(projects, item.requested_workspace, false);
+    runningRows.push(`AGENT ${String(item.pid ?? "-").padEnd(7)} ${ansi("32;1", "ACTIVE", model.color)}  ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${project}  ${item.label || item.objective}`);
   }
-  if (height >= 15) {
-    const workerSlots = height >= 30 ? 4 : height >= 24 ? 3 : height >= 20 ? 2 : 1;
-    if (!runningRows.length) lines.push(row(`${ansi("2", "none", model.color)}  ·  no background process, PTY, or subagent`, width, model.color));
-    else for (const item of runningRows.slice(0, workerSlots)) lines.push(row(item, width, model.color));
-    if (runningRows.length > workerSlots) lines.push(row(`… ${runningRows.length - workerSlots} more running item(s)`, width));
-  }
-
-  const silentWorkers = runningProcesses.filter((process) => process.liveness === "silent").length;
-  const stalledWorkers = runningProcesses.filter((process) => process.liveness === "possibly_stalled").length;
-  if ((silentWorkers || stalledWorkers) && height >= 20) {
-    lines.push(row(
-      ansi("33;1", `WORKER LIVENESS · ${silentWorkers} silent · ${stalledWorkers} possibly stalled`, model.color),
-      width,
-      model.color
-    ));
-  }
+  const workerSlots = height >= 36 ? 3 : height >= 24 ? 2 : 1;
+  if (!runningRows.length) lines.push(row(`${ansi("2", "none", model.color)}  ·  no background process, PTY, or subagent`, width, model.color));
+  else for (const item of runningRows.slice(0, workerSlots)) lines.push(row(item, width, model.color));
+  if (runningRows.length > workerSlots) lines.push(row(`… ${runningRows.length - workerSlots} more running item(s)`, width, model.color));
 
   lines.push(section("Activity", width, model.color));
-  const footerReserve = height >= 18 ? 4 : 2;
+  const footerReserve = 3;
   const recentSlots = Math.max(1, Math.min(20, height - lines.length - footerReserve));
   const recent = model.runtime.recent.slice(0, recentSlots);
   if (!recent.length) lines.push(row(`${ansi("2", "no completed calls yet", model.color)}`, width));
@@ -368,25 +608,9 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
     lines.push(row(`${toolStatusSymbol(item.status, model.color)} ${ansi("2", time, model.color)} ${kindLabel(item.kind, model.color)} ${ansi("1", item.tool.padEnd(21).slice(0, 21), model.color)} ${ansi("2", formatDuration(item.duration_ms).padStart(6), model.color)}  ${summary}`, width, model.color));
   }
 
-  if (height >= 18) {
-    lines.push(section("Usage", width, model.color));
-    const usage = model.runtime.usage.slice(0, 6).map((item) => {
-      const repeated = item.repeated_calls ? ` r${item.repeated_calls}` : "";
-      return `${item.tool} ${item.calls} p95:${formatDuration(item.p95_duration_ms)} ${formatBytes(item.total_result_bytes)}${repeated}`;
-    }).join("  ·  ");
-    lines.push(row(usage || ansi("2", "No tool usage yet", model.color), width, model.color));
-  }
-
-  const latestProblem = [...model.messages].reverse().find(
-    (item) => item.level !== "info" && nowMs - Date.parse(item.time) < 15_000
-  );
-  if (latestProblem) {
-    const label = latestProblem.level === "error" ? ansi("31;1", "ERROR", model.color) : ansi("33;1", "WARN", model.color);
-    lines.push(row(`${label} ${latestProblem.text}`, width, model.color));
-  } else {
-    const permission = model.permission.split(":", 1)[0];
-    lines.push(row(`${metric("POLICY", permission, model.color, permission === "open" ? "32;1" : "33;1")}  ·  ${ansi("2", lastToolLabel(model.runtime, nowMs), model.color)}  ·  ${metric("CALLS", `${model.runtime.total_calls}/${model.runtime.total_errors} err`, model.color, model.runtime.total_errors ? "31;1" : "32;1")}  ·  ${ansi("2", "Ctrl+C stop", model.color)}`, width, model.color));
-  }
+  while (lines.length < height - 3) lines.push(row("", width, model.color));
+  lines.push(section("Health", width, model.color));
+  lines.push(alertRow(alert, width, model.color));
   lines.push(tone(`└${"─".repeat(inner)}┘`, model.color, "2"));
   return finishFrame(lines, width, height, model.color);
 }
