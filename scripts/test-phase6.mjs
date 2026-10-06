@@ -37,7 +37,7 @@ const affinity = await import("../dist/lib/project-affinity.js");
 const tasks = await import("../dist/lib/agent-task-store.js");
 const transactions = await import("../dist/lib/edit-transaction-store.js");
 const capsules = await import("../dist/lib/context-capsule-store.js");
-const { createTunnelSupervisor } = await import("../dist/lib/tunnel-supervisor.js");
+const { createTunnelSupervisor, redactTunnelDiagnosticText } = await import("../dist/lib/tunnel-supervisor.js");
 const { shutdownManagedProcesses } = await import("../dist/tools/shell.js");
 const subagentManager = await import("../dist/lib/subagent-manager.js");
 const { SCHEMA_CONTRACT_VERSION } = await import("../dist/lib/runtime-identity.js");
@@ -650,6 +650,34 @@ await test("healthy endpoint with stale tunnel profile is not silently reused", 
     else process.env.OPENAI_TUNNEL_API_KEY = previous.key;
     if (previous.health === undefined) delete process.env.OPENAI_TUNNEL_HEALTH_PORT;
     else process.env.OPENAI_TUNNEL_HEALTH_PORT = previous.health;
+  }
+});
+
+await test("tunnel diagnostics redact MCP and API secrets", async () => {
+  const previous = {
+    token: process.env.MCP_TOKEN,
+    apiKey: process.env.OPENAI_TUNNEL_API_KEY,
+    controlPlaneKey: process.env.CONTROL_PLANE_API_KEY,
+  };
+  try {
+    process.env.MCP_TOKEN = "phase6-secret-mcp-token";
+    process.env.OPENAI_TUNNEL_API_KEY = "phase6-secret-api-key";
+    process.env.CONTROL_PLANE_API_KEY = "phase6-secret-control-key";
+    const redacted = redactTunnelDiagnosticText(
+      "target=http://127.0.0.1:3000/mcp/phase6-secret-mcp-token " +
+      "api=phase6-secret-api-key control=phase6-secret-control-key"
+    );
+    assert.doesNotMatch(redacted, /phase6-secret-mcp-token/);
+    assert.doesNotMatch(redacted, /phase6-secret-api-key/);
+    assert.doesNotMatch(redacted, /phase6-secret-control-key/);
+    assert.match(redacted, /\[REDACTED\]/);
+  } finally {
+    if (previous.token === undefined) delete process.env.MCP_TOKEN;
+    else process.env.MCP_TOKEN = previous.token;
+    if (previous.apiKey === undefined) delete process.env.OPENAI_TUNNEL_API_KEY;
+    else process.env.OPENAI_TUNNEL_API_KEY = previous.apiKey;
+    if (previous.controlPlaneKey === undefined) delete process.env.CONTROL_PLANE_API_KEY;
+    else process.env.CONTROL_PLANE_API_KEY = previous.controlPlaneKey;
   }
 });
 

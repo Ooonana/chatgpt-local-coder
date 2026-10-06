@@ -39,6 +39,21 @@ function appendBounded(current: string, value: string): string {
   return next.length > MAX_LOG_CHARS ? next.slice(-MAX_LOG_CHARS) : next;
 }
 
+export function redactTunnelDiagnosticText(value: string): string {
+  let redacted = value;
+  const secrets = [
+    process.env.MCP_TOKEN,
+    process.env.OPENAI_TUNNEL_API_KEY,
+    process.env.CONTROL_PLANE_API_KEY,
+  ]
+    .map((secret) => (secret || "").trim())
+    .filter(Boolean);
+  for (const secret of [...new Set(secrets)]) {
+    redacted = redacted.split(secret).join("[REDACTED]");
+  }
+  return redacted;
+}
+
 async function ready(port: number): Promise<boolean> {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/readyz`, {
@@ -147,8 +162,8 @@ export function createTunnelSupervisor(options: {
     last_exit_code: lastExitCode,
     restarts,
     reused_external: reusedExternal,
-    last_error: lastError,
-    log_tail: logTail,
+    last_error: lastError ? redactTunnelDiagnosticText(lastError) : null,
+    log_tail: redactTunnelDiagnosticText(logTail),
   });
 
   const pollHealth = async () => {
@@ -239,10 +254,10 @@ export function createTunnelSupervisor(options: {
       });
       child = spawned;
       spawned.stdout!.on("data", (data: Buffer) => {
-        logTail = appendBounded(logTail, data.toString());
+        logTail = appendBounded(logTail, redactTunnelDiagnosticText(data.toString()));
       });
       spawned.stderr!.on("data", (data: Buffer) => {
-        logTail = appendBounded(logTail, data.toString());
+        logTail = appendBounded(logTail, redactTunnelDiagnosticText(data.toString()));
       });
       spawned.once("error", (error) => {
         lastError = error.message;
