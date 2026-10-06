@@ -30,8 +30,18 @@ import { requireUnsafeRuntimeAllowed } from "./lib/permissions.js";
 import {
   autoCheckpointContextCapsule,
   getContextCapsuleHeuristicConfig,
+  resumeContextCapsule,
 } from "./lib/context-capsule-store.js";
 import { invalidateTextReadCache } from "./lib/text-read-cache.js";
+import path from "node:path";
+import {
+  bindCurrentSessionMachine,
+  bindCurrentSessionProject,
+  getCurrentSessionState,
+  runWithSessionContext,
+} from "./lib/session-context.js";
+import { detectProjectRoot, isProjectRoot } from "./lib/project-affinity.js";
+import { audit } from "./lib/audit.js";
 
 // OpenAI Secure MCP Tunnel rejects request/response bodies above 10 MiB.
 // Keep a healthy margin for the JSON-RPC/SSE envelope so an oversized tool
@@ -55,6 +65,37 @@ function hookPathFromArguments(value: unknown): string | undefined {
     if (typeof record[key] === "string" && record[key]) return record[key] as string;
   }
   return undefined;
+}
+
+function scopePathFromArguments(value: unknown): string | undefined {
+  const direct = hookPathFromArguments(value);
+  if (direct) return direct;
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.files)) {
+    const first = record.files.find((item) =>
+      item && typeof item === "object" && typeof (item as Record<string, unknown>).path === "string"
+    ) as Record<string, unknown> | undefined;
+    if (first?.path) return String(first.path);
+  }
+  if (Array.isArray(record.commands)) {
+    const dirs = [...new Set(record.commands
+      .map((item) => item && typeof item === "object"
+        ? (item as Record<string, unknown>).working_directory
+        : undefined)
+      .filter((item): item is string => typeof item === "string" && Boolean(item)))];
+    if (dirs.length === 1) return dirs[0];
+  }
+  return undefined;
+}
+
+async function bindToolExecutionScope(input: unknown, workspaceRoot: string): Promise<void> {
+  const candidate = scopePathFromArguments(input);
+  if (!candidate) return;
+  const absolute = path.isAbsolute(candidate) ? candidate : path.resolve(workspaceRoot, candidate);
+  const root = await detectProjectRoot(absolute);
+  if (await isProjectRoot(root)) bindCurrentSessionProject(root);
+  else bindCurrentSessionMachine();
 }
 
 function boundedHookValue(value: unknown, maxChars = 100_000): unknown {
@@ -182,6 +223,40 @@ function attachContextCheckpointHint(result: unknown, hint: Record<string, unkno
   return result;
 }
 
+function runtimeDomainOutcome(result: unknown): {
+  domain_ok: boolean | null;
+  verification_passed?: boolean | null;
+  failure_category?: string;
+  timed_out?: boolean;
+} {
+  if (!result || typeof result !== "object") return { domain_ok: null };
+  const structured = (result as { structuredContent?: unknown }).structuredContent;
+  if (!structured || typeof structured !== "object") return { domain_ok: null };
+  const payload = structured as Record<string, unknown>;
+  const data = payload.data && typeof payload.data === "object"
+    ? payload.data as Record<string, unknown>
+    : {};
+  const verificationPassed =
+    typeof data.verification_passed === "boolean" ? data.verification_passed : undefined;
+  const failure = data.failure && typeof data.failure === "object"
+    ? data.failure as Record<string, unknown>
+    : undefined;
+  const failureCategory = failure && typeof failure.category === "string"
+    ? failure.category
+    : undefined;
+  const timedOut = data.timed_out === true ||
+    (Array.isArray(data.results) && data.results.some((item) =>
+      item && typeof item === "object" && (item as Record<string, unknown>).timed_out === true
+    ));
+  const envelopeOk = typeof payload.ok === "boolean" ? payload.ok : null;
+  return {
+    domain_ok: verificationPassed === false ? false : envelopeOk,
+    ...(verificationPassed !== undefined ? { verification_passed: verificationPassed } : {}),
+    ...(failureCategory ? { failure_category: failureCategory } : {}),
+    ...(timedOut ? { timed_out: true } : {}),
+  };
+}
+
 function terminalContextAction(toolName: string, input: unknown): { task: boolean; loop: boolean } {
   const action = input && typeof input === "object" && typeof (input as Record<string, unknown>).action === "string"
     ? String((input as Record<string, unknown>).action)
@@ -192,7 +267,7 @@ function terminalContextAction(toolName: string, input: unknown): { task: boolea
   };
 }
 
-function configureToolRegistration(server: McpServer, workspaceRoot: string): void {
+function configureToolRegistration(server: McpServer, workspaceRoot: string, sessionId: string): void {
   const profile = getChatGptToolProfile();
   const contextHeuristic = getContextCapsuleHeuristicConfig();
   let toolCallsSinceContextSnapshot = 0;
@@ -221,10 +296,12 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string): vo
         ? { ...config, outputSchema: TOOL_RESULT_OUTPUT_SCHEMA }
         : config;
 
-    const wrapped = async (...callbackArgs: any[]) => {
+    const wrapped = async (...callbackArgs: any[]) => runWithSessionContext(sessionId, async () => {
       const input = callbackArgs[0];
+      await bindToolExecutionScope(input, workspaceRoot).catch(() => undefined);
       const path = hookPathFromArguments(input);
       const readOnly = nextConfig.annotations?.readOnlyHint === true;
+      const runtimeStartedAt = Date.now();
       const runtimeCallId = beginToolCall({
         tool: toolName,
         kind: runtimeToolKind(isUpstreamProxy, nextConfig),
@@ -292,6 +369,16 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string): vo
                   reason,
                   ...links,
                 });
+                // Auto checkpointing deliberately deduplicates identical machine
+                // state. A deduped disk write must still consume the context
+                // budget cycle and emit the semantic checkpoint / rollover hint,
+                // so recover the existing capsule without writing it again.
+                if (!capsule && budgetDue && (links.task_id || links.coding_loop_id)) {
+                  capsule = await resumeContextCapsule({
+                    workspace: currentLinks.workspace || contextWorkspaceHint,
+                    ...links,
+                  });
+                }
               } catch (error) {
                 checkpointError = error instanceof Error ? error.message : String(error);
               }
@@ -336,7 +423,23 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string): vo
             ...common,
             result: boundedHookValue(result, 50_000),
           }).catch(() => undefined);
-          finishToolCall(runtimeCallId, "ok", undefined, serializedBytes(result));
+          const resultBytes = serializedBytes(result);
+          finishToolCall(runtimeCallId, "ok", undefined, resultBytes);
+          const sessionState = getCurrentSessionState();
+          await audit({
+            tool: toolName,
+            action: "__runtime",
+            target: sessionState?.project_root || path || undefined,
+            status: "ok",
+            details: {
+              tool_ok: true,
+              duration_ms: Math.max(0, Date.now() - runtimeStartedAt),
+              result_bytes: resultBytes,
+              project_root: sessionState?.project_root || null,
+              workspace_kind: sessionState?.workspace_kind || "unbound",
+              ...runtimeDomainOutcome(result),
+            },
+          });
           return result;
         } catch (error) {
           await runLocalHooks("post_tool_use", {
@@ -347,11 +450,27 @@ function configureToolRegistration(server: McpServer, workspaceRoot: string): vo
         }
       } catch (error) {
         finishToolCall(runtimeCallId, "error", error instanceof Error ? error.message : String(error));
+        const sessionState = getCurrentSessionState();
+        await audit({
+          tool: toolName,
+          action: "__runtime",
+          target: sessionState?.project_root || path || undefined,
+          status: "error",
+          details: {
+            tool_ok: false,
+            domain_ok: null,
+            duration_ms: Math.max(0, Date.now() - runtimeStartedAt),
+            result_bytes: 0,
+            project_root: sessionState?.project_root || null,
+            workspace_kind: sessionState?.workspace_kind || "unbound",
+            error: error instanceof Error ? error.message : String(error),
+          },
+        }).catch(() => undefined);
         throw error;
       } finally {
         if (!readOnly) invalidateTextReadCache();
       }
-    };
+    });
 
     return original(name, nextConfig as any, wrapped as any);
   }) as typeof server.registerTool;
@@ -363,7 +482,8 @@ export function createMcpServer(
   workspaceRoots: string[] = [workspaceRoot],
   fullDiskAccess = false,
   upstreamManager?: McpUpstreamManager,
-  projectMemoryInstructions?: string
+  projectMemoryInstructions?: string,
+  sessionId = "legacy"
 ): McpServer {
   const server = new McpServer(
     {
@@ -384,10 +504,10 @@ export function createMcpServer(
     }
   );
 
-  configureToolRegistration(server, workspaceRoot);
+  configureToolRegistration(server, workspaceRoot, sessionId);
 
   registerFilesystemTools(server);
-  registerShellTools(server, workspaceRoot, shellTimeout);
+  registerShellTools(server, workspaceRoot, shellTimeout, sessionId);
   registerGitTools(server, workspaceRoot);
   registerContextTools(server, workspaceRoot);
   registerNodeReplTool(server, workspaceRoot);

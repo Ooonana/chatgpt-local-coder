@@ -36,10 +36,13 @@ const call = async (name, args) => client.callTool({ name, arguments: args });
 await run("new tools are exposed in slim", async () => {
   const listed = await client.listTools();
   const names = new Set(listed.tools.map((tool) => tool.name));
-  for (const name of ["run_commands_parallel", "view_image", "lsp", "pty", "subagent", "delegate_status", "read_files", "inspect_project", "verify_project", "process_history"]) {
+  for (const name of ["run_commands_parallel", "view_image", "pty", "subagent", "read_files", "inspect_project", "verify_project", "process_history", "repo_intel"]) {
     if (!names.has(name)) throw new Error(`${name} not exposed`);
   }
-  for (const name of ["shell_reset", "directory_tree", "git_log", "delete_directory", "git_reset", "git_push", "mcp_call"]) {
+  for (const name of [
+    "shell_reset", "directory_tree", "git_log", "delete_directory", "git_reset", "git_push", "mcp_call",
+    "lsp", "delegate_status", "multi_edit", "delete_file", "git_add", "git_restore",
+  ]) {
     if (names.has(name)) throw new Error(`${name} should remain hidden in slim`);
   }
 });
@@ -131,28 +134,39 @@ await run("oversized native tool results fail explicitly before transport", asyn
   if (!/safe transport limit|Narrow or chunk/.test(text)) throw new Error(text.slice(0, 1000));
 });
 
+const previousProfile = process.env.CHATGPT_TOOL_PROFILE;
+process.env.CHATGPT_TOOL_PROFILE = "full";
+const [fullClientTransport, fullServerTransport] = InMemoryTransport.createLinkedPair();
+const fullServer = createMcpServer(root, 15, [root], true);
+const fullClient = new Client({ name: "modern-tools-full-test", version: "1.0.0" }, { capabilities: {} });
+await fullServer.connect(fullServerTransport);
+await fullClient.connect(fullClientTransport);
+const fullCall = async (name, args) => fullClient.callTool({ name, arguments: args });
+if (previousProfile === undefined) delete process.env.CHATGPT_TOOL_PROFILE;
+else process.env.CHATGPT_TOOL_PROFILE = previousProfile;
+
 await run("TypeScript LSP hover and definition", async () => {
   const file = path.join(tmp, "sample.ts");
   await fs.writeFile(file, "const value: number = 42;\nfunction twice(x: number){ return x * 2; }\nconsole.log(twice(value));\n");
-  const hover = await call("lsp", { action: "hover", path: file, line: 3, column: 20 });
+  const hover = await fullCall("lsp", { action: "hover", path: file, line: 3, column: 20 });
   const hoverText = JSON.stringify(hover.structuredContent?.data?.result || null);
   if (!hoverText.includes("value") || !hoverText.includes("number")) throw new Error(hoverText);
-  const definition = await call("lsp", { action: "definition", path: file, line: 3, column: 20 });
+  const definition = await fullCall("lsp", { action: "definition", path: file, line: 3, column: 20 });
   const defText = JSON.stringify(definition.structuredContent?.data?.result || null);
   if (!defText.includes("sample.ts")) throw new Error(defText);
-  await call("lsp", { action: "shutdown", server: "typescript" });
+  await fullCall("lsp", { action: "shutdown", server: "typescript" });
 });
 
 await run("Python LSP hover and definition", async () => {
   const file = path.join(tmp, "sample.py");
   await fs.writeFile(file, "value: int = 42\ndef twice(x: int) -> int:\n    return x * 2\nprint(twice(value))\n");
-  const hover = await call("lsp", { action: "hover", path: file, line: 4, column: 13 });
+  const hover = await fullCall("lsp", { action: "hover", path: file, line: 4, column: 13 });
   const hoverText = JSON.stringify(hover.structuredContent?.data?.result || null);
   if (!hoverText.includes("value")) throw new Error(hoverText);
-  const definition = await call("lsp", { action: "definition", path: file, line: 4, column: 13 });
+  const definition = await fullCall("lsp", { action: "definition", path: file, line: 4, column: 13 });
   const defText = JSON.stringify(definition.structuredContent?.data?.result || null);
   if (!defText.includes("sample.py")) throw new Error(defText);
-  await call("lsp", { action: "shutdown", server: "pyright" });
+  await fullCall("lsp", { action: "shutdown", server: "pyright" });
 });
 
 await run("PTY provides interactive terminal I/O", async () => {
@@ -179,7 +193,9 @@ await run("PTY provides interactive terminal I/O", async () => {
   }
 });
 
-await call("lsp", { action: "shutdown" }).catch(() => {});
+await fullCall("lsp", { action: "shutdown" }).catch(() => {});
+await fullClient.close().catch(() => {});
+await fullServer.close().catch(() => {});
 await client.close().catch(() => {});
 await server.close().catch(() => {});
 await fs.rm(tmp, { recursive: true, force: true });

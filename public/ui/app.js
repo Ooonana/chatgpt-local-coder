@@ -126,10 +126,15 @@ function runtimeKind(kind) {
 function renderRuntimeOverview(runtimeInfo) {
   const runtime = runtimeInfo.runtime || {};
   const identity = runtimeInfo.identity || {};
-  const affinity = runtimeInfo.project_affinity || {};
   const now = Date.now();
   const active = Array.isArray(runtime.active) ? runtime.active : [];
   const recent = Array.isArray(runtime.recent) ? runtime.recent : [];
+  const processes = Array.isArray(runtimeInfo.processes) ? runtimeInfo.processes : [];
+  const tasks = Array.isArray(runtimeInfo.agent_tasks) ? runtimeInfo.agent_tasks : [];
+  const operations = Array.isArray(runtimeInfo.operations) ? runtimeInfo.operations : [];
+  const loops = Array.isArray(runtimeInfo.coding_loops) ? runtimeInfo.coding_loops : [];
+  const transactions = Array.isArray(runtimeInfo.edit_transactions) ? runtimeInfo.edit_transactions : [];
+  const tunnel = runtimeInfo.tunnel || {};
   const workers = [runtimeInfo.processes, runtimeInfo.ptys, runtimeInfo.subagents]
     .flatMap((items) => Array.isArray(items) ? items : [])
     .filter((item) => item.running).length;
@@ -153,12 +158,59 @@ function renderRuntimeOverview(runtimeInfo) {
   if (errorsStat) errorsStat.textContent = String(runtime.total_errors ?? 0);
   const runStat = document.getElementById("stat-run-id");
   const schemaStat = document.getElementById("stat-schema");
-  const projectStat = document.getElementById("stat-project");
-  const projectSub = document.getElementById("stat-project-sub");
   if (runStat) runStat.textContent = identity.run_id ? String(identity.run_id).replace(/^run_/, "").slice(0, 12) : "—";
   if (schemaStat) schemaStat.textContent = identity.schema_hash ? String(identity.schema_hash).slice(0, 12) : "—";
-  if (projectStat) projectStat.textContent = affinity.active_alias || "—";
-  if (projectSub) projectSub.textContent = affinity.active_root || "No active project";
+
+  const sessionEl = document.getElementById("dash-sessions");
+  const sessionCount = document.getElementById("dash-session-count");
+  const workspaceMap = new Map();
+  const addWorkspace = (root, kind, label) => {
+    const normalized = root ? String(root).replace(/[\\/]+$/, "") : "__machine__";
+    const key = normalized.toLowerCase();
+    const row = workspaceMap.get(key) || {
+      root: root || null,
+      label: root ? (String(root).split(/[/\\]/).filter(Boolean).pop() || "Project") : "Machine / host",
+      tools: 0, jobs: 0, tasks: 0, loops: 0, transactions: 0,
+    };
+    row[kind] += 1;
+    if (label && !row.detail) row.detail = label;
+    workspaceMap.set(key, row);
+  };
+  for (const item of active) if (item.project_root) addWorkspace(item.project_root, "tools", item.tool);
+  for (const item of processes.filter((item) => item.running)) addWorkspace(item.project_root || null, "jobs", item.label || item.command);
+  for (const task of tasks.filter((task) => task.status === "active" || task.status === "blocked")) addWorkspace(task.workspace, "tasks", task.title);
+  for (const loop of loops.filter((loop) => loop.status === "active")) addWorkspace(loop.workspace, "loops", loop.goal);
+  for (const tx of transactions.filter((tx) => tx.status === "active")) addWorkspace(tx.workspace, "transactions", tx.label || tx.id);
+  const workspaceRows = [...workspaceMap.values()].sort((a, b) => {
+    const total = (row) => row.tools + row.jobs + row.tasks + row.loops + row.transactions;
+    return total(b) - total(a);
+  });
+  if (sessionCount) sessionCount.textContent = String(workspaceRows.length);
+  if (sessionEl) {
+    sessionEl.innerHTML = workspaceRows.length
+      ? workspaceRows.slice(0, 16).map((row) => {
+          const summary = [
+            row.tools ? `${row.tools} tool${row.tools === 1 ? "" : "s"}` : "",
+            row.jobs ? `${row.jobs} job${row.jobs === 1 ? "" : "s"}` : "",
+            row.tasks ? `${row.tasks} task${row.tasks === 1 ? "" : "s"}` : "",
+            row.loops ? `${row.loops} loop${row.loops === 1 ? "" : "s"}` : "",
+            row.transactions ? `${row.transactions} transaction${row.transactions === 1 ? "" : "s"}` : "",
+          ].filter(Boolean).join(" · ");
+          const liveness = processes
+            .filter((item) => item.running && (row.root ? item.project_root === row.root : !item.project_root))
+            .map((item) => item.liveness);
+          const warn = liveness.includes("possibly_stalled") || liveness.includes("silent");
+          return `<div class="runtime-row session-row">
+            <span class="runtime-kind ${row.root ? "edit" : "operation"}">${row.root ? "PROJ" : "HOST"}</span>
+            <span class="runtime-tool ${warn ? "runtime-state-warn" : "runtime-state-ok"}" title="${esc(row.root || "Machine / host")}">
+              <span class="session-workspace"><strong>${esc(row.label)}</strong></span>
+            </span>
+            <span class="runtime-summary" title="${esc(row.root || row.detail || summary)}">${esc(summary || row.detail || "active")}</span>
+            <span class="runtime-time">${warn ? "check liveness" : "active"}</span>
+          </div>`;
+        }).join("")
+      : '<div class="runtime-empty">No active project or machine work.</div>';
+  }
 
   const activeEl = document.getElementById("dash-active");
   activeEl.innerHTML = active.length
@@ -202,7 +254,47 @@ function renderRuntimeOverview(runtimeInfo) {
       : '<div class="runtime-empty">No tool telemetry yet.</div>';
   }
 
-  const tasks = Array.isArray(runtimeInfo.agent_tasks) ? runtimeInfo.agent_tasks : [];
+  const persistent = runtimeInfo.persistent_telemetry || null;
+  const persistentEl = document.getElementById("dash-persistent-telemetry");
+  const persistentCount = document.getElementById("dash-persistent-count");
+  const days7 = persistent?.windows?.days_7;
+  const days30 = persistent?.windows?.days_30;
+  if (persistentCount) persistentCount.textContent = String(days30?.calls || 0);
+  if (persistentEl) {
+    if (!persistent || !persistent.canonical_runtime_records) {
+      persistentEl.innerHTML = '<div class="runtime-empty">Canonical Phase 6 telemetry starts accumulating after this build is restarted.</div>';
+    } else {
+      const summaryRows = [
+        { label: "7 DAYS", value: days7 },
+        { label: "30 DAYS", value: days30 },
+      ];
+      const summaryHtml = summaryRows.map(({ label, value }) => {
+        const text = String(value?.calls || 0) + " call(s) · " +
+          String(value?.runtime_errors || 0) + " runtime error(s) · " +
+          String(value?.domain_failures || 0) + " domain failure(s) · " +
+          String(value?.timeouts || 0) + " timeout(s)";
+        return '<div class="runtime-row">' +
+          '<span class="runtime-kind read">' + esc(label) + '</span>' +
+          '<span class="runtime-tool">' + formatBytes(value?.total_result_bytes || 0) + '</span>' +
+          '<span class="runtime-summary" title="' + esc(text) + '">' + esc(text) + '</span>' +
+          '<span class="runtime-time">' + String(persistent.source_files || 0) + ' log(s)</span>' +
+          '</div>';
+      }).join("");
+      const toolHtml = (days30?.tools || []).slice(0, 8).map((item) => {
+        const summary = String(item.calls) + " call(s) · runtime " + String(item.runtime_errors) +
+          " · domain " + String(item.domain_failures) + " · timeout " + String(item.timeouts) +
+          " · p95 " + formatElapsed(item.p95_duration_ms || 0);
+        return '<div class="runtime-row">' +
+          '<span class="runtime-kind read">30D</span>' +
+          '<span class="runtime-tool" title="' + esc(item.tool) + '">' + esc(item.tool) + '</span>' +
+          '<span class="runtime-summary" title="' + esc(summary) + '">' + esc(summary) + '</span>' +
+          '<span class="runtime-time">' + formatBytes(item.total_result_bytes || 0) + '</span>' +
+          '</div>';
+      }).join("");
+      persistentEl.innerHTML = summaryHtml + toolHtml;
+    }
+  }
+
   const resumable = tasks.filter((task) => task.status === "active" || task.status === "blocked");
   document.getElementById("dash-task-count").textContent = String(resumable.length);
   const taskEl = document.getElementById("dash-agent-task");
@@ -211,16 +303,16 @@ function renderRuntimeOverview(runtimeInfo) {
         const progress = task.progress || {};
         const step = progress.current_step || progress.next_step;
         const stateClass = task.status === "blocked" ? "runtime-state-error" : "runtime-state-ok";
+        const project = String(task.workspace || "").split(/[/\\]/).filter(Boolean).pop() || "project";
         return `<div class="runtime-row agent-task-row">
           <span class="runtime-kind task">TASK</span>
-          <span class="runtime-tool ${stateClass}" title="${esc(task.title)}">${esc(task.title)}</span>
+          <span class="runtime-tool ${stateClass}" title="${esc(task.title)}">${esc(project)} · ${esc(task.title)}</span>
           <span class="runtime-summary" title="${esc(step?.title || task.objective)}">${esc(step?.title || task.objective)}</span>
           <span class="runtime-time">${progress.percent ?? 0}%</span>
         </div>`;
       }).join("")
     : '<div class="runtime-empty">No active persistent agent task.</div>';
 
-  const operations = Array.isArray(runtimeInfo.operations) ? runtimeInfo.operations : [];
   document.getElementById("dash-operation-count").textContent = String(operations.length);
   const operationsEl = document.getElementById("dash-operations");
   operationsEl.innerHTML = operations.length
@@ -241,7 +333,6 @@ function renderRuntimeOverview(runtimeInfo) {
       }).join("")
     : '<div class="runtime-empty">No persistent background operations yet.</div>';
 
-  const loops = Array.isArray(runtimeInfo.coding_loops) ? runtimeInfo.coding_loops : [];
   const activeLoops = loops.filter((loop) => loop.status === "active");
   document.getElementById("dash-loop-count").textContent = String(activeLoops.length);
   const loopsEl = document.getElementById("dash-loops");
@@ -255,16 +346,16 @@ function renderRuntimeOverview(runtimeInfo) {
         const updated = Date.parse(loop.updated_at || "");
         const age = Number.isFinite(updated) ? `${formatElapsed(now - updated)} ago` : "—";
         const summary = `${phase} · attempt ${attempt} · ${mode}`;
+        const project = String(loop.workspace || "").split(/[/\\]/).filter(Boolean).pop() || "project";
         return `<div class="runtime-row loop-row">
           <span class="runtime-kind loop">LOOP</span>
-          <span class="runtime-tool ${stateClass}" title="${esc(loop.id)}">${esc(loop.goal || loop.id)}</span>
+          <span class="runtime-tool ${stateClass}" title="${esc(loop.id)}">${esc(project)} · ${esc(loop.goal || loop.id)}</span>
           <span class="runtime-summary" title="${esc(summary)}">${esc(summary)}</span>
           <span class="runtime-time">${age}</span>
         </div>`;
       }).join("")
     : '<div class="runtime-empty">No coding loops yet.</div>';
 
-  const transactions = Array.isArray(runtimeInfo.edit_transactions) ? runtimeInfo.edit_transactions : [];
   const activeTransactions = transactions.filter((transaction) => transaction.status === "active");
   document.getElementById("dash-transaction-count").textContent = String(activeTransactions.length);
   const transactionsEl = document.getElementById("dash-transactions");
@@ -278,9 +369,10 @@ function renderRuntimeOverview(runtimeInfo) {
         const updated = Date.parse(transaction.updated_at || "");
         const age = Number.isFinite(updated) ? `${formatElapsed(now - updated)} ago` : "—";
         const summary = `${transaction.files || 0} file(s), ${transaction.edits || 0} edit(s), ${verification}`;
+        const project = String(transaction.workspace || "").split(/[/\\]/).filter(Boolean).pop() || "project";
         return `<div class="runtime-row transaction-row">
           <span class="runtime-kind transaction">${esc(status.toUpperCase().slice(0, 5))}</span>
-          <span class="runtime-tool ${stateClass}" title="${esc(transaction.id)}">${esc(transaction.label || transaction.id)}</span>
+          <span class="runtime-tool ${stateClass}" title="${esc(transaction.id)}">${esc(project)} · ${esc(transaction.label || transaction.id)}</span>
           <span class="runtime-summary" title="${esc(summary)}">${esc(summary)}</span>
           <span class="runtime-time">${age}</span>
         </div>`;
@@ -363,25 +455,36 @@ async function loadDashboard() {
   const instr = health.instructions || {};
   const memCount = instr.memory_files?.length ?? 0;
   const gitBranch = instr.git?.branch || (instr.git?.is_repo === false ? "—" : "?");
+  const transports = Array.isArray(runtimeInfo.sessions) ? runtimeInfo.sessions : [];
+  const activeWorkspaceRoots = new Set([
+    ...(runtimeInfo.processes || []).filter((item) => item.running && item.project_root).map((item) => item.project_root),
+    ...(runtimeInfo.agent_tasks || []).filter((item) => item.status === "active" || item.status === "blocked").map((item) => item.workspace),
+    ...(runtimeInfo.coding_loops || []).filter((item) => item.status === "active").map((item) => item.workspace),
+    ...(runtimeInfo.edit_transactions || []).filter((item) => item.status === "active").map((item) => item.workspace),
+  ].filter(Boolean));
+  const machineJobs = (runtimeInfo.processes || []).filter((item) => item.running && !item.project_root).length;
+  const tunnel = runtimeInfo.tunnel || health.tunnel || {};
   document.getElementById("overview-transport").textContent = `${transport} · :${health.mcp_port}`;
   document.getElementById("stat-grid").innerHTML = `
     <div class="stat"><div class="stat-label">MCP Port</div><div class="stat-value">${health.mcp_port}</div></div>
     <div class="stat"><div class="stat-label">Transport</div><div class="stat-value">${esc(transport)}</div></div>
-    <div class="stat"><div class="stat-label">Sessions</div><div class="stat-value">${health.active_sessions}</div></div>
+    <div class="stat"><div class="stat-label">MCP transports</div><div class="stat-value">${transports.length || health.active_sessions}</div></div>
     <div class="stat"><div class="stat-label">Active tools</div><div class="stat-value" id="stat-active-tools">${activeTools}</div></div>
     <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" id="stat-workers">${workers}</div></div>
     <div class="stat"><div class="stat-label">Tool calls</div><div class="stat-value" id="stat-calls">${runtimeInfo.runtime?.total_calls ?? 0}</div></div>
     <div class="stat"><div class="stat-label">Errors</div><div class="stat-value" id="stat-errors">${runtimeInfo.runtime?.total_errors ?? 0}</div></div>
     <div class="stat"><div class="stat-label">Run ID</div><div class="stat-value" id="stat-run-id" style="font-size:0.85rem">${esc((runtimeInfo.identity?.run_id || "—").replace(/^run_/, "").slice(0, 12))}</div></div>
-    <div class="stat"><div class="stat-label">Schema</div><div class="stat-value" id="stat-schema" style="font-size:0.85rem">${esc((runtimeInfo.identity?.schema_hash || "—").slice(0, 12))}</div></div>
+    <div class="stat"><div class="stat-label">Schema</div><div class="stat-value" id="stat-schema" style="font-size:0.85rem">v${esc(runtimeInfo.identity?.schema_contract_version ?? "?")} · ${esc((runtimeInfo.identity?.schema_hash || "—").slice(0, 8))}</div></div>
     <div class="stat"><div class="stat-label">Policy</div><div class="stat-value">${esc(policy)}</div></div>
+    <div class="stat"><div class="stat-label">Tunnel</div><div class="stat-value" style="font-size:0.95rem">${esc(String(tunnel.status || "unknown").toUpperCase())}</div>
+      <div class="stat-sub">${tunnel.health_port ? `health :${esc(tunnel.health_port)} · ` : ""}${esc(tunnel.restarts ?? 0)} restart(s)</div></div>
+    <div class="stat"><div class="stat-label">Active workspaces</div><div class="stat-value">${activeWorkspaceRoots.size + (machineJobs ? 1 : 0)}</div>
+      <div class="stat-sub">${activeWorkspaceRoots.size} project(s)${machineJobs ? ` · ${machineJobs} machine job(s)` : ""}</div></div>
     <div class="stat"><div class="stat-label">Project memory</div><div class="stat-value">${memCount} file(s)</div>
       <div class="stat-sub">${instr.instruction_bytes ? Math.round(instr.instruction_bytes / 1024) + " KB instructions" : ""}</div></div>
     <div class="stat"><div class="stat-label">Git branch</div><div class="stat-value" style="font-size:0.85rem">${esc(gitBranch)}</div></div>
-    <div class="stat"><div class="stat-label">Workspace</div><div class="stat-value" style="font-size:0.85rem">${esc(health.default_cwd?.split(/[/\\]/).pop())}</div>
-      <div class="stat-sub">${esc(health.default_cwd)}</div></div>
-    <div class="stat"><div class="stat-label">Active project</div><div class="stat-value" id="stat-project" style="font-size:0.85rem">${esc(runtimeInfo.project_affinity?.active_alias || "—")}</div>
-      <div class="stat-sub" id="stat-project-sub">${esc(runtimeInfo.project_affinity?.active_root || "No active project")}</div></div>`;
+    <div class="stat"><div class="stat-label">Server workspace</div><div class="stat-value" style="font-size:0.85rem">${esc(health.default_cwd?.split(/[/\\]/).pop())}</div>
+      <div class="stat-sub">${esc(health.default_cwd)}</div></div>`;
   document.getElementById("dash-servers").innerHTML = serversTable(health.upstream || [], { actions: false });
   document.getElementById("status-json").textContent = JSON.stringify(health, null, 2);
   renderRuntimeOverview(runtimeInfo);

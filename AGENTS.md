@@ -14,6 +14,7 @@ The default project's memory and Git state are already injected into MCP instruc
 - The default `open` permission profile allows full local paths, commands, and configured runtimes (subject to OS ACLs). `workspace`, `read_only`, and `custom` profiles can restrict this.
 - Absolute paths are supported, for example `C:\`, `D:\Projects\...`, `/Users/you/projects/...`, and `/home/you/...`.
 - `WORKSPACE_PATH` sets the default cwd for relative paths, shell commands, and Git. By itself it is not a sandbox boundary; restrictive Local Coder permission profiles can enforce configured roots at the application layer.
+- ChatGPT may create a fresh MCP transport for each tool call. Treat transport/session IDs as diagnostics, not chat/work ownership. Use explicit `path`, `workspace`, and especially `working_directory` for project work; Local Coder derives mutation scope per call.
 - Read-only upstream MCP tools can remain available under restrictive profiles; mutating or annotation-unknown upstream calls are treated as unsafe runtimes and require explicit permission.
 - `CHATGPT_AUTO_APPROVE=true` marks routine local operations to reduce unnecessary confirmation prompts.
 
@@ -28,7 +29,7 @@ Before starting work after a server update or restart:
 
 Avoid relying on the popup **Always allow** action if it causes the MCP session to reset. If the tunnel reports `stream canceled by remote`, keep the server and tunnel running, refresh the connector, and start a new MCP chat.
 
-For a stable public endpoint, use the OpenAI Secure MCP Tunnel on Windows with `openai-tunnel.ps1`. macOS/Linux users should run a compatible tunnel client directly or use another supported tunnel.
+For a stable public endpoint on Windows, use `openai-tunnel.ps1 -Init` once to configure credentials, then use `start.ps1`; Local Coder supervises `tunnel-client` in the same runtime so a second tunnel window is not needed. macOS/Linux users should run a compatible tunnel client directly or use another supported tunnel.
 
 ## Tool profiles
 
@@ -43,7 +44,7 @@ The complete native catalog is maintained in `src/lib/tool-profile.ts` and is ch
 
 The Admin UI can force-enable a native tool outside `slim` or disable any native tool through `profiles/tool-overrides.json`. Unknown/stale override names are filtered automatically.
 
-The default `slim` profile includes the high-value read/edit/search tools, bounded and parallel shell execution, background-process lifecycle tools, PTY/LSP/image inspection, core Git status/diff/worktree/stage/commit/restore, project/task/transaction/coding-loop/context-capsule tools, rewind, skills/rules, subagent/delegate status, and `mcp_servers`. Convenience/destructive/remote helpers such as recursive directory deletion, Git reset/push/pull/checkout/branch/stash/log, raw binary writes, shell reset/clear-process helpers, `node_repl`, `ponytail_turn`, and low-level `mcp_tools` / `mcp_call` remain opt-in/full-profile unless explicitly overridden. Treat `src/lib/tool-profile.ts` as authoritative.
+The default `slim` profile includes the high-value read/edit/search tools, bounded and parallel shell execution, background-process lifecycle tools, PTY/image inspection, Git status/diff/worktree/commit, project/task/transaction/coding-loop/context-capsule tools, rewind, skills/rules, subagent execution, and `mcp_servers`. Overlapping or lower-level helpers such as `multi_edit`, raw `lsp`, `delegate_status`, `git_add`, `git_restore`, destructive/remote Git helpers, raw binary writes, shell reset/clear-process helpers, `node_repl`, `ponytail_turn`, and low-level `mcp_tools` / `mcp_call` remain opt-in/full-profile unless explicitly overridden. Treat `src/lib/tool-profile.ts` as authoritative.
 
 ## Claude Code ↔ Local Coder mapping
 
@@ -56,7 +57,7 @@ The default `slim` profile includes the high-value read/edit/search tools, bound
 | `Glob` | `glob` | File-name discovery. |
 | `Grep` | `grep` | `content`, `files_with_matches`, and `count` modes. |
 | `LS` | `list_directory` | Optional ignore globs. |
-| `Bash` | `run_command` | Short/finite commands; cwd persists. |
+| `Bash` | `run_command` | Short/finite commands; pass `working_directory`. Cwd is transport-local and is not persisted for ChatGPT by default. |
 | Parallel shell | `run_commands_parallel` | Independent commands run concurrently in isolated processes. Batch state is durable so retry/recovery should rerun only failed or incomplete members. |
 | Background shell | `start_process` + process tools | Use `process_status`, `process_output`, `process_input`, and `stop_process`. Prefer event/wait conditions for exit/text instead of repeated `Start-Sleep` polling. `process_input` is piped stdin, not a full PTY. |
 | Interactive terminal | `pty` | Real PTY/ConPTY for TUIs, debuggers, installers, and terminal-native CLIs. |
@@ -90,12 +91,12 @@ Real delegated subagents are available through the external-runner `subagent` to
 | Independent commands in parallel | `run_commands_parallel`; recover/retry only failed or incomplete members when a batch id is returned |
 | Long-running build/server | `start_process` → `process_status` / `process_output` with wait condition → optional `process_input` → `stop_process` |
 | Interactive terminal/TUI/debugger | `pty` |
-| Definition/reference/diagnostics | `lsp` |
+| Definition/reference/diagnostics | `repo_intel` in slim; raw `lsp` in full/override profile |
 | Inspect a local screenshot/image | `view_image` |
 | Inspect Git | `git_status`, `git_diff` |
 | Isolated branch work | `git_worktree` |
-| Stage/commit | `git_add`, `git_commit` |
-| Restore tracked files | `git_restore` |
+| Commit | `git_commit` (stages all changes by default; use `stage_all=false` for already-staged changes) |
+| Lower-level stage/restore | `git_add`, `git_restore` in full/override profile |
 | Persist a long task | `agent_task` |
 | Preserve/resume long-chat working context | `context_capsule` |
 | Delegate to configured external model runner | `subagent` |
@@ -148,17 +149,17 @@ Shell commands that directly modify files are not captured by rewind.
 
 - Prefer absolute paths when the target is unambiguous.
 - Relative paths resolve from the configured default cwd.
-- For another repository, call `project_context(path)` before editing so its instructions are loaded.
+- For another repository, call `project_context(path)` to load its instructions, but still pass explicit paths/workspaces/working directories on later calls because ChatGPT may use a new MCP transport.
 
 ## Starting the server
 
 **Windows**
 
 ```powershell
-.\start.ps1                 # build + restart MCP + live TUI + Admin UI + tunnel if configured
+.\start.ps1                 # build only if changed + restart MCP + live TUI + Admin UI + supervised tunnel
 ```
 
-`-Force` remains accepted for compatibility. Use `-NoTunnel` only when you explicitly want the local MCP server without managing the OpenAI tunnel.
+`-Force` remains accepted for compatibility. `-Rebuild` forces compilation; `-NoBuild` reuses an existing `dist`. Use `-NoTunnel` only when you explicitly want the local MCP server without managing the OpenAI tunnel.
 
 First tunnel setup:
 
@@ -181,7 +182,7 @@ Health check: `http://127.0.0.1:3000/health`
 
 Admin UI: `http://127.0.0.1:<ADMIN_PORT>/ui` (default port: `3001`)
 
-The terminal dashboard is enabled automatically in an interactive terminal and shows current time, uptime, sessions, live/active tool calls, call kind (`READ` / `EDIT` / `EXEC` / `MCP`), running background processes/PTYs/subagents, recent completions, durations, per-tool usage, CPU, RSS, and heap. Set `LOCAL_CODER_TUI=off` for traditional scrolling logs.
+The terminal dashboard is enabled automatically in an interactive terminal and shows current time, uptime, MCP transports, live/active tool calls, call kind (`READ` / `EDIT` / `EXEC` / `MCP`), running background processes/PTYs/subagents with liveness, recent completions, durations, per-tool usage, CPU, RSS, and heap. Set `LOCAL_CODER_TUI=off` for traditional scrolling logs.
 
 ## Troubleshooting
 

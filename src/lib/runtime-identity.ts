@@ -16,10 +16,12 @@ export interface RuntimeIdentity {
   tool_profile: string;
   native_tool_count: number;
   slim_tool_count: number;
+  schema_contract_version: number;
 }
 
 const RUN_ID = `run_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
 const STARTED_AT = new Date().toISOString();
+export const SCHEMA_CONTRACT_VERSION = 6;
 
 function packageVersion(): string {
   try {
@@ -84,6 +86,7 @@ let IDENTITY: RuntimeIdentity = {
   tool_profile: process.env.CHATGPT_TOOL_PROFILE || "slim",
   native_tool_count: LOCAL_TOOL_CATALOG.length,
   slim_tool_count: SLIM_CHATGPT_TOOLS.size,
+  schema_contract_version: SCHEMA_CONTRACT_VERSION,
 };
 
 function readPrevious(target: string): { schema_hash?: string; build_commit?: string | null } | null {

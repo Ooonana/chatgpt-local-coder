@@ -1,11 +1,20 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  bindCurrentSessionProject,
+  getCurrentSessionId,
+  getCurrentSessionState,
+} from "./session-context.js";
 
 interface ProjectRegistryEntry {
   root: string;
   alias: string;
   last_used_at: string;
   uses: number;
+  identity?: string;
+  previous_roots?: string[];
 }
 
 interface ProjectRegistry {
@@ -17,9 +26,10 @@ interface ProjectRegistry {
 const ROOT_MARKERS = [".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "AGENTS.md", "CLAUDE.md"];
 const MAX_RECENTS = 24;
 const MAX_DETECTION_CACHE = 2048;
-let activeRoot: string | null = null;
+const activeRoots = new Map<string, string>();
 const detectionCache = new Map<string, string>();
 let registryWriteQueue = Promise.resolve();
+const execFileAsync = promisify(execFile);
 
 function registryPath(): string {
   return path.resolve(process.env.MCP_PROJECT_REGISTRY_PATH?.trim() || path.join(process.cwd(), ".mcp-state", "projects.json"));
@@ -38,6 +48,40 @@ function aliasFor(root: string): string {
   return path.basename(root.replace(/[\\/]+$/, "")) || "project";
 }
 
+function normalizeRemote(raw: string): string {
+  let value = raw.trim().replace(/\\/g, "/").replace(/\.git$/i, "");
+  const scp = value.match(/^git@([^:]+):(.+)$/i);
+  if (scp) value = "ssh://" + scp[1] + "/" + scp[2];
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    const pathname = url.pathname.replace(/^\/+|\/+$/g, "");
+    return host + "/" + pathname.toLowerCase();
+  } catch {
+    return value.toLowerCase();
+  }
+}
+
+async function projectIdentity(root: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", root, "config", "--get", "remote.origin.url"],
+      { windowsHide: true, timeout: 3_000, maxBuffer: 32 * 1024 }
+    );
+    const remote = normalizeRemote(stdout);
+    return remote ? "git:" + remote : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function samePath(left: string, right: string): boolean {
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
 function cacheDetection(key: string, root: string): void {
   detectionCache.delete(key);
   detectionCache.set(key, root);
@@ -53,7 +97,7 @@ async function readRegistry(): Promise<ProjectRegistry> {
     const parsed = JSON.parse(await fs.readFile(registryPath(), "utf-8")) as ProjectRegistry;
     if (parsed.version === 1 && Array.isArray(parsed.entries)) return parsed;
   } catch {}
-  return { version: 1, active_root: activeRoot, entries: [] };
+  return { version: 1, active_root: null, entries: [] };
 }
 
 async function writeRegistry(registry: ProjectRegistry): Promise<void> {
@@ -107,20 +151,57 @@ export async function detectProjectRoot(inputPath: string): Promise<string> {
   return start;
 }
 
+export async function isProjectRoot(candidate: string): Promise<boolean> {
+  for (const marker of ROOT_MARKERS) {
+    if (await exists(path.join(candidate, marker))) return true;
+  }
+  return false;
+}
+
 export async function recordProjectAffinity(inputPath: string): Promise<string> {
   const root = await detectProjectRoot(inputPath);
-  activeRoot = root;
+  const identity = await projectIdentity(root);
+  const sessionId = getCurrentSessionId();
+  if (sessionId) activeRoots.set(sessionId, root);
+  bindCurrentSessionProject(root, aliasFor(root));
   await mutateRegistry(async () => {
     const registry = await readRegistry();
     const now = new Date().toISOString();
-    const existing = registry.entries.find((entry) => path.resolve(entry.root) === path.resolve(root));
+    const identityMatches = identity
+      ? registry.entries.filter((entry) => entry.identity === identity)
+      : [];
+    const existing = identityMatches[0] || registry.entries.find((entry) => samePath(entry.root, root));
     if (existing) {
+      if (!samePath(existing.root, root)) {
+        existing.previous_roots = [...new Set([...(existing.previous_roots || []), existing.root])]
+          .filter((candidate) => !samePath(candidate, root))
+          .slice(-8);
+        existing.root = root;
+        existing.alias = aliasFor(root);
+      }
+      if (identity) existing.identity = identity;
       existing.last_used_at = now;
       existing.uses = Math.max(0, existing.uses || 0) + 1;
+      if (identityMatches.length > 1) {
+        const duplicateSet = new Set(identityMatches.slice(1));
+        for (const duplicate of identityMatches.slice(1)) {
+          existing.uses += Math.max(0, duplicate.uses || 0);
+          existing.previous_roots = [...new Set([
+            ...(existing.previous_roots || []),
+            duplicate.root,
+            ...(duplicate.previous_roots || []),
+          ])].filter((candidate) => !samePath(candidate, root)).slice(-8);
+        }
+        registry.entries = registry.entries.filter((entry) => !duplicateSet.has(entry));
+      }
     } else {
-      registry.entries.push({ root, alias: aliasFor(root), last_used_at: now, uses: 1 });
+      registry.entries.push({ root, alias: aliasFor(root), last_used_at: now, uses: 1, ...(identity ? { identity } : {}) });
     }
-    registry.active_root = root;
+    // Do not persist a process-global "active project". ChatGPT can create a
+    // fresh MCP transport per tool call, and multiple chats may work on
+    // different projects concurrently. The registry is recent-project history
+    // only; execution scope is derived per tool call.
+    registry.active_root = null;
     registry.entries.sort((a, b) => b.last_used_at.localeCompare(a.last_used_at));
     registry.entries = registry.entries.slice(0, MAX_RECENTS);
     await writeRegistry(registry);
@@ -146,13 +227,21 @@ export async function getProjectAffinity(fallback?: string): Promise<{
   active_alias: string | null;
   recents: ProjectRegistryEntry[];
 }> {
-  if (!activeRoot && fallback) await recordProjectAffinity(fallback).catch(() => undefined);
+  const sessionId = getCurrentSessionId();
+  const sessionRoot = sessionId ? activeRoots.get(sessionId) : undefined;
+  if (!sessionRoot && fallback && getCurrentSessionState()?.workspace_kind === "project") {
+    await recordProjectAffinity(fallback).catch(() => undefined);
+  }
   const registry = await readRegistry();
-  const root = activeRoot || registry.active_root || null;
+  const root = (sessionId ? activeRoots.get(sessionId) : undefined) || null;
   const entry = root ? registry.entries.find((item) => path.resolve(item.root) === path.resolve(root)) : undefined;
   return { active_root: root, active_alias: entry?.alias || (root ? aliasFor(root) : null), recents: registry.entries.slice(0, 12) };
 }
 
 export function clearProjectDetectionCache(): void {
   detectionCache.clear();
+}
+
+export function clearProjectAffinitySession(sessionId: string): void {
+  activeRoots.delete(sessionId);
 }

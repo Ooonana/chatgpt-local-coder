@@ -61,7 +61,7 @@ try {
   ok("background process lifecycle exposed in slim");
 
   for (const t of [
-    "run_commands_parallel", "pty", "view_image", "lsp", "delete_file",
+    "run_commands_parallel", "pty", "view_image",
   ]) {
     if (!shouldExposeTool(t, "slim")) throw new Error(`${t} missing from slim`);
   }
@@ -79,6 +79,7 @@ try {
   for (const t of [
     "replace_regex", "directory_tree", "create_directory", "copy_file", "move_file",
     "shell_reset", "clear_processes", "git_log", "git_branch", "git_stash",
+    "multi_edit", "delete_file", "lsp", "delegate_status", "git_add", "git_restore",
   ]) {
     if (shouldExposeTool(t, "slim")) throw new Error(`${t} should be hidden in slim; use full/overrides or run_command fallback`);
   }

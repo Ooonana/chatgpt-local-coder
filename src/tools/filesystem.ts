@@ -14,6 +14,7 @@ import { globFiles } from "../lib/glob-search.js";
 import { grepSearch } from "../lib/grep-search.js";
 import { captureTransactionPaths, recordTransactionEdit, withEditTransactionLock } from "../lib/edit-transaction-store.js";
 import { readTextCached } from "../lib/text-read-cache.js";
+import { assertCurrentSessionMutationPath } from "../lib/session-context.js";
 
 const MAX_TEXT_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_EDITABLE_TEXT_BYTES = 16 * 1024 * 1024;
@@ -323,6 +324,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, content, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
+      assertCurrentSessionMutationPath(validPath, "write_file");
       if (transaction_id) await captureTransactionPaths(transaction_id, [validPath]);
       const checkpointId = await checkpointBefore("write_file", [validPath]);
       await fs.mkdir(path.dirname(validPath), { recursive: true });
@@ -353,6 +355,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, content, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
+      assertCurrentSessionMutationPath(validPath, "write_file_base64");
       if (transaction_id) await captureTransactionPaths(transaction_id, [validPath]);
       const checkpointId = await checkpointBefore("write_file_base64", [validPath]);
       const buffer = Buffer.from(content, "base64");
@@ -383,6 +386,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, old_text, new_text, replace_all, dry_run, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
+      assertCurrentSessionMutationPath(validPath, "edit_file");
       const content = await readEditableTextFile(validPath);
       if (!content.includes(old_text)) throw new Error("old_text not found in file. Ensure exact match.");
       const newContent = replace_all ? content.split(old_text).join(new_text) : content.replace(old_text, new_text);
@@ -418,6 +422,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, edits, dry_run, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
+      assertCurrentSessionMutationPath(validPath, "multi_edit");
       const original = await readEditableTextFile(validPath);
       let next = original;
       for (const edit of edits) {
@@ -458,6 +463,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, pattern, replacement, flags, dry_run, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
+      assertCurrentSessionMutationPath(validPath, "replace_regex");
       const original = await readEditableTextFile(validPath);
       const regex = new RegExp(pattern, flags);
       const next = original.replace(regex, replacement);
@@ -500,6 +506,7 @@ export function registerFilesystemTools(server: McpServer): void {
         const patchPaths = await Promise.all(
           parseMultiFilePatch(patch, baseDir).map((op) => validatePath(op.path))
         );
+        for (const patchPath of patchPaths) assertCurrentSessionMutationPath(patchPath, "apply_patch");
         if (transaction_id && !dry_run) await captureTransactionPaths(transaction_id, patchPaths);
         const checkpointId = await checkpointBefore("apply_patch", patchPaths, { dry_run });
         const results = await applyMultiFilePatch(patch, { base_dir: baseDir, dry_run });
@@ -526,6 +533,7 @@ export function registerFilesystemTools(server: McpServer): void {
 
       if (!filePath) throw new Error("path is required for single-file patches");
       const validPath = await validatePath(filePath);
+      assertCurrentSessionMutationPath(validPath, "apply_patch");
       const original = await readEditableTextFile(validPath);
       const next = applyUnifiedPatchToText(original, patch);
       const diff = buildSimpleDiff(original, next);
@@ -656,6 +664,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, transaction_id }) => withEditTransactionLock(transaction_id, async () => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
+      assertCurrentSessionMutationPath(validPath, "delete_file");
       const stat = await fs.stat(validPath);
       if (!stat.isFile()) throw new Error("Path is not a file");
       if (transaction_id) await captureTransactionPaths(transaction_id, [validPath]);
@@ -679,6 +688,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: dirPath }) => {
       requireWriteAllowed();
       const validPath = await validatePath(dirPath);
+      assertCurrentSessionMutationPath(validPath, "create_directory");
       await fs.mkdir(validPath, { recursive: true });
       await audit({ tool: "create_directory", action: "mkdir", target: validPath, status: "ok" });
       return toolResult("create_directory", { path: validPath });
@@ -698,6 +708,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: dirPath }) => {
       requireWriteAllowed();
       const validPath = await validatePath(dirPath);
+      assertCurrentSessionMutationPath(validPath, "delete_directory");
       const stat = await fs.stat(validPath);
       if (!stat.isDirectory()) throw new Error("Path is not a directory");
       const checkpointId = await checkpointBefore("delete_directory", [validPath]);
@@ -724,6 +735,7 @@ export function registerFilesystemTools(server: McpServer): void {
       requireWriteAllowed();
       const src = await validatePath(source);
       const dest = await validatePath(destination);
+      assertCurrentSessionMutationPath(dest, "copy_file");
       const stat = await fs.stat(src);
       if (!stat.isFile()) throw new Error("Source is not a file");
       if (transaction_id) await captureTransactionPaths(transaction_id, [dest]);
@@ -749,6 +761,8 @@ export function registerFilesystemTools(server: McpServer): void {
       requireWriteAllowed();
       const src = await validatePath(source);
       const dest = await validatePath(destination);
+      assertCurrentSessionMutationPath(src, "move_file source");
+      assertCurrentSessionMutationPath(dest, "move_file destination");
       if (transaction_id) await captureTransactionPaths(transaction_id, [src, dest]);
       const checkpointId = await checkpointBefore("move_file", [src, dest]);
       await fs.mkdir(path.dirname(dest), { recursive: true });

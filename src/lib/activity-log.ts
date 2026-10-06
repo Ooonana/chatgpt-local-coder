@@ -166,7 +166,14 @@ export async function loadAuditHistory(limit = 80): Promise<ActivityEntry[]> {
   try {
     const raw = await fs.readFile(auditPath, "utf-8");
     const lines = raw.trim().split("\n").filter(Boolean);
-    const slice = lines.slice(-limit);
+    const visibleLines = lines.filter((line) => {
+      try {
+        return (JSON.parse(line) as Record<string, unknown>).action !== "__runtime";
+      } catch {
+        return true;
+      }
+    });
+    const slice = visibleLines.slice(-limit);
     return slice.map((line) => {
       try {
         const rec = JSON.parse(line) as Record<string, unknown>;

@@ -34,15 +34,14 @@ You are a local coding agent using Local Coder MCP tools. Obey the active Local 
 - When a coding_loop is active, do not start a second transaction for its edits: use the loop's transaction_id. coding_loop(rollback) restores only that transaction's baselines; coding_loop(finish) requires the latest verification to pass unless explicitly overridden.
 
 ### Shell rules
-- run_command cwd persists across ChatGPT tool calls (saved to disk) — call shell_status to see current cwd.
+- ChatGPT may use a fresh MCP transport on later tool calls, so do not rely on hidden shell cwd. Pass working_directory for project commands; shell_status shows only the current transport's cwd.
 - Use run_commands_parallel only for independent commands that can safely overlap; it uses isolated processes and does not change persistent cwd.
 - Long builds/dev servers: start_process with a useful label and task_id when one exists, then process_status/process_output; use process_history to recover prior operation state after chat/MCP reconnects, process_input for stdin prompts, and stop_process when finished.
 - For TUIs, debuggers, interactive installers, or terminal programs that require a real terminal, use pty instead of process_input.
 - git_push, git_checkout, delete_directory may be blocked by ChatGPT — use run_command fallback from tool response.
 
 ### Semantic and visual inspection
-- Prefer repo_intel for repository-wide symbol search, references, and change-impact summaries; it uses LSP first and bounded lexical fallback. Use raw lsp for hover/diagnostics or precise lower-level queries.
-- Use lsp when definitions/references/hover/diagnostics are more precise than grep. TypeScript/JavaScript and Python language servers are bundled; other supported servers are detected if installed.
+- Prefer repo_intel for repository-wide symbol search, references, and change-impact summaries; it uses LSP first and bounded lexical fallback. Raw lsp remains available in the full/override profile for precise lower-level queries.
 - Use view_image for images that exist only as local machine paths. Do not add duplicate web-search/browser/data-analysis flows when the ChatGPT host already provides them.
 
 ### Long-running / resumable tasks
@@ -76,12 +75,12 @@ You are a local coding agent using Local Coder MCP tools. Obey the active Local 
 ### Tool reference (compact)
 - Agent loop: coding_loop, coding_loop_status, agent_task, context_capsule
 - Explore: inspect_project, repo_intel, glob, grep, read_files, read_text_file, list_directory
-- Edit: edit_transaction, apply_patch, multi_edit, write_file, edit_file
+- Edit: edit_transaction, apply_patch, write_file, edit_file
 - Run: run_command, run_commands_parallel, verify_project, start_process, process_status, process_history, process_output, process_input, stop_process, pty
-- Semantic: repo_intel, lsp
+- Semantic: repo_intel
 - Local visual files: view_image
-- Git: git_status, git_diff, git_worktree, git_add, git_commit, git_restore
-- External delegation: subagent, delegate_status
+- Git: git_status, git_diff, git_worktree, git_commit
+- External delegation: subagent
 - Undo file edits: rewind (list → preview → restore)
 - Full cheat sheet: call agent_status once if needed
 `.trim();

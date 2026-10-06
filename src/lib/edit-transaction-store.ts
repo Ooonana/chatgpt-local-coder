@@ -2,8 +2,9 @@ import fs from "fs/promises";
 import path from "path";
 import { createHash, randomUUID } from "crypto";
 import { buildSimpleDiff } from "./patch.js";
+import { getCurrentSessionId } from "./session-context.js";
 
-export type EditTransactionStatus = "active" | "accepted" | "rolled_back";
+export type EditTransactionStatus = "active" | "accepted" | "rolled_back" | "abandoned";
 
 export interface EditTransactionSnapshot {
   path: string;
@@ -22,11 +23,13 @@ export interface EditTransactionRecord {
   id: string;
   label?: string;
   workspace: string;
+  session_id?: string;
   status: EditTransactionStatus;
   created_at: string;
   updated_at: string;
   accepted_at?: string;
   rolled_back_at?: string;
+  abandoned_at?: string;
   snapshots: EditTransactionSnapshot[];
   edits: Array<{
     at: string;
@@ -262,6 +265,7 @@ export async function beginEditTransaction(workspace: string, label?: string): P
     id,
     label: label?.trim() || undefined,
     workspace: path.resolve(workspace),
+    session_id: getCurrentSessionId(),
     status: "active",
     created_at: created,
     updated_at: created,
@@ -288,7 +292,9 @@ export async function listEditTransactions(limit = 20): Promise<EditTransactionR
       if (record?.version === 1 && record.id) records.push(record);
     } catch {}
   }
-  return records.sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, Math.max(1, limit));
+  return records
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+    .slice(0, Math.max(1, limit));
 }
 
 async function pruneEditTransactions(): Promise<void> {
@@ -500,6 +506,28 @@ export async function acceptEditTransaction(id: string): Promise<EditTransaction
   // is interrupted, an accepted transaction may retain harmless snapshots;
   // the inverse ordering could leave an active transaction with no rollback
   // payload at all.
+  await saveRecord(record);
+  await cleanupPayload(record);
+  await saveRecord(record);
+  await pruneEditTransactions();
+  return record;
+}
+
+export async function abandonEditTransaction(id: string): Promise<EditTransactionRecord> {
+  const record = await readRecord(id);
+  if (record.status === "abandoned") {
+    await cleanupPayload(record);
+    await saveRecord(record);
+    await pruneEditTransactions();
+    return record;
+  }
+  if (record.status !== "active") {
+    throw new Error(`Edit transaction ${id} is ${record.status}; only active transactions can be abandoned`);
+  }
+  // Abandoning is deliberately non-destructive: current files are preserved.
+  // Only rollback payloads are removed after the terminal state is persisted.
+  record.status = "abandoned";
+  record.abandoned_at = nowIso();
   await saveRecord(record);
   await cleanupPayload(record);
   await saveRecord(record);

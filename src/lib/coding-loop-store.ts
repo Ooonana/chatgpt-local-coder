@@ -1,9 +1,10 @@
 import fs from "fs/promises";
 import path from "path";
 import { randomUUID } from "crypto";
+import { getCurrentSessionId } from "./session-context.js";
 
-export type CodingLoopStatus = "active" | "completed" | "cancelled" | "failed";
-export type CodingLoopPhase = "editing" | "repair" | "ready" | "blocked" | "completed" | "cancelled" | "failed";
+export type CodingLoopStatus = "active" | "completed" | "cancelled" | "failed" | "abandoned" | "archived";
+export type CodingLoopPhase = "editing" | "repair" | "ready" | "blocked" | "completed" | "cancelled" | "failed" | "abandoned" | "archived";
 
 export interface CodingLoopFailure {
   label: string;
@@ -70,6 +71,7 @@ export interface CodingLoopIsolation {
 export interface CodingLoopRecord {
   version: 1;
   id: string;
+  session_id?: string;
   goal: string;
   task_id?: string;
   managed_task?: boolean;
@@ -93,6 +95,10 @@ export interface CodingLoopRecord {
   completed_at?: string;
   cancelled_at?: string;
   failed_at?: string;
+  abandoned_at?: string;
+  archived_at?: string;
+  archived_from_status?: Exclude<CodingLoopStatus, "archived">;
+  archived_from_phase?: Exclude<CodingLoopPhase, "archived">;
 }
 
 const VERSION = 1 as const;
@@ -175,6 +181,7 @@ export async function createCodingLoop(record: Omit<CodingLoopRecord, "version" 
   const created = nowIso();
   const next: CodingLoopRecord = normalizeRecord({
     version: VERSION,
+    session_id: record.session_id || getCurrentSessionId(),
     ...record,
     created_at: created,
     updated_at: created,

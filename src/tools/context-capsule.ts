@@ -48,11 +48,13 @@ export function registerContextCapsuleTool(server: McpServer, defaultCwd: string
         blockers: z.array(z.string().max(2_000)).max(30).optional(),
         next_steps: z.array(z.string().max(2_000)).max(30).optional(),
         files: z.array(fileSchema).max(50).optional(),
+        semantic_mode: z.enum(["replace", "merge"]).optional().default("replace")
+          .describe("checkpoint only: replace clears omitted semantic fields; merge preserves omitted fields"),
         limit: z.number().int().positive().max(100).optional().default(20),
       },
       annotations: toolAnnotations("edit"),
     },
-    async ({ action, id, workspace, task_id, coding_loop_id, objective, summary, decisions, findings, blockers, next_steps, files, limit }) => {
+    async ({ action, id, workspace, task_id, coding_loop_id, objective, summary, decisions, findings, blockers, next_steps, files, semantic_mode, limit }) => {
       if (action === "status") {
         const resolvedWorkspace = await validatePath(workspace || defaultCwd);
         const capsules = (await listContextCapsules(200))
@@ -120,6 +122,7 @@ export function registerContextCapsuleTool(server: McpServer, defaultCwd: string
         blockers,
         next_steps,
         files,
+        semantic_mode,
       });
       await audit({
         tool: "context_capsule",

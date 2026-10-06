@@ -12,6 +12,14 @@ import { getUpstreamManager } from "./mcp-upstream-manager.js";
 import { refreshProxiedTools } from "./mcp-tool-proxy.js";
 import { runCodexSessionStartHooks } from "./codex-hooks.js";
 import { runLocalHooks } from "./local-hooks.js";
+import {
+  ensureSessionRuntimeState,
+  markSessionConnection,
+  pruneSessionRuntimeStates,
+  touchSessionClient,
+} from "./session-context.js";
+import { clearShellSession } from "./persistent-shell.js";
+import { clearProjectAffinitySession } from "./project-affinity.js";
 
 
 const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
@@ -218,6 +226,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     if (session) {
       session.lastAccessedAt = Date.now();
     }
+    touchSessionClient(sessionId);
   }
 
   function cancelDeleteGrace(sessionId: string): void {
@@ -246,6 +255,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     delete sessions[sessionId];
     delete lastTransportErrors[sessionId];
     sessionOpChains.delete(sessionId);
+    markSessionConnection(sessionId, "closed", config.workspaceRoot);
     clearPendingRecovery(sessionId);
     getUpstreamManager().unregisterMcpServer(session.server);
     // Remove registry references before closing so SDK close callbacks cannot
@@ -257,6 +267,8 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       session_id: sessionId,
       result: { reason },
     }).catch(() => undefined);
+    clearShellSession(sessionId);
+    clearProjectAffinitySession(sessionId);
   }
 
   function clearPendingRecovery(sessionId: string): void {
@@ -279,6 +291,8 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
   }
 
   async function buildSession(preferredSessionId?: string): Promise<McpSession> {
+    const sessionKey = preferredSessionId || randomUUID();
+    ensureSessionRuntimeState(sessionKey, config.workspaceRoot);
     const hookInstructions = await runCodexSessionStartHooks().catch((error) => {
       console.warn("[MCP] Codex SessionStart hook failed:", error);
       return "";
@@ -294,13 +308,12 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       config.workspaceRoots,
       true,
       getUpstreamManager(),
-      [config.projectMemoryInstructions, hookInstructions, localHookInstructions].filter(Boolean).join("\n\n")
+      [config.projectMemoryInstructions, hookInstructions, localHookInstructions].filter(Boolean).join("\n\n"),
+      sessionKey
     );
 
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: preferredSessionId
-        ? () => preferredSessionId
-        : () => randomUUID(),
+      sessionIdGenerator: () => sessionKey,
       // SSE is the SDK default and is safer for long-running tool calls because
       // it emits keepalive comment frames while the POST is still in progress.
       // JSON mode is retained only as an opt-in compatibility escape hatch.
@@ -320,6 +333,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
           createdAt: existing?.createdAt ?? Date.now(),
           closed: false,
         };
+        markSessionConnection(sid, "connected", config.workspaceRoot);
         clearPendingRecovery(sid);
         enforceSessionCapacity(sid);
         console.log(`[MCP] Session initialized: ${sid}`);
@@ -329,6 +343,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         const current = sessions[sid];
         if (!current || current.transport !== transport) return;
         current.closed = true;
+        markSessionConnection(sid, "disconnected", config.workspaceRoot);
         scheduleDeleteGrace(sid);
       },
     });
@@ -345,6 +360,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       const current = sid ? sessions[sid] : undefined;
       if (!sid || !current || current.transport !== transport) return;
       current.closed = true;
+      markSessionConnection(sid, "disconnected", config.workspaceRoot);
       console.log(`[MCP] Transport closed for ${sid} (session kept for recovery)`);
     };
 
@@ -355,7 +371,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       .then(() => mcpServer.sendToolListChanged())
       .catch((error) => console.warn("[MCP] Upstream tool refresh failed:", error));
 
-    const sid = transport.sessionId ?? preferredSessionId ?? randomUUID();
+    const sid = transport.sessionId ?? sessionKey;
     const initialized = sessions[sid];
     // During immediate recovery after a client DELETE, the grace window can
     // intentionally retain the old closed session under the same ID. Never
@@ -592,6 +608,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         for (const sid of Object.keys(pendingRecoveries)) {
           if (!sessions[sid]) clearPendingRecovery(sid);
         }
+        pruneSessionRuntimeStates(new Set(Object.keys(sessions)), SESSION_MAX_RETAINED * 2);
       }, SESSION_CLEANUP_INTERVAL_MS);
       cleanupTimer.unref?.();
     },

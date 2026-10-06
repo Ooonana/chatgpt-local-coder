@@ -60,6 +60,10 @@ export async function audit(event: AuditEvent): Promise<void> {
     // Audit must never break the requested tool call.
   }
 
+  // Canonical __runtime records are analytics-only. Do not mirror them into
+  // the live activity feed or console, otherwise every tool call appears twice.
+  if (event.action === "__runtime") return;
+
   try {
     appendActivity({
       kind: "tool",

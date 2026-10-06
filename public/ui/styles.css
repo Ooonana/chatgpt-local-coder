@@ -160,7 +160,27 @@ body {
 .runtime-time { color: var(--faint); font-family: var(--mono); font-size: 0.7rem; white-space: nowrap; }
 .runtime-state-ok { color: var(--green); }
 .runtime-state-error { color: var(--red); }
+.runtime-state-warn { color: var(--amber); }
 .runtime-empty { padding: 1.2rem; color: var(--muted); font-size: 0.8rem; }
+.session-row {
+  grid-template-columns: auto minmax(120px, 0.7fr) minmax(0, 1.5fr) auto;
+}
+.session-workspace {
+  display: flex;
+  gap: 0.35rem;
+  align-items: baseline;
+  min-width: 0;
+}
+.session-workspace strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-id {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.66rem;
+}
 .runtime-alert {
   display: flex;
   gap: 0.65rem;

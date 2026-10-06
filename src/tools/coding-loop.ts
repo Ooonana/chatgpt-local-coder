@@ -15,6 +15,7 @@ import { assertRepositoryPathInsideWorkspace, runRepositoryIntelligence } from "
 import type { LspServerId } from "../lib/lsp-client.js";
 import {
   acceptEditTransaction,
+  abandonEditTransaction,
   beginEditTransaction,
   getEditTransaction,
   recordTransactionVerification,
@@ -48,8 +49,12 @@ import {
   type CodingLoopFailure,
   type CodingLoopRecord,
 } from "../lib/coding-loop-store.js";
+import {
+  assertCurrentSessionMutationPath,
+  getCurrentSessionState,
+} from "../lib/session-context.js";
 
-const actionSchema = z.enum(["begin", "resume", "refresh", "verify", "finish", "rollback", "cleanup"]);
+const actionSchema = z.enum(["begin", "resume", "refresh", "verify", "finish", "rollback", "abandon", "archive", "cleanup"]);
 const presetSchema = z.enum(["quick", "full", "custom"]);
 const intelActionSchema = z.enum(["symbol_search", "references", "impact"]);
 const serverSchema = z.enum(["auto", "typescript", "pyright", "clangd", "rust-analyzer", "gopls"]);
@@ -417,6 +422,21 @@ function compactLoop(record: CodingLoopRecord) {
   };
 }
 
+function compactLoopListItem(record: CodingLoopRecord) {
+  return {
+    id: record.id,
+    status: record.status,
+    phase: record.phase,
+    workspace: record.workspace,
+    task_id: record.task_id,
+    transaction_id: record.transaction_id,
+    goal: record.goal.slice(0, 240),
+    attempts: record.attempts.length,
+    max_attempts: record.max_attempts,
+    updated_at: record.updated_at,
+  };
+}
+
 export function registerCodingLoopTools(server: McpServer, defaultCwd: string): void {
   server.registerTool(
     "coding_loop_status",
@@ -438,7 +458,7 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
       const loops = await listCodingLoops(limit);
       return toolResult("coding_loop_status", {
         config: getCodingLoopConfig(),
-        loops: loops.map(compactLoop),
+        loops: loops.map(compactLoopListItem),
       }, { summary: `${loops.length} coding loop(s)` });
     }
   );
@@ -495,10 +515,20 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
         if ((line !== undefined || column !== undefined) && !intelPath) throw new Error("path is required when line/column are supplied");
         if (base_ref.startsWith("-")) throw new Error("base_ref must be a Git revision, not an option");
 
-        const sourceCandidate = await resolveProjectReference(workspace, defaultCwd);
+        const session = getCurrentSessionState();
+        const fallbackWorkspace =
+          session?.workspace_kind === "project" && session.project_root ? session.project_root : defaultCwd;
+        const sourceCandidate = await resolveProjectReference(workspace, fallbackWorkspace);
         const sourceWorkspace = await validatePath(sourceCandidate);
+        assertCurrentSessionMutationPath(sourceWorkspace, "coding_loop begin");
         await recordProjectAffinity(sourceWorkspace).catch(() => undefined);
-        if (task_id && !(await getAgentTask(task_id))) throw new Error(`Unknown agent task id: ${task_id}`);
+        if (task_id) {
+          const linkedTask = await getAgentTask(task_id);
+          if (!linkedTask) throw new Error(`Unknown agent task id: ${task_id}`);
+          if (path.resolve(linkedTask.workspace) !== path.resolve(sourceWorkspace)) {
+            throw new Error(`Agent task ${task_id} belongs to ${linkedTask.workspace}, not coding-loop workspace ${sourceWorkspace}`);
+          }
+        }
         let effectiveTaskId = task_id;
         let managedTask = false;
         if (!effectiveTaskId && manage_task) {
@@ -857,6 +887,65 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
             handoff: handoff(record),
             next: record.isolation.mode === "worktree" ? "Call coding_loop action=cleanup to remove the isolated worktree when no longer needed." : null,
           }, { summary: `rolled back and cancelled ${id}` });
+        }
+
+        if (action === "abandon") {
+          requireWriteAllowed();
+          if (record.status === "abandoned") {
+            return toolResult("coding_loop", { action, loop: compactLoop(record), files_preserved: true }, {
+              summary: `${id} already abandoned`,
+            });
+          }
+          if (record.status === "completed" || record.status === "cancelled" || record.status === "archived") {
+            throw new Error(`Coding loop ${id} is ${record.status}; it cannot be abandoned`);
+          }
+          const transaction = await getEditTransaction(record.transaction_id);
+          if (transaction.status === "active") {
+            await abandonEditTransaction(record.transaction_id);
+          } else if (transaction.status === "accepted" || transaction.status === "rolled_back") {
+            throw new Error(`Coding loop transaction ${record.transaction_id} is already ${transaction.status}; use the matching terminal loop action instead`);
+          }
+          record.status = "abandoned";
+          record.phase = "abandoned";
+          record.abandoned_at = nowIso();
+          if (note?.trim()) record.notes.push({ at: nowIso(), text: note.trim() });
+          record = await saveCodingLoop(record);
+          if (record.task_id && record.managed_task) {
+            await updateAgentTask(record.task_id, {
+              status: "abandoned",
+              note: `Coding loop ${id} was abandoned without rolling files back.`,
+            }).catch(() => undefined);
+          }
+          await audit({ tool: "coding_loop", action: "abandon", target: record.workspace, status: "ok", details: { id, files_preserved: true } });
+          return toolResult("coding_loop", {
+            action,
+            loop: compactLoop(record),
+            files_preserved: true,
+            next: record.isolation.mode === "worktree"
+              ? "Current files were preserved. cleanup can remove the isolated worktree later."
+              : "Current files were preserved; the loop and transaction are no longer active.",
+          }, { summary: `abandoned ${id} without changing current files` });
+        }
+
+        if (action === "archive") {
+          requireWriteAllowed();
+          if (record.status === "active") {
+            throw new Error(`Coding loop ${id} is still active; finish, rollback, or abandon it before archiving`);
+          }
+          if (record.status !== "archived") {
+            if (record.phase === "archived") {
+              throw new Error(`Coding loop ${id} has inconsistent state: phase is archived while status is ${record.status}`);
+            }
+            record.archived_from_status = record.status;
+            record.archived_from_phase = record.phase;
+            record.status = "archived";
+            record.phase = "archived";
+            record.archived_at = nowIso();
+            if (note?.trim()) record.notes.push({ at: nowIso(), text: note.trim() });
+            record = await saveCodingLoop(record);
+          }
+          await audit({ tool: "coding_loop", action: "archive", target: record.workspace, status: "ok", details: { id } });
+          return toolResult("coding_loop", { action, loop: compactLoop(record) }, { summary: `archived ${id}` });
         }
 
         if (action === "cleanup") {

@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import fs from "fs";
 import path from "path";
+import { getCurrentSessionId } from "./session-context.js";
 
 export interface ShellExecResult {
   command: string;
@@ -13,12 +14,21 @@ export interface ShellExecResult {
 
 import { loadGlobalShellState, saveGlobalShellState } from "./global-shell-state.js";
 
-let sessionCwd: string | null = null;
-let sessionInitializedAt: string | null = null;
-let persistenceRoot: string | null = null;
-const history: string[] = [];
+interface ShellSessionState {
+  cwd: string | null;
+  initializedAt: string | null;
+  persistenceRoot: string | null;
+  history: string[];
+}
+
+const shellSessions = new Map<string, ShellSessionState>();
+const LEGACY_SESSION = "__legacy__";
 const MAX_HISTORY = 50;
 const MAX_SHELL_OUTPUT_CHARS = 400_000;
+
+function persistShellCwd(): boolean {
+  return ["1", "true", "yes", "on"].includes((process.env.MCP_SHELL_PERSIST_CWD || "").trim().toLowerCase());
+}
 
 async function killProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
   if (process.platform !== "win32" && child.pid) {
@@ -41,51 +51,75 @@ async function killProcessTree(child: ChildProcessWithoutNullStreams): Promise<v
   });
 }
 
-export function setShellPersistenceRoot(workspaceRoot: string): void {
-  persistenceRoot = path.resolve(workspaceRoot);
+function shellKey(explicitSessionId?: string): string {
+  return explicitSessionId || getCurrentSessionId() || LEGACY_SESSION;
 }
 
-export function initShellSession(defaultCwd: string): void {
-  sessionCwd = path.resolve(defaultCwd);
-  sessionInitializedAt = new Date().toISOString();
-  history.length = 0;
+function state(explicitSessionId?: string): ShellSessionState {
+  const key = shellKey(explicitSessionId);
+  let current = shellSessions.get(key);
+  if (!current) {
+    current = { cwd: null, initializedAt: null, persistenceRoot: null, history: [] };
+    shellSessions.set(key, current);
+  }
+  return current;
 }
 
-/** Restore cwd from disk (ChatGPT = new MCP session per tool call). */
-export async function bootstrapShellSession(defaultCwd: string): Promise<void> {
-  setShellPersistenceRoot(defaultCwd);
-  const saved = await loadGlobalShellState(defaultCwd, defaultCwd);
+export function setShellPersistenceRoot(workspaceRoot: string, sessionId?: string): void {
+  state(sessionId).persistenceRoot = path.resolve(workspaceRoot);
+}
+
+export function initShellSession(defaultCwd: string, sessionId?: string): void {
+  const current = state(sessionId);
+  current.cwd = path.resolve(defaultCwd);
+  current.initializedAt = new Date().toISOString();
+  current.history.length = 0;
+}
+
+/** Restore cwd from disk for one MCP session. */
+export async function bootstrapShellSession(defaultCwd: string, sessionId?: string): Promise<void> {
+  const current = state(sessionId);
+  setShellPersistenceRoot(defaultCwd, sessionId);
+  if (!persistShellCwd()) {
+    initShellSession(defaultCwd, sessionId);
+    return;
+  }
+  const saved = await loadGlobalShellState(defaultCwd, defaultCwd, shellKey(sessionId));
   if (saved?.cwd) {
-    sessionCwd = path.resolve(saved.cwd);
-    sessionInitializedAt = saved.updated_at;
+    current.cwd = path.resolve(saved.cwd);
+    current.initializedAt = saved.updated_at;
     if (saved.recent_commands?.length) {
-      history.length = 0;
-      history.push(...saved.recent_commands.slice(-MAX_HISTORY));
+      current.history.length = 0;
+      current.history.push(...saved.recent_commands.slice(-MAX_HISTORY));
     }
     return;
   }
-  initShellSession(defaultCwd);
+  initShellSession(defaultCwd, sessionId);
 }
 
 export function getShellCwd(): string {
-  if (!sessionCwd) throw new Error("Shell session not initialized");
-  return sessionCwd;
+  const current = state();
+  if (!current.cwd) throw new Error("Shell session not initialized");
+  return current.cwd;
 }
 
 export function resetShellSession(cwd: string): void {
-  sessionCwd = path.resolve(cwd);
-  sessionInitializedAt = new Date().toISOString();
-  if (persistenceRoot) {
-    void saveGlobalShellState(persistenceRoot, sessionCwd, undefined, null);
+  const current = state();
+  current.cwd = path.resolve(cwd);
+  current.initializedAt = new Date().toISOString();
+  if (persistShellCwd() && current.persistenceRoot) {
+    void saveGlobalShellState(current.persistenceRoot, current.cwd, undefined, null, shellKey());
   }
 }
 
 export function getShellStatus() {
+  const current = state();
   return {
-    active: sessionCwd !== null,
-    cwd: sessionCwd,
-    started_at: sessionInitializedAt,
-    recent_commands: [...history].slice(-10),
+    active: current.cwd !== null,
+    cwd: current.cwd,
+    started_at: current.initializedAt,
+    recent_commands: [...current.history].slice(-10),
+    session_id: getCurrentSessionId() || null,
   };
 }
 
@@ -286,25 +320,31 @@ export async function execInShellSession(
   timeoutMs: number,
   workingDirectory?: string
 ): Promise<ShellExecResult> {
-  if (!sessionCwd) initShellSession(defaultCwd);
+  const current = state();
+  if (!current.cwd) initShellSession(defaultCwd);
 
   if (workingDirectory) {
-    sessionCwd = path.resolve(await Promise.resolve(workingDirectory));
+    current.cwd = path.resolve(await Promise.resolve(workingDirectory));
   }
 
-  const { cwd, command: effective } = applyCwdDirectives(sessionCwd!, command);
-  sessionCwd = cwd;
+  const { cwd, command: effective } = applyCwdDirectives(current.cwd!, command);
+  current.cwd = cwd;
 
-  history.push(effective);
-  if (history.length > MAX_HISTORY) history.shift();
+  current.history.push(effective);
+  if (current.history.length > MAX_HISTORY) current.history.shift();
 
   const result = await runOnce(effective, cwd, timeoutMs);
-  sessionCwd = cwd;
+  current.cwd = cwd;
 
-  if (persistenceRoot) {
-    const prev = await loadGlobalShellState(persistenceRoot, defaultCwd);
-    await saveGlobalShellState(persistenceRoot, cwd, effective, prev);
+  if (persistShellCwd() && current.persistenceRoot) {
+    const sessionId = shellKey();
+    const prev = await loadGlobalShellState(current.persistenceRoot, defaultCwd, sessionId);
+    await saveGlobalShellState(current.persistenceRoot, cwd, effective, prev, sessionId);
   }
 
   return result;
+}
+
+export function clearShellSession(sessionId: string): void {
+  shellSessions.delete(sessionId);
 }

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import path from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
 import { audit } from "../lib/audit.js";
@@ -16,8 +17,12 @@ import {
   type AgentTaskStatus,
   type AgentTaskStepStatus,
 } from "../lib/agent-task-store.js";
+import {
+  assertCurrentSessionMutationPath,
+  getCurrentSessionState,
+} from "../lib/session-context.js";
 
-const statusSchema = z.enum(["active", "blocked", "completed", "cancelled"]);
+const statusSchema = z.enum(["active", "blocked", "completed", "cancelled", "abandoned", "archived"]);
 const stepStatusSchema = z.enum(["pending", "in_progress", "completed", "blocked", "skipped"]);
 
 function taskWithProgress<T extends Awaited<ReturnType<typeof getAgentTask>>>(task: NonNullable<T>) {
@@ -32,7 +37,7 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
       description:
         "Persistent coding-agent plan state for regular ChatGPT. Tracks objective, structured plan-step progress, notes, workspace, and resume state across MCP/chat sessions; Local Coder stores the loop while ChatGPT remains the reasoning model.",
       inputSchema: {
-        action: z.enum(["start", "list", "get", "resume", "update", "step", "finish", "cancel"]),
+        action: z.enum(["start", "list", "get", "resume", "update", "step", "finish", "cancel", "abandon", "archive"]),
         id: z.string().optional(),
         title: z.string().max(200).optional(),
         objective: z.string().max(10000).optional(),
@@ -48,7 +53,9 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
     },
     async ({ action, id, title, objective, workspace, plan, note, status, step_id, step_index, step_status }) => {
       if (action === "list") {
-        const tasks = await listAgentTasks(status as AgentTaskStatus | undefined);
+        const resolvedWorkspace = workspace ? await validatePath(workspace) : null;
+        const tasks = (await listAgentTasks(status as AgentTaskStatus | undefined))
+          .filter((task) => !resolvedWorkspace || path.resolve(task.workspace) === path.resolve(resolvedWorkspace));
         return toolResult("agent_task", { action, tasks: tasks.map(taskWithProgress) }, { summary: `${tasks.length} task(s)` });
       }
 
@@ -60,8 +67,21 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
       }
 
       if (action === "resume") {
-        const task = await getResumableAgentTask(id);
-        if (!task) throw new Error(id ? `Agent task ${id} is not resumable` : "No active or blocked agent task to resume");
+        const resolvedWorkspace = workspace ? await validatePath(workspace) : undefined;
+        let task = await getResumableAgentTask(id, resolvedWorkspace);
+        if (!id && !resolvedWorkspace) {
+          const candidates = (await listAgentTasks()).filter((item) => item.status === "active" || item.status === "blocked");
+          if (candidates.length > 1) {
+            throw new Error(
+              `Multiple resumable tasks exist across workspaces (${candidates.slice(0, 6).map((item) => `${item.id} @ ${item.workspace}`).join("; ")}). Specify id or workspace instead of guessing.`
+            );
+          }
+          task = candidates[0] || null;
+        }
+        if (!task) throw new Error(id ? `Agent task ${id} is not resumable` : "No active or blocked agent task matched the requested workspace");
+        if (resolvedWorkspace && path.resolve(task.workspace) !== path.resolve(resolvedWorkspace)) {
+          throw new Error(`Agent task ${task.id} belongs to ${task.workspace}, not ${resolvedWorkspace}`);
+        }
         const progress = getAgentTaskProgress(task);
         return toolResult(
           "agent_task",
@@ -74,7 +94,13 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
 
       if (action === "start") {
         if (!objective?.trim()) throw new Error("objective is required for start");
-        const resolvedWorkspace = workspace ? await validatePath(workspace) : defaultCwd;
+        const session = getCurrentSessionState();
+        const resolvedWorkspace = workspace
+          ? await validatePath(workspace)
+          : session?.workspace_kind === "project" && session.project_root
+            ? session.project_root
+            : defaultCwd;
+        assertCurrentSessionMutationPath(resolvedWorkspace, "agent_task start");
         const task = await createAgentTask({ title, objective, workspace: resolvedWorkspace, plan });
         await audit({
           tool: "agent_task",
@@ -87,6 +113,8 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
       }
 
       if (!id) throw new Error(`id is required for ${action}`);
+      const existing = await getAgentTask(id);
+      if (!existing) throw new Error(`Unknown agent task id: ${id}`);
       if (action === "step") {
         if (step_id === undefined && step_index === undefined) throw new Error("step_id or step_index is required for step");
         if (!step_status) throw new Error("step_status is required for step");
@@ -106,7 +134,18 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
       }
 
       const nextStatus: AgentTaskStatus | undefined =
-        action === "finish" ? "completed" : action === "cancel" ? "cancelled" : (status as AgentTaskStatus | undefined);
+        action === "finish"
+          ? "completed"
+          : action === "cancel"
+            ? "cancelled"
+            : action === "abandon"
+              ? "abandoned"
+              : action === "archive"
+                ? "archived"
+                : (status as AgentTaskStatus | undefined);
+      if (action === "archive" && (existing.status === "active" || existing.status === "blocked")) {
+        throw new Error(`Agent task ${id} is still ${existing.status}; abandon or finish it before archiving.`);
+      }
       const task = await updateAgentTask(id, { title, objective, status: nextStatus, plan, note });
       await audit({
         tool: "agent_task",

@@ -32,6 +32,7 @@ import {
   saveSubagentConfig,
 } from "../lib/subagent-manager.js";
 import { getRuntimeSnapshot } from "../lib/runtime-state.js";
+import { getPersistentAuditMetrics } from "../lib/audit-metrics.js";
 import { getRuntimeIdentity } from "../lib/runtime-identity.js";
 import { getProjectAffinity } from "../lib/project-affinity.js";
 import { getAgentTaskProgress, listAgentTasks } from "../lib/agent-task-store.js";
@@ -56,6 +57,8 @@ import {
   subscribeActivity,
   type ActivityEntry,
 } from "../lib/activity-log.js";
+import type { SessionRuntimeState } from "../lib/session-context.js";
+import type { TunnelSnapshot } from "../lib/tunnel-supervisor.js";
 
 function parseDotEnv(text: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -105,6 +108,8 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
   transportMode: "sse" | "json";
   keepAliveMs: number;
   sessionCount: () => number;
+  sessionSnapshot?: () => SessionRuntimeState[];
+  tunnelSnapshot?: () => TunnelSnapshot;
   instructionSummary?: () => Record<string, unknown>;
   instructionsPreview?: () => string;
 }): Router {
@@ -121,6 +126,8 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       transport_mode: options.transportMode,
       sse_keepalive_ms: options.transportMode === "sse" ? options.keepAliveMs : null,
       active_sessions: options.sessionCount(),
+      sessions: options.sessionSnapshot?.() ?? [],
+      tunnel: options.tunnelSnapshot?.() ?? null,
       default_cwd: getDefaultCwd(),
       full_disk_access: getFullDiskAccess(),
       permission: describePermissionProfile(),
@@ -135,22 +142,26 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     const subagents = listSubagents().map(({ stdout: _stdout, stderr: _stderr, ...item }) => item);
     const processes = getManagedProcessSnapshot();
     const activeProcessIds = new Set(processes.filter((item) => item.running).map((item) => item.id));
-    const [tasksResult, operationsResult, transactionsResult, loopsResult, capsulesResult] = await Promise.allSettled([
+    const [tasksResult, operationsResult, transactionsResult, loopsResult, capsulesResult, auditMetricsResult] = await Promise.allSettled([
       listAgentTasks(),
       listOperationHistory({ limit: 12, active_ids: activeProcessIds }),
       listEditTransactions(12),
       listCodingLoops(12),
       listContextCapsules(12),
+      getPersistentAuditMetrics(),
     ]);
     const tasks = tasksResult.status === "fulfilled" ? tasksResult.value : [];
     const operations = operationsResult.status === "fulfilled" ? operationsResult.value : [];
     const editTransactions = transactionsResult.status === "fulfilled" ? transactionsResult.value : [];
     const codingLoops = loopsResult.status === "fulfilled" ? loopsResult.value : [];
     const contextCapsules = capsulesResult.status === "fulfilled" ? capsulesResult.value : [];
+    const auditMetrics = auditMetricsResult.status === "fulfilled" ? auditMetricsResult.value : null;
     const projectAffinity = await getProjectAffinity(getDefaultCwd()).catch(() => ({ active_root: null, active_alias: null, recents: [] }));
     res.json({
       ok: true,
       identity: getRuntimeIdentity(),
+      sessions: options.sessionSnapshot?.() ?? [],
+      tunnel: options.tunnelSnapshot?.() ?? null,
       project_affinity: projectAffinity,
       runtime: getRuntimeSnapshot(),
       processes,
@@ -160,6 +171,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       operations,
       edit_transactions: editTransactions.map((transaction) => ({
         id: transaction.id,
+        session_id: transaction.session_id,
         label: transaction.label,
         workspace: transaction.workspace,
         status: transaction.status,
@@ -178,6 +190,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       })),
       coding_loops: codingLoops.map((loop) => ({
         id: loop.id,
+        session_id: loop.session_id,
         goal: loop.goal,
         task_id: loop.task_id,
         status: loop.status,
@@ -192,6 +205,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         updated_at: loop.updated_at,
       })),
       context_capsules: contextCapsules.map(compactContextCapsule),
+      persistent_telemetry: auditMetrics,
       state_errors: [
         ...(tasksResult.status === "rejected" ? [`agent_tasks: ${String(tasksResult.reason)}`] : []),
         ...(operationsResult.status === "rejected" ? [`operations: ${String(operationsResult.reason)}`] : []),
@@ -200,6 +214,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         ...(loopsResult.status === "fulfilled" ? getCodingLoopStateErrors().map((error) => `coding_loops: ${error}`) : []),
         ...(capsulesResult.status === "rejected" ? [`context_capsules: ${String(capsulesResult.reason)}`] : []),
         ...(capsulesResult.status === "fulfilled" ? getContextCapsuleStateErrors().map((error) => `context_capsules: ${error}`) : []),
+        ...(auditMetricsResult.status === "rejected" ? [`audit_metrics: ${String(auditMetricsResult.reason)}`] : []),
       ],
       memory: {
         rss_bytes: memory.rss,

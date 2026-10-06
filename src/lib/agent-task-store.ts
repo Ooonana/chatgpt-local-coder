@@ -1,8 +1,9 @@
 import fs from "fs/promises";
 import path from "path";
 import { randomUUID } from "node:crypto";
+import { getCurrentSessionId } from "./session-context.js";
 
-export type AgentTaskStatus = "active" | "blocked" | "completed" | "cancelled";
+export type AgentTaskStatus = "active" | "blocked" | "completed" | "cancelled" | "abandoned" | "archived";
 export type AgentTaskStepStatus = "pending" | "in_progress" | "completed" | "blocked" | "skipped";
 
 export interface AgentTaskStep {
@@ -20,6 +21,7 @@ export interface AgentTaskRecord {
   title: string;
   objective: string;
   workspace: string;
+  session_id?: string;
   status: AgentTaskStatus;
   /** Backward-compatible flat plan used by older clients. */
   plan: string[];
@@ -206,13 +208,17 @@ export async function getAgentTask(id: string): Promise<AgentTaskRecord | null> 
   return index.tasks.find((task) => task.id === id) ?? null;
 }
 
-export async function getResumableAgentTask(id?: string): Promise<AgentTaskRecord | null> {
+export async function getResumableAgentTask(id?: string, workspace?: string): Promise<AgentTaskRecord | null> {
   if (id) {
     const task = await getAgentTask(id);
     return task && (task.status === "active" || task.status === "blocked") ? task : null;
   }
   const tasks = await listAgentTasks();
-  return tasks.find((task) => task.status === "active" || task.status === "blocked") ?? null;
+  const root = workspace ? path.resolve(workspace) : null;
+  return tasks.find((task) =>
+    (task.status === "active" || task.status === "blocked") &&
+    (!root || path.resolve(task.workspace) === root)
+  ) ?? null;
 }
 
 export async function createAgentTask(input: {
@@ -229,6 +235,7 @@ export async function createAgentTask(input: {
       title: input.title?.trim() || input.objective.trim().slice(0, 80),
       objective: input.objective.trim(),
       workspace: path.resolve(input.workspace),
+      session_id: getCurrentSessionId(),
       status: "active",
       plan,
       steps: plan.map((title) => newStep(title, now)),
@@ -243,6 +250,7 @@ export async function createAgentTask(input: {
     return task;
   });
 }
+
 
 export async function updateAgentTask(
   id: string,
@@ -294,7 +302,7 @@ export async function updateAgentTaskStep(
   return mutate(async () => {
     const index = await readIndex();
     const task = findTask(index, id);
-    if (task.status === "completed" || task.status === "cancelled") {
+    if (["completed", "cancelled", "abandoned", "archived"].includes(task.status)) {
       throw new Error(`Agent task ${id} is ${task.status}; reactivate it explicitly before changing plan steps`);
     }
     const step = selector.step_id

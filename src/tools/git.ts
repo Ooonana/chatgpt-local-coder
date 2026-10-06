@@ -6,6 +6,7 @@ import { audit } from "../lib/audit.js";
 import { requireWriteAllowed } from "../lib/permissions.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
+import { assertCurrentSessionMutationPath, getCurrentSessionState } from "../lib/session-context.js";
 
 interface GitRunResult {
   stdout: string;
@@ -92,7 +93,19 @@ async function gitOrThrow(args: string[], cwd: string): Promise<GitRunResult> {
 }
 
 export function registerGitTools(server: McpServer, defaultCwd: string): void {
-  const repo = async (p?: string) => (p ? validatePath(p) : defaultCwd);
+  const repo = async (p?: string) => {
+    const session = getCurrentSessionState();
+    return p
+      ? validatePath(p)
+      : session?.workspace_kind === "project" && session.project_root
+        ? session.project_root
+        : defaultCwd;
+  };
+  const mutableRepo = async (p: string | undefined, operation: string) => {
+    const cwd = await repo(p);
+    assertCurrentSessionMutationPath(cwd, operation);
+    return cwd;
+  };
 
   server.registerTool("git_status", {
     title: "Git Status", description: "Show git working tree status.",
@@ -146,7 +159,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     },
     annotations: toolAnnotations("edit"),
   }, async ({ path: repoPath, action, worktree_path, branch, new_branch, start_point, force }) => {
-    const cwd = await repo(repoPath);
+    const cwd = action === "list" ? await repo(repoPath) : await mutableRepo(repoPath, "git_worktree");
     if (action === "list") {
       const r = await gitOrThrow(["worktree", "list", "--porcelain"], cwd);
       return toolResult("git_worktree", { path: cwd, action, output: r.stdout });
@@ -207,7 +220,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     annotations: toolAnnotations("edit"),
   }, async ({ path: repoPath, files, all }) => {
     requireWriteAllowed();
-    const cwd = await repo(repoPath);
+    const cwd = await mutableRepo(repoPath, "git_add");
     const args = ["add"];
     if (all && (!files || files.length === 0)) args.push("-A");
     else if (files?.length) args.push(...files);
@@ -216,7 +229,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   });
 
   server.registerTool("git_commit", {
-    title: "Git Commit", description: "Create a commit (stages all first unless stage_only=false).",
+    title: "Git Commit", description: "Create a commit; stages all changes first by default. Set stage_all=false to commit only already-staged changes.",
     inputSchema: {
       message: z.string().max(100_000),
       path: z.string().optional(),
@@ -226,7 +239,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     annotations: toolAnnotations("edit"),
   }, async ({ message, path: repoPath, stage_all }) => {
     requireWriteAllowed();
-    const cwd = await repo(repoPath);
+    const cwd = await mutableRepo(repoPath, "git_commit");
     if (stage_all) await gitOrThrow(["add", "-A"], cwd);
     const r = await gitOrThrow(["commit", "-m", message], cwd);
     await audit({ tool: "git_commit", action: "git", target: cwd, status: "ok", details: { message } });
@@ -243,7 +256,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
 
     annotations: toolAnnotations("edit"),
   }, async ({ path: repoPath, action, name }) => {
-    const cwd = await repo(repoPath);
+    const cwd = action === "list" ? await repo(repoPath) : await mutableRepo(repoPath, "git_branch");
     let args: string[];
     if (action === "list") args = ["branch", "--all"];
     else {
@@ -267,7 +280,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     annotations: toolAnnotations("edit"),
   }, async ({ path: repoPath, branch }) => {
     requireWriteAllowed();
-    const cwd = await repo(repoPath);
+    const cwd = await mutableRepo(repoPath, "git_checkout");
     const r = await gitOrThrow(["switch", branch], cwd);
     return toolResult("git_checkout", {
       path: cwd,
@@ -294,7 +307,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     annotations: toolAnnotations("edit"),
   }, async ({ path: repoPath, files, source }) => {
     requireWriteAllowed();
-    const cwd = await repo(repoPath);
+    const cwd = await mutableRepo(repoPath, "git_restore");
     let r: GitRunResult;
     const restore = await runGit(["restore", "--source", source, "--", ...files], cwd);
     if (restore.exit_code === 0) {
@@ -325,7 +338,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     annotations: toolAnnotations("edit"),
   }, async ({ path: repoPath, remote, branch, set_upstream }) => {
     requireWriteAllowed();
-    const cwd = await repo(repoPath);
+    const cwd = await mutableRepo(repoPath, "git_push");
     const args = ["push"];
     if (set_upstream) args.push("-u");
     args.push(remote);
@@ -352,7 +365,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     annotations: toolAnnotations("edit"),
   }, async ({ path: repoPath, remote, branch }) => {
     requireWriteAllowed();
-    const cwd = await repo(repoPath);
+    const cwd = await mutableRepo(repoPath, "git_pull");
     const args = ["pull", remote];
     if (branch) args.push(branch);
     const r = await gitOrThrow(args, cwd);
@@ -369,7 +382,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
 
     annotations: toolAnnotations("edit"),
   }, async ({ path: repoPath, action, message }) => {
-    const cwd = await repo(repoPath);
+    const cwd = action === "list" ? await repo(repoPath) : await mutableRepo(repoPath, "git_stash");
     const args = ["stash"];
     if (action === "list") args.push("list");
     else {
@@ -396,7 +409,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     annotations: toolAnnotations("edit"),
   }, async ({ path: repoPath, mode, ref }) => {
     requireWriteAllowed();
-    const cwd = await repo(repoPath);
+    const cwd = await mutableRepo(repoPath, "git_reset");
     const r = await gitOrThrow(["reset", `--${mode}`, ref], cwd);
     return toolResult("git_reset", { path: cwd, mode, ref, output: r.stdout || r.stderr });
   });

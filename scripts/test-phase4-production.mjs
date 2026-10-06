@@ -275,7 +275,8 @@ try {
   });
   metric("noisy_raw_chars", noisy.payload?.data?.results?.[0]?.output_chars || 0, " chars");
   metric("noisy_compact_response_bytes", noisy.bytes, " bytes");
-  assert.equal(noisy.payload?.ok, false);
+  assert.equal(noisy.payload?.ok, true);
+  assert.equal(noisy.payload?.data?.verification_passed, false);
   assert.ok((noisy.payload?.data?.results?.[0]?.output_chars || 0) > 100_000);
   assert.ok(noisy.bytes < 16 * 1024, `verification compaction response too large: ${noisy.bytes}`);
 

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import path from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
 import { audit } from "../lib/audit.js";
@@ -7,6 +8,7 @@ import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 import {
   acceptEditTransaction,
+  abandonEditTransaction,
   beginEditTransaction,
   getEditTransaction,
   getEditTransactionConfig,
@@ -22,8 +24,13 @@ import {
   type VerificationCommand,
 } from "../lib/verification.js";
 import { runOneShotCommand } from "./shell.js";
+import {
+  assertCurrentSessionMutationPath,
+  getCurrentSessionState,
+} from "../lib/session-context.js";
+import { recordProjectAffinity } from "../lib/project-affinity.js";
 
-const actionSchema = z.enum(["begin", "status", "list", "preview", "verify", "accept", "rollback"]);
+const actionSchema = z.enum(["begin", "resume", "status", "list", "preview", "verify", "accept", "rollback", "abandon"]);
 const commandSchema = z.object({
   label: z.string().min(1).max(120),
   command: z.string().min(1).max(100_000),
@@ -52,7 +59,9 @@ export function registerEditTransactionTool(server: McpServer, defaultCwd: strin
     },
     async ({ action, id, workspace, label, limit, force, preset, commands, stop_on_failure }) => {
       if (action === "list") {
-        const transactions = await listEditTransactions(limit);
+        const root = workspace ? await validatePath(workspace) : null;
+        const transactions = (await listEditTransactions(limit))
+          .filter((transaction) => !root || path.resolve(transaction.workspace) === path.resolve(root));
         return toolResult("edit_transaction", {
           action,
           config: getEditTransactionConfig(),
@@ -62,7 +71,13 @@ export function registerEditTransactionTool(server: McpServer, defaultCwd: strin
 
       if (action === "begin") {
         requireWriteAllowed();
-        const root = workspace ? await validatePath(workspace) : defaultCwd;
+        const session = getCurrentSessionState();
+        const root = workspace
+          ? await validatePath(workspace)
+          : session?.workspace_kind === "project" && session.project_root
+            ? session.project_root
+            : defaultCwd;
+        assertCurrentSessionMutationPath(root, "edit_transaction begin");
         const transaction = await beginEditTransaction(root, label);
         await audit({
           tool: "edit_transaction",
@@ -79,6 +94,12 @@ export function registerEditTransactionTool(server: McpServer, defaultCwd: strin
       }
 
       if (!id) throw new Error(`id is required for edit_transaction action '${action}'`);
+      if (action === "resume") {
+        const transaction = await getEditTransaction(id);
+        await validatePath(transaction.workspace);
+        await recordProjectAffinity(transaction.workspace).catch(() => undefined);
+        return toolResult("edit_transaction", { action, transaction }, { summary: `resumed ${id}` });
+      }
       return withEditTransactionLock(id, async () => {
       const current = await getEditTransaction(id);
       await validatePath(current.workspace);
@@ -188,6 +209,23 @@ export function registerEditTransactionTool(server: McpServer, defaultCwd: strin
           details: { id, files: transaction.snapshots.length, edits: transaction.edits.length },
         });
         return toolResult("edit_transaction", { action, transaction }, { summary: `accepted ${id}` });
+      }
+
+      if (action === "abandon") {
+        requireWriteAllowed();
+        const transaction = await abandonEditTransaction(id);
+        await audit({
+          tool: "edit_transaction",
+          action: "abandon",
+          target: transaction.workspace,
+          status: "ok",
+          details: { id, files_preserved: true, snapshots: transaction.snapshots.length },
+        });
+        return toolResult("edit_transaction", {
+          action,
+          transaction,
+          files_preserved: true,
+        }, { summary: `abandoned ${id} without changing current files` });
       }
 
       requireWriteAllowed();

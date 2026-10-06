@@ -83,7 +83,7 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
     {
       title: "Verify Project",
       description:
-        "Run a deterministic project verification recipe in one MCP call and return compact per-check evidence. Auto-discovers package build/lint/typecheck/test/integration checks or reads .local-coder/verification.json. Use preset=discover to inspect the recipe without executing it.",
+        "Run deterministic build/lint/typecheck/test verification, not exploratory diagnosis. A failing project check is reported as verification_passed=false while the tool call itself remains successful. Use preset=discover to inspect the recipe without executing it.",
       inputSchema: {
         path: z.string().optional(),
         preset: z.enum(["discover", "quick", "full", "custom"]).optional().default("full"),
@@ -122,8 +122,8 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
       if (!selected.commands.length) {
         return toolResult(
           "verify_project",
-          { path: root, preset, source: discovered.source, commands: [], results: [], incremental: selected.incremental, incremental_reason: selected.reason },
-          { ok: false, summary: "no verification checks discovered" }
+          { path: root, preset, source: discovered.source, commands: [], results: [], verification_available: false, verification_passed: null, incremental: selected.incremental, incremental_reason: selected.reason },
+          { summary: "no verification checks discovered" }
         );
       }
 
@@ -187,8 +187,8 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
         tool: "verify_project",
         action: "verify",
         target: root,
-        status: failed ? "error" : "ok",
-        details: { preset, source: discovered.source, checks: results.length, failed, duration_ms: totalMs, task_id, incremental: selected.incremental, affected_files: safeAffectedFiles.length, use_cache },
+        status: "ok",
+        details: { preset, source: discovered.source, checks: results.length, failed, verification_passed: failed === 0, duration_ms: totalMs, task_id, incremental: selected.incremental, affected_files: safeAffectedFiles.length, use_cache },
       });
       return toolResult(
         "verify_project",
@@ -205,8 +205,10 @@ export function registerAgentRuntimeTools(server: McpServer, defaultCwd: string)
           incremental_reason: selected.reason,
           affected_files: safeAffectedFiles,
           cached_checks: results.filter((item) => item.cached).length,
+          verification_available: true,
+          verification_passed: failed === 0,
         },
-        { ok: failed === 0, summary }
+        { summary }
       );
     }
   );

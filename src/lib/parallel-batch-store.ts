@@ -7,6 +7,7 @@ export interface ParallelCommandSpec {
   command: string;
   working_directory?: string;
   timeout_seconds?: number;
+  success_exit_codes?: number[];
 }
 
 export interface ParallelCommandResult {

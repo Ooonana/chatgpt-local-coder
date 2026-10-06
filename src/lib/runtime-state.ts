@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { getCurrentSessionState } from "./session-context.js";
 
 export type RuntimeToolKind = "READ" | "EDIT" | "EXEC" | "MCP";
 
@@ -9,6 +10,9 @@ export interface ActiveToolCall {
   summary: string;
   started_at: string;
   started_ms: number;
+  session_id?: string;
+  project_root?: string | null;
+  workspace_kind?: string;
 }
 
 export interface CompletedToolCall {
@@ -23,6 +27,9 @@ export interface CompletedToolCall {
   error?: string;
   result_bytes: number;
   repeated: boolean;
+  session_id?: string;
+  project_root?: string | null;
+  workspace_kind?: string;
 }
 
 export interface ToolUsageStat {
@@ -97,6 +104,7 @@ export function beginToolCall(input: {
 }): string {
   const id = randomUUID();
   const startedMs = Date.now();
+  const session = getCurrentSessionState();
   active.set(id, {
     id,
     tool: input.tool,
@@ -104,6 +112,9 @@ export function beginToolCall(input: {
     summary: trimOneLine(input.summary || ""),
     started_at: new Date(startedMs).toISOString(),
     started_ms: startedMs,
+    session_id: session?.session_id,
+    project_root: session?.project_root,
+    workspace_kind: session?.workspace_kind,
   });
   notify();
   return id;
@@ -136,6 +147,9 @@ export function finishToolCall(
     error: error ? trimOneLine(error, 220) : undefined,
     result_bytes: Math.max(0, Math.trunc(resultBytes)),
     repeated,
+    session_id: item.session_id,
+    project_root: item.project_root,
+    workspace_kind: item.workspace_kind,
   };
   recent.unshift(completed);
   if (recent.length > MAX_RECENT) recent.length = MAX_RECENT;

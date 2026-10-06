@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
 import { audit, getAuditPath } from "../lib/audit.js";
+import { getPersistentAuditMetrics } from "../lib/audit-metrics.js";
 import {
   describePermissionProfile,
   getPermissionConfig,
@@ -21,13 +22,20 @@ import { appendAutoMemory } from "../lib/auto-memory.js";
 import { loadPathRulesForFile } from "../lib/path-rules.js";
 import { toolResult } from "../lib/tool-result.js";
 import { loadProjectSkill, loadProjectSkills } from "../lib/skills-loader.js";
-import { getShellStatus } from "../lib/persistent-shell.js";
+import { getShellStatus, resetShellSession } from "../lib/persistent-shell.js";
 import { getProjectAffinity, recordProjectAffinity, resolveProjectReference } from "../lib/project-affinity.js";
 import { getRuntimeIdentity } from "../lib/runtime-identity.js";
 import { listAgentTasks } from "../lib/agent-task-store.js";
 import { listEditTransactions } from "../lib/edit-transaction-store.js";
 import { listCodingLoops } from "../lib/coding-loop-store.js";
 import { getTextReadCacheStats } from "../lib/text-read-cache.js";
+import {
+  bindCurrentSessionMachine,
+  getCurrentSessionState,
+  listSessionRuntimeStates,
+} from "../lib/session-context.js";
+import { getManagedProcessSnapshot } from "./shell.js";
+import { listOperationHistory } from "../lib/operation-store.js";
 
 
 
@@ -44,6 +52,51 @@ const CONTEXT_CACHE_MAX_ENTRIES = 128;
 const CONTEXT_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 const contextFileCache = new Map<string, { size: number; mtimeMs: number; ctimeMs: number; retainedBytes: number; content: string }>();
 let contextFileCacheBytes = 0;
+
+function sameOptionalRoot(left?: string | null, right?: string | null): boolean {
+  if (!left || !right) return left == null && right == null;
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+async function buildRecoverySummary() {
+  const session = getCurrentSessionState();
+  const processes = getManagedProcessSnapshot();
+  const activeIds = new Set(processes.filter((item) => item.running).map((item) => item.id));
+  const history = await listOperationHistory({ limit: 30, active_ids: activeIds });
+  const running = processes
+    .filter((item) => item.running)
+    .slice(0, 8)
+    .map((item) => ({
+      id: item.id,
+      label: item.label || null,
+      pid: item.pid || null,
+      project_root: item.project_root || null,
+      cwd: item.cwd,
+      liveness: item.liveness,
+      last_activity_at: item.last_activity_at,
+    }));
+  const attention = running.filter((item) => item.liveness !== "active");
+  const recentCompleted = history
+    .filter((item) => item.effective_status !== "running")
+    .slice(0, 5)
+    .map((item) => ({
+      id: item.id,
+      label: item.label || null,
+      project_root: item.project_root || null,
+      status: item.effective_status,
+      exit_code: item.exit_code ?? null,
+      finished_at: item.finished_at || null,
+    }));
+  return {
+    transport_session_id: session?.session_id || null,
+    note: "MCP transport sessions are diagnostic only; durable work is recovered by operation/task/loop id and workspace.",
+    running_operations: running,
+    silent_or_stalled_operations: attention,
+    recent_completed_operations: recentCompleted,
+  };
+}
 
 function removeContextCacheEntry(key: string): void {
   const existing = contextFileCache.get(key);
@@ -148,14 +201,16 @@ async function buildDoctor(workspaceRoot: string) {
     ? Math.min(Math.max(Math.trunc(staleHoursRaw), 1), 24 * 30)
     : 24;
   const cutoffMs = Date.now() - staleHours * 60 * 60 * 1000;
-  const [tasksResult, transactionsResult, loopsResult] = await Promise.allSettled([
+  const [tasksResult, transactionsResult, loopsResult, auditMetricsResult] = await Promise.allSettled([
     listAgentTasks(),
     listEditTransactions(100),
     listCodingLoops(100),
+    getPersistentAuditMetrics(),
   ]);
   const tasks = tasksResult.status === "fulfilled" ? tasksResult.value : [];
   const transactions = transactionsResult.status === "fulfilled" ? transactionsResult.value : [];
   const loops = loopsResult.status === "fulfilled" ? loopsResult.value : [];
+  const auditMetrics = auditMetricsResult.status === "fulfilled" ? auditMetricsResult.value : null;
   const activeLoops = loops.filter((loop) => loop.status === "active");
   const activeLoopTransactions = new Set(activeLoops.map((loop) => loop.transaction_id));
   const ageHours = (value: string | undefined) => {
@@ -189,6 +244,7 @@ async function buildDoctor(workspaceRoot: string) {
     ...(tasksResult.status === "rejected" ? [`agent_tasks: ${String(tasksResult.reason)}`] : []),
     ...(transactionsResult.status === "rejected" ? [`edit_transactions: ${String(transactionsResult.reason)}`] : []),
     ...(loopsResult.status === "rejected" ? [`coding_loops: ${String(loopsResult.reason)}`] : []),
+    ...(auditMetricsResult.status === "rejected" ? [`audit_metrics: ${String(auditMetricsResult.reason)}`] : []),
   ];
   if (identity.connector_refresh_recommended) recommendations.push("Server tool schema changed since the previous run; refresh the connector and use a fresh ChatGPT chat after restart.");
   if (!checks.every((check) => check.ok)) recommendations.push("Resolve failed filesystem checks before relying on mutation or recovery features.");
@@ -227,6 +283,7 @@ async function buildDoctor(workspaceRoot: string) {
       edit_transactions: staleTransactions,
       state_errors: stateErrors,
     },
+    persistent_telemetry: auditMetrics,
   };
 }
 
@@ -268,8 +325,9 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
     {
       title: "Project Context",
       description:
-        "Load CLAUDE.md/AGENTS.md for a project path or recent project alias and make that project active for subsequent work.",
+        "Load one project's context for this MCP transport, or select machine mode for host-wide work. Explicit path/workspace/working_directory arguments remain authoritative because ChatGPT may create a fresh MCP transport on later tool calls.",
       inputSchema: {
+        mode: z.enum(["project", "machine"]).optional().default("project"),
         path: z.string().optional().describe("Project directory, defaults to primary workspace"),
         max_depth: z.number().int().min(0).max(5).optional().default(3),
         max_bytes_per_file: z.number().int().positive().max(200000).optional().default(60000),
@@ -277,11 +335,27 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
 
       annotations: toolAnnotations("read"),
     },
-    async ({ path: projectPath, max_depth, max_bytes_per_file }) => {
+    async ({ mode, path: projectPath, max_depth, max_bytes_per_file }) => {
+      if (mode === "machine") {
+        if (projectPath) throw new Error("path must be omitted when project_context mode=machine");
+        bindCurrentSessionMachine();
+        resetShellSession(workspaceRoot);
+        const session = getCurrentSessionState();
+        await audit({ tool: "project_context", action: "machine", target: workspaceRoot, status: "ok" });
+        return toolResult("project_context", {
+          mode,
+          root: null,
+          files: [],
+          count: 0,
+          session,
+          cwd: getShellStatus().cwd,
+        }, { summary: "session switched to machine context" });
+      }
       const fallback = getShellStatus().cwd || workspaceRoot;
       const affinityRoot = await resolveProjectReference(projectPath, fallback);
       const root = await validatePath(affinityRoot);
       await recordProjectAffinity(root).catch(() => undefined);
+      resetShellSession(root);
       const files = await findContextFiles(root, max_depth);
       const fileContents: Array<{ path: string; content: string; truncated: boolean }> = [];
 
@@ -293,7 +367,14 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
       }
 
       await audit({ tool: "project_context", action: "read", target: root, status: "ok", details: { files: files.length } });
-      return toolResult("project_context", { root, files: fileContents, count: fileContents.length });
+      return toolResult("project_context", {
+        mode,
+        root,
+        files: fileContents,
+        count: fileContents.length,
+        session: getCurrentSessionState(),
+        cwd: getShellStatus().cwd,
+      });
     }
   );
 
@@ -302,21 +383,46 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
     {
       title: "Agent Status",
       description:
-        "Runtime/tool/permission/project status. mode=doctor adds filesystem/schema/recovery self-checks.",
-      inputSchema: { mode: z.enum(["summary", "doctor"]).optional().default("summary") },
+        "Compact runtime/session/project status. Use mode=doctor for self-checks, full for detailed configuration, or help for the full tool workflow.",
+      inputSchema: { mode: z.enum(["summary", "doctor", "full", "help"]).optional().default("summary") },
 
       annotations: toolAnnotations("read"),
     },
     async ({ mode }) => {
+      const affinity = await getProjectAffinity(getShellStatus().cwd || workspaceRoot);
+      const identity = getRuntimeIdentity();
+      const session = getCurrentSessionState() ?? null;
+      const recovery = await buildRecoverySummary();
+      const doctor = mode === "doctor" ? await buildDoctor(workspaceRoot) : undefined;
+      const compact = {
+        healthy: doctor ? doctor.healthy : true,
+        pid: process.pid,
+        node: process.version,
+        session,
+        shell: getShellStatus(),
+        project: {
+          active_root: affinity.active_root,
+          active_alias: affinity.active_alias,
+        },
+        tool_profile: process.env.CHATGPT_TOOL_PROFILE || "slim",
+        runtime_identity: identity,
+        recovery,
+        admin_ui: `http://127.0.0.1:${process.env.ADMIN_PORT || "3001"}/ui`,
+      };
+      if (mode === "summary") return toolResult("agent_status", compact);
+      if (mode === "help") {
+        return toolResult("agent_status", { ...compact, quickstart: MCP_QUICKSTART });
+      }
+      if (mode === "doctor") {
+        return toolResult("agent_status", { ...compact, doctor });
+      }
       const upstreamManager = getUpstreamManager();
       let upstream: Awaited<ReturnType<typeof upstreamManager.listStatuses>> = [];
       try {
         upstream = await upstreamManager.listStatuses();
       } catch {}
-      const affinity = await getProjectAffinity(getShellStatus().cwd || workspaceRoot);
-      const identity = getRuntimeIdentity();
-      const doctor = mode === "doctor" ? await buildDoctor(workspaceRoot) : undefined;
       return toolResult("agent_status", {
+        ...compact,
         permission_profile: getPermissionProfile(),
         permission_description: describePermissionProfile(),
         permission_config: getPermissionConfig(),
@@ -325,19 +431,12 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
         default_cwd: getDefaultCwd(),
         machine_roots: getMachineRoots(),
         audit_log: getAuditPath(),
-        pid: process.pid,
-        node: process.version,
-        quickstart: MCP_QUICKSTART,
         rewind: getCheckpointConfig(),
         upstream_mcp: {
           config_path: upstreamManager.getConfigPath(),
           servers: upstream,
         },
-        admin_ui: `http://127.0.0.1:${process.env.ADMIN_PORT || "3001"}/ui`,
-        tool_profile: process.env.CHATGPT_TOOL_PROFILE || "slim",
         project_affinity: affinity,
-        runtime_identity: identity,
-        ...(doctor ? { doctor } : {}),
       });
     }
   );

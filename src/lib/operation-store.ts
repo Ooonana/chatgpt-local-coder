@@ -7,6 +7,8 @@ export interface OperationRecord {
   id: string;
   label?: string;
   task_id?: string;
+  session_id?: string;
+  project_root?: string | null;
   command: string;
   cwd: string;
   pid?: number;
@@ -18,6 +20,7 @@ export interface OperationRecord {
   spawn_error?: string;
   stdout_tail?: string;
   stderr_tail?: string;
+  last_progress_at?: string;
 }
 
 interface OperationIndex {
@@ -109,7 +112,7 @@ export async function recordOperationStart(record: OperationRecord): Promise<voi
 
 export async function recordOperationFinish(
   id: string,
-  updates: Partial<Pick<OperationRecord, "status" | "finished_at" | "exit_code" | "signal" | "spawn_error" | "stdout_tail" | "stderr_tail">>
+  updates: Partial<Pick<OperationRecord, "status" | "finished_at" | "exit_code" | "signal" | "spawn_error" | "stdout_tail" | "stderr_tail" | "last_progress_at">>
 ): Promise<void> {
   await mutate(async () => {
     const index = await readIndex();

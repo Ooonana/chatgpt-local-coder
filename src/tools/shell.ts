@@ -32,15 +32,21 @@ import {
   type ParallelCommandResult,
   type ParallelCommandSpec,
 } from "../lib/parallel-batch-store.js";
-import { recordProjectAffinity } from "../lib/project-affinity.js";
+import { detectProjectRoot, isProjectRoot } from "../lib/project-affinity.js";
 import { captureWorkingTree, commandMayMutate, compareWorkingTrees } from "../lib/shell-mutation.js";
 import { loadIdempotent, requestFingerprint, saveIdempotent, withIdempotencyKeyLock } from "../lib/idempotency-store.js";
 import { captureTransactionPaths, getEditTransaction, recordTransactionEdit, withEditTransactionLock } from "../lib/edit-transaction-store.js";
+import {
+  getCurrentSessionId,
+  getCurrentSessionState,
+} from "../lib/session-context.js";
 
 interface ManagedProcess {
   id: string;
   label?: string;
   taskId?: string;
+  sessionId?: string;
+  projectRoot?: string | null;
   command: string;
   cwd: string;
   startedAt: string;
@@ -54,6 +60,7 @@ interface ManagedProcess {
   startWrite?: Promise<void>;
   historyWrite?: Promise<void>;
   historyError?: string;
+  lastActivityAt: string;
 }
 
 interface OneShotCommandResult {
@@ -85,10 +92,13 @@ function pruneFinishedProcesses(): void {
 }
 
 export function getManagedProcessSnapshot() {
+  const now = Date.now();
   return [...processes.values()].map((item) => ({
     id: item.id,
     label: item.label,
     task_id: item.taskId,
+    session_id: item.sessionId,
+    project_root: item.projectRoot,
     pid: item.child.pid,
     command: item.command,
     cwd: item.cwd,
@@ -96,7 +106,27 @@ export function getManagedProcessSnapshot() {
     running: item.exitCode === null && item.signal === null,
     exit_code: item.exitCode,
     signal: item.signal,
+    last_activity_at: item.lastActivityAt,
+    liveness: !processRunning(item)
+      ? "exited"
+      : now - Date.parse(item.lastActivityAt) > 10 * 60_000
+        ? "possibly_stalled"
+        : now - Date.parse(item.lastActivityAt) > 2 * 60_000
+          ? "silent"
+          : "active",
   }));
+}
+
+function sameRoot(left?: string | null, right?: string | null): boolean {
+  if (!left || !right) return left == null && right == null;
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+async function projectRootForCwd(cwd: string): Promise<string | null> {
+  const root = await detectProjectRoot(cwd).catch(() => cwd);
+  return await isProjectRoot(root).catch(() => false) ? root : null;
 }
 
 function getShellInvocation(command: string): { shell: string; args: string[]; effectiveCommand: string } {
@@ -305,20 +335,21 @@ export async function shutdownManagedProcesses(): Promise<void> {
   await Promise.all(active.map((item) => waitForManagedProcessExit(item)));
 }
 
-export function registerShellTools(server: McpServer, defaultCwd: string, timeoutSec: number): void {
-  void bootstrapShellSession(defaultCwd);
+export function registerShellTools(server: McpServer, defaultCwd: string, timeoutSec: number, sessionId = "legacy"): void {
+  void bootstrapShellSession(defaultCwd, sessionId);
 
   server.registerTool(
     "run_command",
     {
       title: "Run Command",
       description:
-        "Run a bounded shell command. Cwd persists across ChatGPT tool calls (saved to disk). timeout_seconds overrides the server default up to 1 hour; use start_process for very long/continuous jobs.",
+        "Run a short bounded shell command in this MCP session's cwd. For long work use start_process + process_status/process_output; do not build Start-Sleep polling loops. success_exit_codes marks expected domain exits as successful.",
       inputSchema: {
         command: z.string().max(MAX_COMMAND_CHARS),
         working_directory: z.string().optional().describe("One-off override; does not reset persistent cwd unless you use shell_reset"),
         timeout_seconds: z.number().int().positive().max(3600).optional()
           .describe("Per-call timeout in seconds. Defaults to SHELL_TIMEOUT (300s by default). Use start_process for continuous jobs."),
+        success_exit_codes: z.array(z.number().int()).min(1).max(16).optional().default([0]),
         idempotency_key: z.string().min(1).max(200).optional(),
         track_changes: z.boolean().optional().default(true),
         transaction_id: z.string().optional(),
@@ -327,12 +358,11 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
 
       annotations: toolAnnotations("command"),
     },
-    async ({ command, working_directory, timeout_seconds, idempotency_key, track_changes, transaction_id, mutation_paths }) => {
+    async ({ command, working_directory, timeout_seconds, success_exit_codes, idempotency_key, track_changes, transaction_id, mutation_paths }) => {
       const cwdOverride = working_directory ? await validatePath(working_directory) : undefined;
       const policyCwd = cwdOverride ?? getShellStatus().cwd ?? defaultCwd;
       requireCommandAllowed(command, policyCwd);
-      await recordProjectAffinity(policyCwd).catch(() => undefined);
-      const fingerprint = idempotency_key ? requestFingerprint({ command, cwd: policyCwd, timeout_seconds, transaction_id, mutation_paths }) : undefined;
+      const fingerprint = idempotency_key ? requestFingerprint({ command, cwd: policyCwd, timeout_seconds, success_exit_codes, transaction_id, mutation_paths }) : undefined;
       const txPaths = mutation_paths?.length
         ? await Promise.all(mutation_paths.map((item) => validatePath(path.isAbsolute(item) ? item : path.resolve(policyCwd, item))))
         : [];
@@ -348,9 +378,9 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         const rawResult = await execInShellSession(command, defaultCwd, (timeout_seconds ?? timeoutSec) * 1000, cwdOverride);
         if (transaction_id) await recordTransactionEdit(transaction_id, "run_command", txPaths);
         const result = await compactCommandResult(rawResult, "command");
-        await recordProjectAffinity(result.cwd).catch(() => undefined);
         const mutation = beforeTree ? compareWorkingTrees(beforeTree, await captureWorkingTree(result.cwd)) : undefined;
-        const failure = result.exit_code === 0 ? undefined : classifyToolFailure({
+        const acceptedExit = result.exit_code !== null && success_exit_codes.includes(result.exit_code);
+        const failure = acceptedExit ? undefined : classifyToolFailure({
           message: result.stderr,
           exitCode: result.exit_code,
           timedOut: result.timed_out,
@@ -363,11 +393,11 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           tool: "run_command",
           action: "command",
           target: result.cwd,
-          status: result.exit_code === 0 || expectedNoMatch ? "ok" : "error",
-          details: { command, exit_code: result.exit_code, timed_out: result.timed_out, failure, changed_paths: mutation?.changed_paths, idempotency_key, transaction_id, mutation_paths: txPaths },
+          status: acceptedExit || expectedNoMatch ? "ok" : "error",
+          details: { command, exit_code: result.exit_code, success_exit_codes, timed_out: result.timed_out, failure, changed_paths: mutation?.changed_paths, idempotency_key, transaction_id, mutation_paths: txPaths },
         });
         return toolResult("run_command", data, {
-          ok: result.exit_code === 0 || expectedNoMatch,
+          ok: acceptedExit || expectedNoMatch,
           summary: expectedNoMatch ? `no matches in ${result.cwd}` : `exit ${result.exit_code} in ${result.cwd}`,
         });
       };
@@ -403,12 +433,13 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     "run_commands_parallel",
     {
       title: "Run Commands in Parallel",
-      description: "Run independent commands concurrently. Returns a durable batch_id; retry_failed reruns only failed/timed-out members.",
+      description: "Run independent short commands concurrently. Use retry_failed with the durable batch_id instead of rerunning successful siblings. For long/recursive jobs use start_process. Each member may define expected success_exit_codes.",
       inputSchema: {
         commands: z.array(z.object({
           command: z.string().max(MAX_COMMAND_CHARS),
           working_directory: z.string().optional(),
           timeout_seconds: z.number().int().positive().max(3600).optional(),
+          success_exit_codes: z.array(z.number().int()).min(1).max(16).optional().default([0]),
         })).min(1).max(16).optional(),
         concurrency: z.number().int().min(1).max(8).optional().default(4),
         batch_id: z.string().optional(),
@@ -429,7 +460,12 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         if (!retry_failed) {
           const failedEntries = record.results
             .map((item, index) => ({ item, index }))
-            .filter(({ item }) => !item || Boolean(item.error) || (item.exit_code !== 0 && item.failure?.category !== "expected_no_match"));
+            .filter(({ item, index }) =>
+              !item ||
+              Boolean(item.error) ||
+              (!(record.commands[index]?.success_exit_codes || [0]).includes(item.exit_code) &&
+                item.failure?.category !== "expected_no_match")
+            );
           return toolResult("run_commands_parallel", {
             batch_id: record.id,
             results: record.results,
@@ -442,7 +478,12 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         }
         targetIndices = record.results
           .map((item, index) => ({ item, index }))
-          .filter(({ item }) => !item || Boolean(item.error) || (item.exit_code !== 0 && item.failure?.category !== "expected_no_match"))
+          .filter(({ item, index }) =>
+            !item ||
+            Boolean(item.error) ||
+            (!(record.commands[index]?.success_exit_codes || [0]).includes(item.exit_code) &&
+              item.failure?.category !== "expected_no_match")
+          )
           .map(({ index }) => index);
         if (!targetIndices.length) {
           return toolResult("run_commands_parallel", {
@@ -493,7 +534,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
               (spec.timeout_seconds ?? timeoutSec) * 1000
             );
             const result = await compactCommandResult(raw, "parallel");
-            const failure = result.exit_code === 0 ? undefined : classifyToolFailure({
+            const acceptedExit = spec.success_exit_codes?.includes(result.exit_code) ?? result.exit_code === 0;
+            const failure = acceptedExit ? undefined : classifyToolFailure({
               message: result.stderr,
               exitCode: result.exit_code,
               timedOut: result.timed_out,
@@ -505,8 +547,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
               tool: "run_commands_parallel",
               action: "command",
               target: cwd,
-              status: result.exit_code === 0 || failure?.category === "expected_no_match" ? "ok" : "error",
-              details: { batch_id: record.id, index, command: spec.command, exit_code: result.exit_code, timed_out: result.timed_out, failure },
+              status: acceptedExit || failure?.category === "expected_no_match" ? "ok" : "error",
+              details: { batch_id: record.id, index, command: spec.command, exit_code: result.exit_code, success_exit_codes: spec.success_exit_codes, timed_out: result.timed_out, failure },
             });
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -533,7 +575,11 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       await saveParallelBatch(record);
       const failedEntries = results
         .map((item, index) => ({ item, index }))
-        .filter(({ item }) => !item || Boolean(item.error) || (item.exit_code !== 0 && item.failure?.category !== "expected_no_match"));
+        .filter(({ item, index }) => {
+          if (!item || item.error || item.failure?.category === "expected_no_match") return Boolean(!item || item.error);
+          const accepted = record.commands[index]?.success_exit_codes || [0];
+          return !accepted.includes(item.exit_code);
+        });
       const failed = failedEntries.length;
       return toolResult(
         "run_commands_parallel",
@@ -556,7 +602,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     "shell_status",
     {
       title: "Shell Status",
-      description: "Show persistent shell session cwd and recent commands.",
+      description: "Show this MCP transport's shell cwd and recent commands. ChatGPT transports do not share cwd by default; pass working_directory for project shell work.",
       inputSchema: {},
 
       annotations: toolAnnotations("read"),
@@ -571,7 +617,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     "shell_reset",
     {
       title: "Shell Reset",
-      description: "Reset persistent shell cwd to a directory (default: workspace).",
+      description: "Reset this MCP transport's shell cwd to a directory (default: server workspace).",
       inputSchema: { path: z.string().optional() },
 
       annotations: toolAnnotations("edit"),
@@ -579,7 +625,6 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     async ({ path: dirPath }) => {
       const cwd = dirPath ? await validatePath(dirPath) : defaultCwd;
       resetShellSession(cwd);
-      await recordProjectAffinity(cwd).catch(() => undefined);
       return toolResult("shell_reset", { cwd }, { summary: `shell cwd reset to ${cwd}` });
     }
   );
@@ -601,7 +646,31 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     async ({ command, working_directory, label, task_id }) => {
       const cwd = working_directory ? await validatePath(working_directory) : getShellStatus().cwd || defaultCwd;
       requireCommandAllowed(command, cwd);
-      await recordProjectAffinity(cwd).catch(() => undefined);
+      const session = getCurrentSessionState();
+      const projectRoot = session?.workspace_kind === "project" && session.project_root
+        ? session.project_root
+        : await projectRootForCwd(cwd);
+      const duplicate = [...processes.values()].find((item) =>
+        processRunning(item) &&
+        sameRoot(item.projectRoot, projectRoot) &&
+        path.resolve(item.cwd) === path.resolve(cwd) &&
+        item.command.trim() === command.trim()
+      );
+      if (duplicate) {
+        return toolResult("start_process", {
+          id: duplicate.id,
+          label: duplicate.label,
+          task_id: duplicate.taskId,
+          session_id: duplicate.sessionId,
+          project_root: duplicate.projectRoot,
+          pid: duplicate.child.pid,
+          command: duplicate.command,
+          cwd: duplicate.cwd,
+          started_at: duplicate.startedAt,
+          reused: true,
+          liveness: "active",
+        }, { summary: `reused running ${duplicate.label || duplicate.id}` });
+      }
       if (task_id) {
         const task = await getAgentTask(task_id);
         if (!task) throw new Error(`Unknown agent task id: ${task_id}`);
@@ -641,6 +710,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         id,
         label: label?.trim() || undefined,
         taskId: task_id,
+        sessionId: session?.session_id,
+        projectRoot,
         command,
         cwd,
         startedAt: new Date().toISOString(),
@@ -649,10 +720,17 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         stderr: [],
         exitCode: null,
         signal: null,
+        lastActivityAt: new Date().toISOString(),
       };
       processes.set(id, item);
-      child.stdout.on("data", (d: Buffer) => appendLog(item.stdout, d));
-      child.stderr.on("data", (d: Buffer) => appendLog(item.stderr, d));
+      child.stdout.on("data", (d: Buffer) => {
+        item.lastActivityAt = new Date().toISOString();
+        appendLog(item.stdout, d);
+      });
+      child.stderr.on("data", (d: Buffer) => {
+        item.lastActivityAt = new Date().toISOString();
+        appendLog(item.stderr, d);
+      });
       child.on("error", (error) => {
         item.spawnError = error.message;
         if (item.exitCode === null) item.exitCode = 1;
@@ -662,11 +740,14 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         id,
         label: item.label,
         task_id: item.taskId,
+        session_id: item.sessionId,
+        project_root: item.projectRoot,
         command,
         cwd,
         pid: child.pid,
         status: "running",
         started_at: item.startedAt,
+        last_progress_at: item.lastActivityAt,
       });
       child.on("close", (code, signal) => {
         item.exitCode = code ?? item.exitCode ?? (item.spawnError ? 1 : null);
@@ -689,6 +770,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
             spawn_error: item.spawnError,
             stdout_tail: item.stdout.join(""),
             stderr_tail: item.stderr.join(""),
+            last_progress_at: item.lastActivityAt,
           });
         })().catch((error) => {
           item.historyError = error instanceof Error ? error.message : String(error);
@@ -703,7 +785,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         throw new Error(`Failed to persist background operation state: ${error instanceof Error ? error.message : String(error)}`);
       }
       await audit({ tool: "start_process", action: "start", target: cwd, status: "ok", details: { id, command } });
-      return toolResult("start_process", { id, label: item.label, task_id: item.taskId, pid: child.pid, command, cwd, started_at: item.startedAt }, {
+      return toolResult("start_process", { id, label: item.label, task_id: item.taskId, session_id: item.sessionId, project_root: item.projectRoot, pid: child.pid, command, cwd, started_at: item.startedAt, reused: false }, {
         summary: `started ${item.label || id}`,
       });
     }
@@ -736,6 +818,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           id: p.id,
           label: p.label,
           task_id: p.taskId,
+          session_id: p.sessionId,
+          project_root: p.projectRoot,
           pid: p.child.pid,
           command: p.command,
           cwd: p.cwd,
@@ -746,6 +830,14 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           signal: p.signal,
           spawn_error: p.spawnError ?? null,
           history_error: p.historyError ?? null,
+          last_activity_at: p.lastActivityAt,
+          liveness: !processRunning(p)
+            ? "exited"
+            : Date.now() - Date.parse(p.lastActivityAt) > 10 * 60_000
+              ? "possibly_stalled"
+              : Date.now() - Date.parse(p.lastActivityAt) > 2 * 60_000
+                ? "silent"
+                : "active",
         }));
       return toolResult("process_status", { processes: processes_list, ...(wait ? { wait } : {}) }, { summary: `${processes_list.length} process(es)` });
     }

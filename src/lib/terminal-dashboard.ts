@@ -4,6 +4,8 @@ import { getManagedProcessSnapshot } from "../tools/shell.js";
 import { getPtySessionSnapshot } from "../tools/pty.js";
 import { listSubagents } from "./subagent-manager.js";
 import { listCodingLoops, type CodingLoopRecord } from "./coding-loop-store.js";
+import type { SessionRuntimeState } from "./session-context.js";
+import type { TunnelSnapshot } from "./tunnel-supervisor.js";
 
 type LogLevel = "info" | "warn" | "error";
 
@@ -23,6 +25,8 @@ export interface DashboardOptions {
   transportMode: "sse" | "json";
   keepAliveMs: number;
   sessionCount: () => number;
+  sessionSnapshot?: () => SessionRuntimeState[];
+  tunnelSnapshot?: () => TunnelSnapshot;
 }
 
 export interface DashboardRenderModel {
@@ -39,6 +43,8 @@ export interface DashboardRenderModel {
   transportMode: "sse" | "json";
   keepAliveMs: number;
   sessionCount: number;
+  sessions?: SessionRuntimeState[];
+  tunnel?: TunnelSnapshot;
   cpuPercent: number;
   rssBytes: number;
   heapBytes: number;
@@ -211,10 +217,11 @@ function compactDashboard(model: DashboardRenderModel, width: number, height: nu
     model.subagents.filter((item) => item.running).length;
   const active = model.runtime.active[0];
   const activeLoops = (model.codingLoops || []).filter((loop) => loop.status === "active");
+  const tunnel = model.tunnel;
   const lastTool = lastToolLabel(model.runtime, nowMs);
   const lines = [
     `Local Coder ONLINE ${clock(model.now)}`,
-    `MCP:${model.mcpPort} S:${model.sessionCount} ${model.transportMode.toUpperCase()} A:${model.runtime.active.length} L:${activeLoops.length}`,
+    `MCP:${model.mcpPort} S:${model.sessionCount} ${model.transportMode.toUpperCase()} T:${tunnel?.status || "n/a"} A:${model.runtime.active.length} L:${activeLoops.length}`,
     `calls:${model.runtime.total_calls} err:${model.runtime.total_errors} work:${running} ${lastTool}`,
     active ? `${spinner(nowMs, false)} ${active.tool} ${formatDuration(nowMs - active.started_ms)}` : "idle",
   ];
@@ -273,16 +280,30 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
   lines.push(row([
     metric("MCP", `:${model.mcpPort}`, model.color),
     ansi("1", `${model.transportMode.toUpperCase()}${keepAlive}`, model.color),
-    metric("SESSIONS", String(model.sessionCount), model.color),
+    metric("TRANSPORTS", String(model.sessionCount), model.color),
     metric("AUTH", model.authEnabled ? "ON" : "OFF", model.color, model.authEnabled ? "32;1" : "33;1"),
     metric("PROFILE", model.toolProfile, model.color),
   ].join("  "), width, model.color));
+  if (model.tunnel) {
+    const tunnelCode = model.tunnel.status === "online"
+      ? "32;1"
+      : ["disabled", "not_configured", "stopped"].includes(model.tunnel.status)
+        ? "2"
+        : "33;1";
+    lines.push(row([
+      metric("TUNNEL", model.tunnel.status.toUpperCase(), model.color, tunnelCode),
+      metric("HEALTH", `:${model.tunnel.health_port}`, model.color),
+      metric("RESTARTS", String(model.tunnel.restarts), model.color),
+      model.tunnel.reused_external ? ansi("2", "reused existing tunnel", model.color) : "",
+    ].filter(Boolean).join("  "), width, model.color));
+  }
   lines.push(row([
     metric("WORKSPACE", shortWorkspace(model.workspace), model.color),
     metric("POLICY", model.permission.split(":", 1)[0], model.color, model.permission.startsWith("open") ? "32;1" : "33;1"),
     metric("LOOPS", String(activeLoops.length), model.color),
     metric("ADMIN", `:${model.adminPort}`, model.color),
   ].join("  "), width, model.color));
+
 
   if (activeLoops.length && height >= 20) {
     const loop = activeLoops[0];
@@ -324,6 +345,16 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
     if (!runningRows.length) lines.push(row(`${ansi("2", "none", model.color)}  ·  no background process, PTY, or subagent`, width, model.color));
     else for (const item of runningRows.slice(0, workerSlots)) lines.push(row(item, width, model.color));
     if (runningRows.length > workerSlots) lines.push(row(`… ${runningRows.length - workerSlots} more running item(s)`, width));
+  }
+
+  const silentWorkers = runningProcesses.filter((process) => process.liveness === "silent").length;
+  const stalledWorkers = runningProcesses.filter((process) => process.liveness === "possibly_stalled").length;
+  if ((silentWorkers || stalledWorkers) && height >= 20) {
+    lines.push(row(
+      ansi("33;1", `WORKER LIVENESS · ${silentWorkers} silent · ${stalledWorkers} possibly stalled`, model.color),
+      width,
+      model.color
+    ));
   }
 
   lines.push(section("Activity", width, model.color));
@@ -461,6 +492,8 @@ export function startTerminalDashboard(options: DashboardOptions): {
       transportMode: options.transportMode,
       keepAliveMs: options.keepAliveMs,
       sessionCount: options.sessionCount(),
+      sessions: options.sessionSnapshot?.() ?? [],
+      tunnel: options.tunnelSnapshot?.(),
       cpuPercent,
       rssBytes: memory.rss,
       heapBytes: memory.heapUsed,

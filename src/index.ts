@@ -38,6 +38,8 @@ import { shutdownSubagents } from "./lib/subagent-manager.js";
 import { startTerminalDashboard } from "./lib/terminal-dashboard.js";
 import { initializeRuntimeIdentity } from "./lib/runtime-identity.js";
 import { pruneEphemeralState } from "./lib/state-maintenance.js";
+import { createTunnelSupervisor } from "./lib/tunnel-supervisor.js";
+import { listSessionRuntimeStates } from "./lib/session-context.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -126,6 +128,10 @@ const sessionManager = createSessionManager({
   workspaceRoots,
   port: PORT,
   projectMemoryInstructions: instructionContext.instructionsText,
+});
+const tunnelSupervisor = createTunnelSupervisor({
+  root: process.cwd(),
+  mcpPort: PORT,
 });
 
 const app = express();
@@ -368,6 +374,8 @@ const adminServer = startAdminServer({
   keepAliveMs: MCP_SSE_KEEPALIVE_MS,
   manager: upstreamManager,
   sessionCount: () => sessionManager.count(),
+  sessionSnapshot: () => listSessionRuntimeStates(),
+  tunnelSnapshot: () => tunnelSupervisor.snapshot(),
   instructionSummary: () => summarizeInstructionContext(instructionContext),
   instructionsPreview: () => instructionContext.instructionsText,
 });
@@ -392,6 +400,11 @@ server = app.listen(PORT, HOST, () => {
     transportMode: MCP_JSON_RESPONSE ? "json" : "sse",
     keepAliveMs: MCP_SSE_KEEPALIVE_MS,
     sessionCount: () => sessionManager.count(),
+    sessionSnapshot: () => listSessionRuntimeStates(),
+    tunnelSnapshot: () => tunnelSupervisor.snapshot(),
+  });
+  void tunnelSupervisor.start().then(() => terminalDashboard.renderNow()).catch((error) => {
+    console.warn("[Tunnel] supervisor start failed:", error);
   });
   if (terminalDashboard.active) {
     terminalDashboard.renderNow();
@@ -453,6 +466,7 @@ function shutdown(signal: string, exitCode = 0, fatalError?: unknown): void {
     shutdownPtySessions(),
     shutdownManagedProcesses(),
     shutdownSubagents(),
+    tunnelSupervisor.stop(),
   ]).finally(() => {
     try {
       adminServer.close();

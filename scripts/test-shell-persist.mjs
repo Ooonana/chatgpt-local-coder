@@ -1,5 +1,5 @@
 /**
- * Global shell cwd persists across bootstrap (simulates ChatGPT new MCP sessions).
+ * Optional shell cwd persistence works when explicitly enabled for a stable MCP client.
  */
 import fs from "fs/promises";
 import path from "path";
@@ -15,6 +15,7 @@ const root = path.resolve(__dirname, "..");
 const stateDir = path.join(root, ".tool-test-tmp", "shell-persist");
 
 process.env.MCP_SHELL_STATE_DIR = stateDir;
+process.env.MCP_SHELL_PERSIST_CWD = "1";
 
 let passed = 0;
 let failed = 0;

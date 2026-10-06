@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { collectGitSnapshot, type GitSnapshot } from "./git-snapshot.js";
 import { getRecentActivity } from "./activity-log.js";
 import {
@@ -15,6 +15,7 @@ import {
   type CodingLoopRecord,
 } from "./coding-loop-store.js";
 import { getEditTransaction } from "./edit-transaction-store.js";
+import { getCurrentSessionId } from "./session-context.js";
 
 export type ContextCapsuleCheckpointSource = "manual" | "auto";
 
@@ -81,12 +82,14 @@ export interface ContextCapsuleRecord {
   objective: string;
   task_id?: string;
   coding_loop_id?: string;
+  session_id?: string;
   semantic: ContextCapsuleSemanticState;
   machine: ContextCapsuleMachineState;
   checkpoint_count: number;
   auto_checkpoint_count: number;
   last_checkpoint_source: ContextCapsuleCheckpointSource;
   last_auto_reason?: string;
+  machine_fingerprint?: string;
   created_at: string;
   updated_at: string;
 }
@@ -371,7 +374,12 @@ function sameWorkspace(left: string, right: string): boolean {
   return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
-function matches(record: ContextCapsuleRecord, workspace: string, taskId?: string, loopId?: string): boolean {
+function matches(
+  record: ContextCapsuleRecord,
+  workspace: string,
+  taskId?: string,
+  loopId?: string
+): boolean {
   if (!sameWorkspace(record.workspace, workspace)) return false;
   if (loopId) return record.coding_loop_id === loopId;
   if (taskId) return record.task_id === taskId;
@@ -390,6 +398,16 @@ function promotableTaskCapsule(
     record.task_id === taskId &&
     !record.coding_loop_id
   );
+}
+
+function machineFingerprint(machine: ContextCapsuleMachineState): string {
+  const stable = {
+    git: machine.git,
+    task: machine.task,
+    coding_loop: machine.coding_loop,
+    transaction: machine.transaction,
+  };
+  return createHash("sha256").update(JSON.stringify(stable)).digest("hex").slice(0, 24);
 }
 
 export function getContextCapsuleConfig(): Record<string, unknown> {
@@ -443,6 +461,8 @@ export async function checkpointContextCapsule(input: {
   blockers?: string[];
   next_steps?: string[];
   files?: Array<{ path: string; note?: string }>;
+  semantic_mode?: "merge" | "replace";
+  session_id?: string;
 }): Promise<ContextCapsuleRecord> {
   return mutate(async () => {
     const workspace = path.resolve(input.workspace);
@@ -453,13 +473,14 @@ export async function checkpointContextCapsule(input: {
         || promotableTaskCapsule(all, workspace, input.task_id, input.coding_loop_id);
     const built = await buildMachineState(workspace, input.task_id || existing?.task_id, input.coding_loop_id || existing?.coding_loop_id);
     const createdAt = existing?.created_at || nowIso();
+    const mergeSemantic = input.semantic_mode !== "replace";
     const semantic = normalizeSemantic({
-      summary: input.summary !== undefined ? input.summary : existing?.semantic.summary || "",
-      decisions: input.decisions !== undefined ? input.decisions : existing?.semantic.decisions || [],
-      findings: input.findings !== undefined ? input.findings : existing?.semantic.findings || [],
-      blockers: input.blockers !== undefined ? input.blockers : existing?.semantic.blockers || [],
-      next_steps: input.next_steps !== undefined ? input.next_steps : existing?.semantic.next_steps || [],
-      files: input.files !== undefined ? input.files : existing?.semantic.files || [],
+      summary: input.summary !== undefined ? input.summary : mergeSemantic ? existing?.semantic.summary || "" : "",
+      decisions: input.decisions !== undefined ? input.decisions : mergeSemantic ? existing?.semantic.decisions || [] : [],
+      findings: input.findings !== undefined ? input.findings : mergeSemantic ? existing?.semantic.findings || [] : [],
+      blockers: input.blockers !== undefined ? input.blockers : mergeSemantic ? existing?.semantic.blockers || [] : [],
+      next_steps: input.next_steps !== undefined ? input.next_steps : mergeSemantic ? existing?.semantic.next_steps || [] : [],
+      files: input.files !== undefined ? input.files : mergeSemantic ? existing?.semantic.files || [] : [],
     });
     const record: ContextCapsuleRecord = {
       version: VERSION,
@@ -471,12 +492,14 @@ export async function checkpointContextCapsule(input: {
       ),
       task_id: input.task_id || existing?.task_id || built.task?.id,
       coding_loop_id: input.coding_loop_id || existing?.coding_loop_id || built.loop?.id,
+      session_id: existing?.session_id || input.session_id || getCurrentSessionId(),
       semantic,
       machine: built.machine,
       checkpoint_count: (existing?.checkpoint_count || 0) + 1,
       auto_checkpoint_count: existing?.auto_checkpoint_count || 0,
       last_checkpoint_source: "manual",
       last_auto_reason: existing?.last_auto_reason,
+      machine_fingerprint: machineFingerprint(built.machine),
       created_at: createdAt,
       updated_at: nowIso(),
     };
@@ -489,6 +512,7 @@ export async function autoCheckpointContextCapsule(input: {
   reason: string;
   task_id?: string;
   coding_loop_id?: string;
+  session_id?: string;
 }): Promise<ContextCapsuleRecord | null> {
   return mutate(async () => {
     const workspace = path.resolve(input.workspace);
@@ -499,6 +523,9 @@ export async function autoCheckpointContextCapsule(input: {
     const loopId = input.coding_loop_id || built.loop?.id;
     const existing = all.find((record) => matches(record, workspace, taskId, loopId))
       || promotableTaskCapsule(all, workspace, taskId, loopId);
+    const fingerprint = machineFingerprint(built.machine);
+    const existingFingerprint = existing?.machine_fingerprint || (existing ? machineFingerprint(existing.machine) : null);
+    if (existing && existingFingerprint === fingerprint) return null;
     const createdAt = existing?.created_at || nowIso();
     const record: ContextCapsuleRecord = {
       version: VERSION,
@@ -507,12 +534,14 @@ export async function autoCheckpointContextCapsule(input: {
       objective: trimText(existing?.objective || built.task?.objective || built.loop?.goal, 4_000),
       task_id: taskId,
       coding_loop_id: loopId,
+      session_id: existing?.session_id || input.session_id || getCurrentSessionId(),
       semantic: normalizeSemantic(existing?.semantic || emptySemantic()),
       machine: built.machine,
       checkpoint_count: existing?.checkpoint_count || 0,
       auto_checkpoint_count: (existing?.auto_checkpoint_count || 0) + 1,
       last_checkpoint_source: "auto",
       last_auto_reason: trimText(input.reason, 300),
+      machine_fingerprint: fingerprint,
       created_at: createdAt,
       updated_at: nowIso(),
     };
@@ -525,6 +554,7 @@ export async function resumeContextCapsule(input: {
   id?: string;
   task_id?: string;
   coding_loop_id?: string;
+  session_id?: string;
 }): Promise<ContextCapsuleRecord | null> {
   const workspace = path.resolve(input.workspace);
   const record = input.id
@@ -536,6 +566,7 @@ export async function resumeContextCapsule(input: {
     ...record,
     task_id: input.task_id || record.task_id || built.task?.id,
     coding_loop_id: input.coding_loop_id || record.coding_loop_id || built.loop?.id,
+    session_id: record.session_id || input.session_id || getCurrentSessionId(),
     machine: built.machine,
   });
 }
@@ -554,6 +585,7 @@ export function compactContextCapsule(record: ContextCapsuleRecord) {
     objective: record.objective,
     task_id: record.task_id,
     coding_loop_id: record.coding_loop_id,
+    session_id: record.session_id,
     checkpoint_count: record.checkpoint_count,
     auto_checkpoint_count: record.auto_checkpoint_count,
     last_checkpoint_source: record.last_checkpoint_source,

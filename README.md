@@ -59,7 +59,7 @@ git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
 cd chatgpt-local-coder
 copy .env.example .env          # edit WORKSPACE_PATH + MCP_TOKEN
 npm install
-.\start.ps1                  # builds/restarts MCP + Admin UI + TUI; starts/reuses OpenAI tunnel when configured
+.\start.ps1                  # builds only when source changed, restarts MCP + Admin UI + TUI, and supervises the OpenAI tunnel
 ```
 
 **macOS / Linux**
@@ -82,7 +82,7 @@ Server runs at `http://127.0.0.1:3000` — health check: `http://127.0.0.1:3000/
 
 ### Live terminal dashboard
 
-Interactive launches use a clean alternate-screen TUI instead of scrolling request logs. The desktop view uses a stable **44-row canvas by default**, requests a one-time resize upward when the terminal is shorter, and keeps color restrained to meaningful state accents such as online/error/warning/active indicators. It shows the current time and uptime, sessions, active tool calls and their kind (`READ`, `EDIT`, `EXEC`, `MCP`), elapsed time, coding-loop state, background processes/PTYs/subagents, the **20 latest completed tool calls**, per-tool usage, CPU, RSS, and heap memory. Narrow/tiny terminals still fall back to the compact resize-safe layouts; non-interactive/CI/redirected output automatically falls back to normal logs.
+Interactive launches use a clean alternate-screen TUI instead of scrolling request logs. The desktop view uses a stable **44-row canvas by default**, requests a one-time resize upward when the terminal is shorter, and keeps color restrained to meaningful state accents such as online/error/warning/active indicators. It shows current time and uptime, MCP transport count, active tool calls and their kind (`READ`, `EDIT`, `EXEC`, `MCP`), elapsed time, coding-loop state, background processes/PTYs/subagents and worker liveness, the **20 latest completed tool calls**, per-tool usage, CPU, RSS, and heap memory. Narrow/tiny terminals still fall back to compact resize-safe layouts; non-interactive/CI/redirected output automatically falls back to normal logs.
 
 Set `LOCAL_CODER_TUI=off` to force traditional logs, or `LOCAL_CODER_TUI=on` to request the dashboard when stdout is a TTY. `LOCAL_CODER_TUI_HEIGHT=44` controls the preferred desktop height (20–60 rows); set it to `auto` or `0` to follow the terminal height without requesting a resize.
 
@@ -148,10 +148,10 @@ Stable tunnel ID — connector URL never changes.
 .\openai-tunnel.ps1 -Init    # enter tunnel_id + Runtime API key from OpenAI Platform
 
 # Every time after — one command
-.\start.ps1                  # restarts MCP and starts/reuses the tunnel automatically
+.\start.ps1                  # one visible window: Local Coder supervises tunnel-client itself
 ```
 
-`-Force` is still accepted (`.\start.ps1 -Force`). Use `.\start.ps1 -NoTunnel` only when you intentionally want the local server without the OpenAI tunnel.
+`-Force` is still accepted (`.\start.ps1 -Force`). `-Rebuild` forces TypeScript compilation and `-NoBuild` reuses the existing `dist` build. Use `.\start.ps1 -NoTunnel` only when you intentionally want the local server without the OpenAI tunnel.
 
 Get credentials: [OpenAI Platform → Tunnels](https://platform.openai.com/settings/organization/tunnels)
 
@@ -207,7 +207,7 @@ Free sessions expire after **60 minutes** and the URL changes each time, so you 
 
 Native tools use structured JSON responses `{ ok, tool, summary, data }`. The source-of-truth catalog is `src/lib/tool-profile.ts`; `scripts/test-tool-profile.mjs` verifies it matches the native `server.registerTool()` declarations.
 
-The default `slim` profile is intentionally optimized for regular ChatGPT: it currently exposes **46 high-value tools** while the `full` profile keeps all **69 native tools**. Redundant convenience tools hidden from `slim` remain available through `CHATGPT_TOOL_PROFILE=full`, Admin → **MCP Servers → Local tools**, or a `run_command` fallback. This keeps the default MCP discovery payload below the Phase 4 budget without removing local capability. The source-of-truth counts are enforced by `scripts/test-tool-profile.mjs`; update documentation when that test reports a deliberate profile change.
+The default `slim` profile is intentionally optimized for regular ChatGPT: it currently exposes **40 high-value tools** while the `full` profile keeps all native tools. Redundant convenience/low-level tools hidden from `slim` remain available through `CHATGPT_TOOL_PROFILE=full`, Admin → **MCP Servers → Local tools**, or a `run_command` fallback. This keeps the default MCP discovery payload comfortably below the Phase 4 budget without removing local capability. The source-of-truth catalog is `src/lib/tool-profile.ts`.
 
 ### Agent production benchmark
 
@@ -226,6 +226,16 @@ npm run test:phase5
 ```
 
 It covers concurrent idempotency, crash-resumable parallel batches, dirty-worktree mutation detection, ambiguous project aliases, verification-cache invalidation, cache coherency, runtime-identity side effects, ephemeral-state pruning, large-result handles, structured no-match errors, and runtime telemetry. These tests exist specifically to catch orchestration failures that can pass ordinary compile/unit checks.
+
+Phase 6 adds reliability/isolation coverage:
+
+```bash
+npm run test:phase6
+```
+
+It verifies that fresh ChatGPT MCP transports do not inherit hidden shell cwd, explicit per-call project scope blocks accidental cross-project mutation, durable task/capsule state survives changing transport IDs, moved Git repos reconcile by remote identity, abandoned transactions preserve current files, automatic context checkpoints deduplicate unchanged state, and the integrated tunnel supervisor has safe disabled/unconfigured states.
+
+> ChatGPT can create a **fresh MCP transport for individual tool calls**. A transport/session ID is therefore diagnostic metadata, not a durable chat/work owner. Project isolation is derived from explicit `path`, `workspace`, and `working_directory` arguments plus durable task/loop/transaction IDs.
 
 ### Onboarding *(call these first)*
 
@@ -260,7 +270,7 @@ It covers concurrent idempotency, crash-resumable parallel batches, dirty-worktr
 |------|-------------|
 | `run_command` | Run bounded shell commands (`npm test`, builds, …). Supports optional idempotency/mutation tracking and transaction-aware shell edits |
 | `run_commands_parallel` | Run independent commands concurrently in isolated shell processes; batches persist per-member completion so failed/incomplete members can be retried without rerunning successful siblings |
-| `shell_status` / `shell_reset` | Persistent shell session |
+| `shell_status` / `shell_reset` | Transport-local shell state. ChatGPT calls do **not** share hidden cwd by default; use explicit `working_directory` |
 | `start_process` | Long-running / background commands |
 | `process_status` / `process_output` | Inspect live background jobs and logs; use their wait conditions instead of sleep/poll loops when waiting for exit or expected output |
 | `process_history` | Persistent named operation history across MCP/server restarts; stale running jobs are reported as interrupted |
@@ -378,6 +388,7 @@ LOCAL_CODER_TUI=auto
 SHELL_TIMEOUT=300
 GIT_TIMEOUT_MS=300000
 MCP_SESSION_RECOVERY=true
+MCP_SHELL_PERSIST_CWD=0
 MCP_JSON_RESPONSE=false
 MCP_SSE_KEEPALIVE_MS=10000
 ADMIN_PORT=3011
@@ -400,6 +411,7 @@ OPENAI_TUNNEL_API_KEY=
 | `MCP_SESSION_TTL_MS` | `7200000` | Idle live-session retention (2 hours by default). Expired session IDs can still be recovered on demand instead of being retained all day |
 | `MCP_CLOSED_SESSION_TTL_MS` | `900000` | Closed-transport retention (15 minutes by default) before cleanup |
 | `MCP_SESSION_MAX_RETAINED` | `32` | Hard cap on retained MCP session/server objects. Old closed/idle sessions are evicted first; stale IDs can still auto-recover on demand |
+| `MCP_SHELL_PERSIST_CWD` | `false` | Persist shell cwd across transport recreation. Off by default because ChatGPT may create a fresh MCP transport per tool call; explicit `working_directory` is safer |
 | `MCP_JSON_RESPONSE` | `false` | Keep `false` for SSE tool responses with heartbeat frames. Set `true` only as a compatibility fallback for clients that require one JSON response at the end |
 | `MCP_SSE_KEEPALIVE_MS` | `10000` | SSE heartbeat interval for long MCP calls. The server clamps this to 1–60 seconds |
 | `SHELL_TIMEOUT` | `300` | Default timeout for synchronous `run_command` / `run_commands_parallel` calls, clamped to 5–3600 seconds. Both support per-call overrides; prefer `start_process` for very long or continuous jobs |
@@ -418,7 +430,7 @@ OPENAI_TUNNEL_API_KEY=
 | `MCP_RESULT_STATE_DIR` | `.mcp-state/results` | Durable bounded storage for oversized textual tool output referenced by result handles |
 | `MCP_PARALLEL_BATCH_STATE_DIR` | `.mcp-state/parallel-batches` | Crash-resumable per-member state for parallel command batches |
 | `MCP_IDEMPOTENCY_STATE_DIR` | `.mcp-state/idempotency` | Persistence for idempotency keys used to avoid duplicate side effects on retried shell work |
-| `MCP_PROJECT_REGISTRY_PATH` | `.mcp-state/projects.json` | Recent/active project registry used for project affinity and aliases; ambiguous aliases fail instead of guessing |
+| `MCP_PROJECT_REGISTRY_PATH` | `.mcp-state/projects.json` | Recent-project registry and aliases. Git remote identity reconciles moved repos; there is no process-global active project |
 | `MCP_VERIFICATION_CACHE_STATE_DIR` | `.mcp-state/verification-cache` | Optional successful-verification cache storage |
 | `MCP_VERIFICATION_CACHE_TTL_SECONDS` | `300` | Maximum age of a cached verification success; cache keys include Git HEAD and the dirty/untracked worktree state |
 | `MCP_TEXT_CACHE_MAX_BYTES` | `33554432` | Total estimated heap budget for cached text-file contents (32 MiB); least-recently-used entries are evicted under pressure |
@@ -433,7 +445,7 @@ OPENAI_TUNNEL_API_KEY=
 
 > The default `open` permission profile provides full local access (subject to OS ACLs). `WORKSPACE_PATH` sets the default cwd; restricted permission profiles can turn configured roots into an application-level boundary.
 
-> Long tool calls use Streamable HTTP/SSE by default and emit heartbeat comment frames every 10 seconds. This reduces silent tunnel/client timeouts; long-running work should still prefer `start_process` or `subagent spawn` plus short polling instead of keeping one tool call open for minutes.
+> Long tool calls use Streamable HTTP/SSE by default and emit heartbeat comment frames every 10 seconds. Long-running work should still prefer `start_process` plus `process_status(wait_for="exit")` / `process_output(wait_for=...)` instead of `Start-Sleep` polling or keeping one tool call open for minutes.
 
 > Upstream MCP tools that explicitly advertise themselves as read-only remain usable under restrictive profiles. Mutating or annotation-unknown upstream calls are treated as **unsafe runtimes** and require `open` or an explicit `custom.allow_unsafe_runtimes=true` policy.
 
@@ -449,7 +461,7 @@ The exact URL is printed in the startup banner. Stopping the server stops the ad
 
 | Tab | What it does |
 |-----|--------------|
-| **Overview** | Live ChatGPT tool calls plus persistent agent plan/progress, coding loops, context capsules, background operation history, edit transactions, runtime/schema identity, active project affinity, per-tool p50/p95/result-volume/repeat telemetry, PID/sessions/workers, and upstream health |
+| **Overview** | Live ChatGPT tool calls plus active project/machine workspaces, persistent agent plan/progress, coding loops, context capsules, background operation history/liveness, edit transactions, tunnel health, runtime/schema identity, per-tool p50/p95/result-volume/repeat telemetry, PID/MCP transports/workers, and upstream health |
 | **MCP Servers** | Enable/disable upstream MCP servers, test connections, inspect their tools |
 | **Import** | Pull existing MCP config from Cursor / Claude Code / OpenCode |
 | **Activity** | Live tool-call log from ChatGPT (SSE stream) |
@@ -493,7 +505,7 @@ src/
 ```
 
 - **Transport:** MCP Streamable HTTP — `/mcp/<MCP_TOKEN>` and `/<MCP_TOKEN>` (or `/mcp` and `/` when `MCP_TOKEN` is empty)
-- **Session:** Stateful with auto-recovery when ChatGPT holds a stale session ID
+- **Transport session:** Streamable-HTTP transport objects are bounded and recoverable when a client presents a stale transport ID. They are not treated as durable ChatGPT chat/work ownership.
 - **Output:** Structured JSON from every tool
 
 ## 🧪 Development
@@ -523,7 +535,7 @@ The default `open` permission profile grants **full local access** through Local
 | Problem | Fix |
 |---------|-----|
 | **"Error in message stream"** right after *"Looking for tools"* — **no server log** | You did **not tag the connector**. New chat → **+** → **More** → enable connector, or type **`@Local Coder`** in the message. Then retry. |
-| **Resource not found** on tool call | Refresh connector + new chat. Server auto-recovers sessions — ensure latest build is running. |
+| **Resource not found** on tool call | Refresh connector + new chat and ensure the latest build is running. Durable task/loop/capsule recovery uses explicit IDs/workspaces rather than assuming one stable MCP transport per chat. |
 | **Connection failed** | Check `.\start.ps1` + tunnel are both running. URL must be HTTPS. |
 | **Permission popup every call** | Settings → Apps → set connector to *Ask before important changes*. Don't use popup "Always allow". |
 | **Tool blocked by OpenAI safety** | Not a server bug. Retry with `run_command` (response may include `run_command_fallback`). Affects `git_push`, `git_checkout`, `delete_directory` occasionally. |

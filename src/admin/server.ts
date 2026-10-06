@@ -5,6 +5,8 @@ import type { Server } from "http";
 import type { McpUpstreamManager } from "../lib/mcp-upstream-manager.js";
 import { createAdminRouter } from "./routes.js";
 import { adminAuth, localhostOnly } from "./localhost-guard.js";
+import type { SessionRuntimeState } from "../lib/session-context.js";
+import type { TunnelSnapshot } from "../lib/tunnel-supervisor.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -17,6 +19,8 @@ export interface AdminServerOptions {
   keepAliveMs: number;
   manager: McpUpstreamManager;
   sessionCount: () => number;
+  sessionSnapshot?: () => SessionRuntimeState[];
+  tunnelSnapshot?: () => TunnelSnapshot;
   instructionSummary?: () => Record<string, unknown>;
   instructionsPreview?: () => string;
 }
@@ -70,6 +74,8 @@ export function startAdminServer(options: AdminServerOptions): Server {
     transportMode: options.transportMode,
     keepAliveMs: options.keepAliveMs,
     sessionCount: options.sessionCount,
+    sessionSnapshot: options.sessionSnapshot,
+    tunnelSnapshot: options.tunnelSnapshot,
     instructionSummary: options.instructionSummary,
     instructionsPreview: options.instructionsPreview,
   }));
