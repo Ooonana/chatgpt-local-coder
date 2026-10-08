@@ -18,6 +18,7 @@ import {
   acceptEditTransaction,
   abandonEditTransaction,
   beginEditTransaction,
+  currentTransactionVerification,
   getEditTransaction,
   recordTransactionVerification,
   rollbackEditTransaction,
@@ -437,7 +438,14 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
       if (id) {
         const record = await getCodingLoop(id);
         const transaction = await getEditTransaction(record.transaction_id).catch(() => null);
-        return toolResult("coding_loop_status", { loop: compactLoop(record), transaction }, { summary: `${id}: ${record.status}/${record.phase}` });
+        const verificationFreshness = transaction?.status === "active"
+          ? await currentTransactionVerification(record.transaction_id)
+          : null;
+        return toolResult("coding_loop_status", {
+          loop: compactLoop(record), transaction,
+          verification_current: verificationFreshness?.valid ?? null,
+          verification_issue: verificationFreshness?.reason ?? null,
+        }, { summary: `${id}: ${record.status}/${record.phase}${verificationFreshness && !verificationFreshness.valid ? " (verification stale)" : ""}` });
       }
       const loops = await listCodingLoops(limit);
       return toolResult("coding_loop_status", {
@@ -796,6 +804,12 @@ export function registerCodingLoopTools(server: McpServer, defaultCwd: string): 
             const current = await getEditTransaction(record.transaction_id);
             if (current.status === "rolled_back") {
               throw new Error(`Coding loop transaction ${record.transaction_id} was already rolled back`);
+            }
+            if (!allow_unverified && current.status === "active") {
+              const freshness = await currentTransactionVerification(record.transaction_id);
+              if (!freshness.valid) {
+                throw new Error(`${freshness.reason}. Rerun coding_loop action=verify before finish, or explicitly set allow_unverified=true.`);
+              }
             }
             return current.status === "accepted" ? current : acceptEditTransaction(record.transaction_id);
           });

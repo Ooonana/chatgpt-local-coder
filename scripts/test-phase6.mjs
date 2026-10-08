@@ -514,6 +514,28 @@ await test("abandoning an edit transaction preserves current files", async () =>
   });
 });
 
+await test("rollback preflights all payload hashes before touching workspace files", async () => {
+  const fileA = path.join(projectA, "rollback-preflight-a.txt");
+  const fileB = path.join(projectA, "rollback-preflight-b.txt");
+  await fs.writeFile(fileA, "base-A\n");
+  await fs.writeFile(fileB, "base-B\n");
+  const tx = await transactions.beginEditTransaction(projectA, "snapshot preflight test");
+  try {
+    const captured = await transactions.captureTransactionPaths(tx.id, [fileA, fileB]);
+    await fs.writeFile(fileA, "edited-A\n");
+    await fs.writeFile(fileB, "edited-B\n");
+    await transactions.recordTransactionEdit(tx.id, "test", [fileA, fileB]);
+    const secondPayload = captured.snapshots.find((item) => item.path === fileB)?.snapshot_file;
+    assert.ok(secondPayload);
+    await fs.writeFile(secondPayload, "CORRUPTED\n");
+    await assert.rejects(transactions.rollbackEditTransaction(tx.id), /rollback payload missing or corrupted/i);
+    assert.equal(await fs.readFile(fileA, "utf8"), "edited-A\n", "rollback partially touched earlier file");
+    assert.equal(await fs.readFile(fileB, "utf8"), "edited-B\n", "rollback partially touched later file");
+  } finally {
+    await transactions.abandonEditTransaction(tx.id);
+  }
+});
+
 await test("semantic replace clears stale blockers", async () => {
   await inSession("phase6-capsule", async () => {
     const first = await capsules.checkpointContextCapsule({

@@ -110,6 +110,52 @@ await run("completed loop persists and read-only status can resume context", asy
   if (!listed.some((item) => item.id === completedLoopId)) throw new Error("completed loop missing from durable list");
 });
 
+await run("coding loop refuses stale verification after external or transaction-linked edits", async () => {
+  await fs.writeFile(sourcePath, originalSource);
+  const began = await call("coding_loop", {
+    action: "begin", goal: "reject stale green verification", workspace: fixture,
+    verification_preset: "custom", max_attempts: 4,
+    commands: [{ label: "pass", command: "node -e \"console.log('PASS')\"", timeout_seconds: 30 }],
+  });
+  const loop = began.structuredContent?.data?.loop;
+  if (!loop?.id || !loop.transaction_id) throw new Error(JSON.stringify(began));
+  const changed = await call("edit_file", {
+    path: sourcePath, old_text: "ORIGINAL", new_text: "PASSED", transaction_id: loop.transaction_id,
+  });
+  if (changed.isError) throw new Error(JSON.stringify(changed));
+  const first = await call("coding_loop", { action: "verify", id: loop.id });
+  if (first.structuredContent?.data?.loop?.phase !== "ready") throw new Error(JSON.stringify(first));
+  await fs.writeFile(sourcePath, "export const marker = 'OUTSIDE';\n");
+  const staleStatus = await call("coding_loop_status", { id: loop.id });
+  if (staleStatus.structuredContent?.data?.verification_current !== false
+      || !/File changed/.test(staleStatus.structuredContent?.data?.verification_issue || "")) {
+    throw new Error("status failed to surface out-of-band stale verification: " + JSON.stringify(staleStatus));
+  }
+  const stale = await call("coding_loop", { action: "finish", id: loop.id });
+  if (!stale.isError || !/File changed after verification/.test(JSON.stringify(stale))) {
+    throw new Error("out-of-band change incorrectly accepted: " + JSON.stringify(stale));
+  }
+  await fs.writeFile(sourcePath, "export const marker = 'PASSED';\n");
+  const second = await call("coding_loop", { action: "verify", id: loop.id });
+  if (second.structuredContent?.data?.loop?.phase !== "ready") throw new Error(JSON.stringify(second));
+  const edited = await call("edit_file", {
+    path: sourcePath, old_text: "PASSED", new_text: "LATER", transaction_id: loop.transaction_id,
+  });
+  if (edited.isError) throw new Error(JSON.stringify(edited));
+  const rejected = await call("coding_loop", { action: "finish", id: loop.id });
+  if (!rejected.isError || !/current verification/.test(JSON.stringify(rejected))) {
+    throw new Error("tracked edit incorrectly reused old verification: " + JSON.stringify(rejected));
+  }
+  const again = await call("coding_loop", { action: "verify", id: loop.id });
+  if (again.structuredContent?.data?.loop?.phase !== "ready") throw new Error(JSON.stringify(again));
+  const freshStatus = await call("coding_loop_status", { id: loop.id });
+  if (freshStatus.structuredContent?.data?.verification_current !== true) {
+    throw new Error("status still reports stale verification after recheck: " + JSON.stringify(freshStatus));
+  }
+  const finish = await call("coding_loop", { action: "finish", id: loop.id });
+  if (finish.structuredContent?.data?.loop?.status !== "completed") throw new Error(JSON.stringify(finish));
+});
+
 await run("finish reconciles a transaction accepted just before loop state persisted", async () => {
   const began = await call("coding_loop", {
     action: "begin",

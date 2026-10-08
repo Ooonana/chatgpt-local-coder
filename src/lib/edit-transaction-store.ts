@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "crypto";
 import { buildSimpleDiff } from "./patch.js";
 import { getCurrentSessionId } from "./session-context.js";
 import { isPathInside } from "./path-identity.js";
+import { atomicWriteText } from "./atomic-file.js";
 
 export type EditTransactionStatus = "active" | "accepted" | "rolled_back" | "abandoned";
 
@@ -51,6 +52,8 @@ export interface EditTransactionRecord {
       timed_out: boolean;
       excerpt: string;
     }>;
+    /** The exact files whose contents passed verification; absent in old records. */
+    file_fingerprints?: Array<{ path: string; exists: boolean; sha256?: string }>;
   };
 }
 
@@ -165,10 +168,7 @@ async function ensureStore(): Promise<void> {
 }
 
 async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(value, null, 2), "utf-8");
-  await fs.rename(tmp, filePath);
+  await atomicWriteText(filePath, JSON.stringify(value, null, 2));
 }
 
 async function sha256File(filePath: string): Promise<{ exists: boolean; sha256?: string; size: number; mode?: number }> {
@@ -357,7 +357,16 @@ export async function captureTransactionPaths(id: string, paths: string[]): Prom
       const index = record.snapshots.length;
       const snapshotFile = path.join(payloadDir(record.id), `${String(index).padStart(4, "0")}.bin`);
       await fs.mkdir(path.dirname(snapshotFile), { recursive: true });
-      await fs.copyFile(filePath, snapshotFile);
+      try {
+        await fs.copyFile(filePath, snapshotFile);
+        const copied = await sha256File(snapshotFile);
+        if (!copied.exists || copied.sha256 !== fingerprint.sha256 || copied.size !== fingerprint.size) {
+          throw new Error(`Transaction source file changed while capturing snapshot: ${filePath}`);
+        }
+      } catch (error) {
+        await fs.rm(snapshotFile, { force: true }).catch(() => undefined);
+        throw error;
+      }
       snapshot.snapshot_file = snapshotFile;
     }
     record.snapshots.push(snapshot);
@@ -389,6 +398,8 @@ export async function recordTransactionEdit(
     record.snapshots[index].last_known_size = current.size;
   }
   record.edits.push({ at: nowIso(), tool, paths: unique, checkpoint_id: checkpointId });
+  // Require a fresh verification after any transaction-linked edit.
+  delete record.verification;
   if (record.edits.length > MAX_TRANSACTION_EDITS) record.edits.splice(0, record.edits.length - MAX_TRANSACTION_EDITS);
   await saveRecord(record);
   return record;
@@ -481,9 +492,43 @@ export async function recordTransactionVerification(
 ): Promise<EditTransactionRecord> {
   const record = await readRecord(id);
   assertActive(record);
-  record.verification = verification;
+  const file_fingerprints = [];
+  for (const snapshot of record.snapshots) {
+    await assertTransactionPathInsideWorkspace(record.workspace, snapshot.path);
+    const current = await sha256File(snapshot.path);
+    file_fingerprints.push({ path: snapshot.path, exists: current.exists, sha256: current.sha256 });
+  }
+  record.verification = { ...verification, file_fingerprints };
   await saveRecord(record);
   return record;
+}
+
+/** Reject a stale green check after tracked or out-of-band changes. */
+export async function currentTransactionVerification(
+  id: string
+): Promise<{ valid: boolean; reason: string | null }> {
+  const record = await readRecord(id);
+  const verification = record.verification;
+  if (!verification || verification.failed !== 0 || verification.passed < 1) {
+    return { valid: false, reason: "Transaction has no successful current verification" };
+  }
+  if (!verification.file_fingerprints
+    || verification.file_fingerprints.length !== record.snapshots.length) {
+    return { valid: false, reason: "Verification predates file fingerprint tracking; verify again" };
+  }
+  for (let index = 0; index < record.snapshots.length; index++) {
+    const snapshot = record.snapshots[index];
+    const expected = verification.file_fingerprints[index];
+    if (!expected || pathKey(expected.path) !== pathKey(snapshot.path)) {
+      return { valid: false, reason: "Verification file set changed; verify again" };
+    }
+    await assertTransactionPathInsideWorkspace(record.workspace, snapshot.path);
+    const actual = await sha256File(snapshot.path);
+    if (actual.exists !== expected.exists || (actual.exists && actual.sha256 !== expected.sha256)) {
+      return { valid: false, reason: `File changed after verification: ${snapshot.path}` };
+    }
+  }
+  return { valid: true, reason: null };
 }
 
 export async function acceptEditTransaction(id: string): Promise<EditTransactionRecord> {
@@ -572,6 +617,16 @@ export async function rollbackEditTransaction(
 
   if (conflicts.length && !force) {
     return { transaction: record, rolled_back: false, restored: [], deleted: [], conflicts };
+  }
+
+  // Validate all payloads before modifying workspace files to avoid partial rollback.
+  for (const snapshot of record.snapshots) {
+    if (!snapshot.existed) continue;
+    if (!snapshot.snapshot_file) throw new Error(`Missing transaction snapshot payload for ${snapshot.path}`);
+    const payload = await sha256File(snapshot.snapshot_file);
+    if (!payload.exists || payload.size !== snapshot.size || payload.sha256 !== snapshot.baseline_sha256) {
+      throw new Error(`Transaction rollback payload missing or corrupted: ${snapshot.path}`);
+    }
   }
 
   const restored: string[] = [];

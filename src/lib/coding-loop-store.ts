@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { randomUUID } from "crypto";
 import { getCurrentSessionId } from "./session-context.js";
+import { atomicWriteText } from "./atomic-file.js";
 
 export type CodingLoopStatus = "active" | "completed" | "cancelled" | "failed" | "abandoned" | "archived";
 export type CodingLoopPhase = "editing" | "repair" | "ready" | "blocked" | "completed" | "cancelled" | "failed" | "abandoned" | "archived";
@@ -130,10 +131,7 @@ async function ensureStore(): Promise<void> {
 }
 
 async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const temp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  await fs.writeFile(temp, JSON.stringify(value, null, 2), "utf-8");
-  await fs.rename(temp, filePath);
+  await atomicWriteText(filePath, JSON.stringify(value, null, 2));
 }
 
 function normalizeRecord(value: CodingLoopRecord): CodingLoopRecord {
