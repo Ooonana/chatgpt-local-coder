@@ -68,6 +68,79 @@ const DEFAULT_DASHBOARD_ROWS = 44;
 const MIN_DASHBOARD_ROWS = 20;
 const MAX_DASHBOARD_ROWS = 60;
 
+// Tool summaries, worker labels and hook diagnostics are untrusted terminal
+// content. Strip control sequences before composing our own ANSI formatting.
+export function sanitizeTerminalText(value: string): string {
+  return value
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
+    .replace(/\x1b[PX^_][\s\S]*?(?:\x1b\\|$)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b./gs, "")
+    .replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, " ")
+    .replace(/ {2,}/g, " ")
+    .trim();
+}
+
+function safeDashboardModel(input: DashboardRenderModel): DashboardRenderModel {
+  return {
+    ...input,
+    workspace: sanitizeTerminalText(input.workspace),
+    permission: sanitizeTerminalText(input.permission),
+    toolProfile: sanitizeTerminalText(input.toolProfile),
+    sessions: input.sessions?.map((session) => ({
+      ...session,
+      project_alias: session.project_alias == null ? null : sanitizeTerminalText(session.project_alias),
+      project_root: session.project_root == null ? null : sanitizeTerminalText(session.project_root),
+    })),
+    runtime: {
+      ...input.runtime,
+      active: input.runtime.active.map((call) => ({
+        ...call,
+        tool: sanitizeTerminalText(call.tool),
+        summary: sanitizeTerminalText(call.summary),
+        project_root: call.project_root == null ? call.project_root : sanitizeTerminalText(call.project_root),
+      })),
+      recent: input.runtime.recent.map((call) => ({
+        ...call,
+        tool: sanitizeTerminalText(call.tool),
+        summary: sanitizeTerminalText(call.summary),
+        error: call.error === undefined ? undefined : sanitizeTerminalText(call.error),
+      })),
+    },
+    processes: input.processes.map((item) => ({
+      ...item,
+      command: sanitizeTerminalText(item.command),
+      label: item.label === undefined ? undefined : sanitizeTerminalText(item.label),
+      project_root: item.project_root == null ? item.project_root : sanitizeTerminalText(item.project_root),
+    })),
+    ptys: input.ptys.map((item) => ({
+      ...item,
+      command: item.command == null ? null : sanitizeTerminalText(item.command),
+      project_root: item.project_root == null ? null : sanitizeTerminalText(item.project_root),
+    })),
+    subagents: input.subagents.map((item) => ({
+      ...item,
+      label: item.label === undefined ? undefined : sanitizeTerminalText(item.label),
+      objective: sanitizeTerminalText(item.objective),
+      requested_workspace: sanitizeTerminalText(item.requested_workspace),
+    })),
+    codingLoops: input.codingLoops?.map((loop) => ({
+      ...loop,
+      goal: sanitizeTerminalText(loop.goal),
+      workspace: sanitizeTerminalText(loop.workspace),
+      source_workspace: sanitizeTerminalText(loop.source_workspace || loop.workspace),
+    })),
+    tunnel: input.tunnel ? {
+      ...input.tunnel,
+      last_error: input.tunnel.last_error === null ? null : sanitizeTerminalText(input.tunnel.last_error),
+    } : undefined,
+    messages: input.messages.map((message) => ({
+      ...message,
+      text: sanitizeTerminalText(message.text),
+    })),
+  };
+}
+
 function ansi(code: string, text: string, enabled: boolean): string {
   return enabled ? `\x1b[${code}m${text}\x1b[0m` : text;
 }
@@ -148,6 +221,8 @@ function pad(value: string, width: number): string {
 }
 
 function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms)) return "unknown";
+  ms = Math.max(0, ms);
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
   const minutes = Math.floor(ms / 60_000);
@@ -338,10 +413,10 @@ function dashboardAlert(model: DashboardRenderModel, nowMs: number): DashboardAl
   const latestProblem = [...model.messages].reverse().find(
     (item) => item.level !== "info" && nowMs - Date.parse(item.time) < 15_000
   );
-  if (latestProblem) {
+  if (latestProblem?.level === "error") {
     return {
-      severity: latestProblem.level === "error" ? "error" : "warn",
-      label: latestProblem.level === "error" ? "ERROR" : "WARN",
+      severity: "error",
+      label: "ERROR",
       text: latestProblem.text,
     };
   }
@@ -393,6 +468,7 @@ function dashboardAlert(model: DashboardRenderModel, nowMs: number): DashboardAl
       text: model.tunnel.last_error || `status ${model.tunnel.status}`,
     };
   }
+  if (latestProblem) return { severity: "warn", label: "WARN", text: latestProblem.text };
   return {
     severity: "ok",
     label: "SYSTEM HEALTHY",
@@ -423,7 +499,7 @@ function compactDashboard(model: DashboardRenderModel, width: number, height: nu
     `Local Coder  ONLINE  ${clock(model.now)}`,
     `PROJECT ${project}  MCP:${model.mcpPort}  TUN:${tunnel?.status || "n/a"}`,
     `WORK tools:${model.runtime.active.length} workers:${running} loops:${activeLoops.length} transports:${model.sessionCount}`,
-    active ? `${spinner(nowMs, false)} ${active.tool} ${formatDuration(nowMs - active.started_ms)}  ${active.summary}` : "idle · waiting for tool calls",
+    active ? `${spinner(nowMs, false)} ${active.tool} ${formatDuration(nowMs - active.started_ms)}  ${active.summary}` : running ? `${running} background worker(s) still running` : "idle · waiting for tool calls",
     `${alertPrefix} ${alert.label} · ${alert.text}`,
   ];
   return lines.slice(0, height).map((line) => crop(line, width)).join("\n");
@@ -447,7 +523,8 @@ function finishFrame(lines: string[], width: number, height: number, color = fal
   return clipped.join("\n");
 }
 
-export function renderDashboardFrame(model: DashboardRenderModel): string {
+export function renderDashboardFrame(rawModel: DashboardRenderModel): string {
+  const model = safeDashboardModel(rawModel);
   const width = Math.max(1, Math.min(Math.trunc(model.width || 80), 160));
   const height = Math.max(1, Math.trunc(model.height || 24));
   // The full operator layout needs 20 rows in its most compact crowded state
@@ -531,22 +608,29 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
       model.color
     ));
   }
-  const activeSlots = height >= 36 ? 3 : height >= 24 ? 2 : 1;
+  const busy = model.runtime.active.length + runningProcesses.length + runningPtys.length + runningAgents.length + projects.length > 0;
+  const activityReserve = busy ? Math.min(5, model.runtime.recent.length || 1) : Math.min(20, model.runtime.recent.length || 1);
+  const activeBudget = Math.max(1, height - lines.length - 9 - activityReserve);
+  const activeSlots = Math.min(model.runtime.active.length || 1, height >= 36 ? 4 : 2, activeBudget);
   if (!model.runtime.active.length) {
-    lines.push(row(`${ansi("2", "idle", model.color)}  ·  waiting for tool calls`, width, model.color));
+    const workerCount = runningProcesses.length + runningPtys.length + runningAgents.length;
+    lines.push(row(workerCount > 0
+      ? `${ansi("36;1", "WORK CONTINUES", model.color)}  ·  ${workerCount} background worker(s) running without an active tool call`
+      : `${ansi("2", "idle", model.color)}  ·  waiting for tool calls`, width, model.color));
   } else {
     for (const call of model.runtime.active.slice(0, activeSlots)) {
       const elapsed = formatDuration(nowMs - call.started_ms).padStart(6);
       const project = projectLabelForRoot(projects, call.project_root, call.workspace_kind === "machine");
       lines.push(row(`${spinner(nowMs, model.color)} ${kindLabel(call.kind, model.color)} ${ansi("1", call.tool.padEnd(20).slice(0, 20), model.color)} ${ansi("2", elapsed, model.color)}  ${ansi("2", project, model.color)}  ${call.summary}`, width, model.color));
     }
-    if (model.runtime.active.length > activeSlots) {
+    if (model.runtime.active.length > activeSlots && height - lines.length > 10 + activityReserve) {
       lines.push(row(`… ${model.runtime.active.length - activeSlots} more active call(s)`, width));
     }
   }
 
   lines.push(section(`Projects / transports (${projects.length})`, width, model.color));
-  const projectSlots = height >= 36 ? 3 : height >= 24 ? 2 : 1;
+  const projectBudget = Math.max(1, height - lines.length - 7 - activityReserve);
+  const projectSlots = Math.min(projects.length || 1, height >= 40 ? 8 : height >= 32 ? 5 : 2, projectBudget);
   if (!projects.length) {
     lines.push(row(ansi("2", "no project/transport activity yet", model.color), width, model.color));
   } else {
@@ -571,12 +655,12 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
         state,
       ].join("  "), width, model.color));
     }
-    if (projects.length > projectSlots) lines.push(row(`… ${projects.length - projectSlots} more workspace(s)`, width, model.color));
+    if (projects.length > projectSlots && height - lines.length > 8 + activityReserve) lines.push(row(`… ${projects.length - projectSlots} more workspace(s)`, width, model.color));
   }
 
   const runningCount = runningProcesses.length + runningPtys.length + runningAgents.length;
   lines.push(section(`Workers (${runningCount})`, width, model.color));
-  const runningRows: string[] = [];
+  const runningRows: Array<{ text: string; priority: number }> = [];
   for (const item of runningProcesses) {
     const project = projectLabelForRoot(projects, item.project_root, !item.project_root);
     const activityAge = Math.max(0, nowMs - Date.parse(item.last_activity_at));
@@ -585,26 +669,31 @@ export function renderDashboardFrame(model: DashboardRenderModel): string {
       : item.liveness === "silent"
         ? ansi("33;1", "SILENT", model.color)
         : ansi("32;1", "ACTIVE", model.color);
-    runningRows.push(`BG    ${String(item.pid ?? "-").padEnd(7)} ${state}  ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${project}  activity ${formatDuration(activityAge)} ago  ${item.label || item.command}`);
+    runningRows.push({
+      text: `BG    ${String(item.pid ?? "-").padEnd(7)} ${state}  ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${project}  activity ${formatDuration(activityAge)} ago  ${item.label || item.command}`,
+      priority: item.liveness === "possibly_stalled" ? 0 : item.liveness === "silent" ? 1 : 2,
+    });
   }
   for (const item of runningPtys) {
     const project = projectLabelForRoot(projects, item.project_root, !item.project_root);
-    runningRows.push(`PTY   ${String(item.pid ?? "-").padEnd(7)} ${ansi("32;1", "ACTIVE", model.color)}  ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${project}  ${item.command || "interactive shell"}`);
+    runningRows.push({ text: `PTY   ${String(item.pid ?? "-").padEnd(7)} ${ansi("32;1", "ACTIVE", model.color)}  ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${project}  ${item.command || "interactive shell"}`, priority: 2 });
   }
   for (const item of runningAgents) {
     const project = projectLabelForRoot(projects, item.requested_workspace, false);
-    runningRows.push(`AGENT ${String(item.pid ?? "-").padEnd(7)} ${ansi("32;1", "ACTIVE", model.color)}  ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${project}  ${item.label || item.objective}`);
+    runningRows.push({ text: `AGENT ${String(item.pid ?? "-").padEnd(7)} ${ansi("32;1", "ACTIVE", model.color)}  ${formatDuration(nowMs - Date.parse(item.started_at)).padStart(6)}  ${project}  ${item.label || item.objective}`, priority: 2 });
   }
-  const workerSlots = height >= 36 ? 3 : height >= 24 ? 2 : 1;
+  runningRows.sort((a, b) => a.priority - b.priority);
+  const workerBudget = Math.max(1, height - lines.length - 5 - activityReserve);
+  const workerSlots = Math.min(runningRows.length || 1, height >= 40 ? 6 : height >= 32 ? 4 : 2, workerBudget);
   if (!runningRows.length) lines.push(row(`${ansi("2", "none", model.color)}  ·  no background process, PTY, or subagent`, width, model.color));
-  else for (const item of runningRows.slice(0, workerSlots)) lines.push(row(item, width, model.color));
-  if (runningRows.length > workerSlots) lines.push(row(`… ${runningRows.length - workerSlots} more running item(s)`, width, model.color));
+  else for (const item of runningRows.slice(0, workerSlots)) lines.push(row(item.text, width, model.color));
+  if (runningRows.length > workerSlots && height - lines.length > 6 + activityReserve) lines.push(row(`… ${runningRows.length - workerSlots} more running item(s)`, width, model.color));
 
   lines.push(section("Activity", width, model.color));
   const footerReserve = 3;
-  const recentSlots = Math.max(1, Math.min(20, height - lines.length - footerReserve));
+  const recentSlots = Math.max(0, Math.min(20, height - lines.length - footerReserve));
   const recent = model.runtime.recent.slice(0, recentSlots);
-  if (!recent.length) lines.push(row(`${ansi("2", "no completed calls yet", model.color)}`, width));
+  if (!recent.length && recentSlots > 0) lines.push(row(`${ansi("2", "no completed calls yet", model.color)}`, width));
   for (const item of recent) {
     const time = new Date(item.finished_at).toLocaleTimeString("en-GB", { hour12: false });
     const summary = item.status === "error" ? item.error || item.summary : item.summary;
@@ -667,6 +756,9 @@ export function startTerminalDashboard(options: DashboardOptions): {
   let codingLoops: CodingLoopRecord[] = [];
   let resizeTimer: NodeJS.Timeout | undefined;
   let renderQueued = false;
+  let lastFrame = "";
+  let lastFrameDimensions = "";
+  let loopRefreshInFlight = false;
   let previousCpu = process.cpuUsage();
   let previousCpuAt = Date.now();
   let cpuPercent = 0;
@@ -732,7 +824,12 @@ export function startTerminalDashboard(options: DashboardOptions): {
       messages,
       color,
     });
-    process.stdout.write(`${CLEAR}${frame}`);
+    const dimensions = `${lastWidth}x${dashboardHeight}`;
+    if (frame === lastFrame && dimensions === lastFrameDimensions) return;
+    const needsClear = dimensions !== lastFrameDimensions || lastWidth < 64 || dashboardHeight < 20;
+    process.stdout.write(`${needsClear ? CLEAR : CSI + "H"}${frame}`);
+    lastFrame = frame;
+    lastFrameDimensions = dimensions;
   };
 
   function queueRender(): void {
@@ -743,10 +840,16 @@ export function startTerminalDashboard(options: DashboardOptions): {
 
   const unsubscribe = subscribeRuntimeState(queueRender);
   const refreshCodingLoops = async () => {
+    if (stopped || loopRefreshInFlight) return;
+    loopRefreshInFlight = true;
     try {
       codingLoops = await listCodingLoops(8);
       queueRender();
-    } catch {}
+    } catch {
+      // Keep the last successfully read loop snapshot during transient I/O.
+    } finally {
+      loopRefreshInFlight = false;
+    }
   };
   void refreshCodingLoops();
   codingLoopTimer = setInterval(() => void refreshCodingLoops(), 2000);
@@ -773,6 +876,7 @@ export function startTerminalDashboard(options: DashboardOptions): {
     if (resizeTimer) clearTimeout(resizeTimer);
     unsubscribe();
     process.stdout.off("resize", resize);
+    process.off("exit", stop);
     setActivityConsoleEnabled(true);
     console.log = original.log;
     console.warn = original.warn;

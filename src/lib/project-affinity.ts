@@ -8,6 +8,7 @@ import {
   getCurrentSessionState,
 } from "./session-context.js";
 import { sameResolvedPath } from "./path-identity.js";
+import { atomicWriteText } from "./atomic-file.js";
 
 interface ProjectRegistryEntry {
   root: string;
@@ -108,10 +109,7 @@ async function readRegistry(): Promise<ProjectRegistry> {
 
 async function writeRegistry(registry: ProjectRegistry): Promise<void> {
   const target = registryPath();
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  const temp = `${target}.${process.pid}.${Date.now().toString(36)}.tmp`;
-  await fs.writeFile(temp, JSON.stringify(registry, null, 2) + "\n", "utf-8");
-  await fs.rename(temp, target);
+  await atomicWriteText(target, JSON.stringify(registry, null, 2) + "\n");
 }
 
 async function mutateRegistry<T>(work: () => Promise<T>): Promise<T> {

@@ -37,7 +37,7 @@ process.env.MCP_TEXT_CACHE_MAX_ENTRY_BYTES = "524288";
 process.env.MCP_TEXT_CACHE_MAX_ENTRIES = "8";
 
 const { classifyToolFailure } = await import("../dist/lib/error-model.js");
-const { compactOrStoreText, readTextResult } = await import("../dist/lib/result-store.js");
+const { compactOrStoreText, readTextResult, storeTextResult } = await import("../dist/lib/result-store.js");
 const { captureWorkingTree, compareWorkingTrees } = await import("../dist/lib/shell-mutation.js");
 const { loadIdempotent, requestFingerprint, saveIdempotent, withIdempotencyKeyLock } = await import("../dist/lib/idempotency-store.js");
 const { loadParallelBatch, newParallelBatchId, saveParallelBatch } = await import("../dist/lib/parallel-batch-store.js");
@@ -65,6 +65,20 @@ await test("large output spills to a durable result handle", async () => {
   assert.equal(first.text.length, 1_234);
   assert.equal(first.original_chars, text.length);
   assert.ok(first.next_offset);
+});
+
+await test("result writes are atomic and reject unsafe handle prefixes", async () => {
+  const results = await Promise.all(Array.from({ length: 12 }, (_, index) =>
+    storeTextResult("payload-" + index, "../unsafe")
+  ));
+  assert.equal(new Set(results.map((item) => item.handle)).size, 12);
+  for (let index = 0; index < results.length; index++) {
+    assert.match(results[index].handle, /^result_/);
+    assert.equal((await readTextResult(results[index].handle)).text, "payload-" + index);
+  }
+  const residue = (await fs.readdir(process.env.MCP_RESULT_STATE_DIR))
+    .filter((name) => name.endsWith(".tmp"));
+  assert.deepEqual(residue, []);
 });
 
 await test("mutation evidence detects edits to an already-dirty file", async () => {

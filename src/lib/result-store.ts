@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { atomicWriteText } from "./atomic-file.js";
 
 const DEFAULT_INLINE_CHARS = 24_000;
 const MAX_STORED_CHARS = 2_000_000;
@@ -26,7 +27,8 @@ export interface StoredTextResult {
 export async function storeTextResult(text: string, prefix = "result"): Promise<StoredTextResult> {
   const originalChars = text.length;
   const bounded = originalChars > MAX_STORED_CHARS ? text.slice(-MAX_STORED_CHARS) : text;
-  const id = `${prefix}_${Date.now().toString(36)}_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  const safePrefix = /^[a-zA-Z0-9_-]{1,40}$/.test(prefix) ? prefix : "result";
+  const id = `${safePrefix}_${Date.now().toString(36)}_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
   const payload = {
     version: 1,
     id,
@@ -36,8 +38,7 @@ export async function storeTextResult(text: string, prefix = "result"): Promise<
     sha256: createHash("sha256").update(text).digest("hex"),
     text: bounded,
   };
-  await fs.mkdir(storeRoot(), { recursive: true });
-  await fs.writeFile(path.join(storeRoot(), `${id}.json`), JSON.stringify(payload), "utf-8");
+  await atomicWriteText(path.join(storeRoot(), `${id}.json`), JSON.stringify(payload));
   return {
     handle: id,
     chars: originalChars,

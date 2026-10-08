@@ -297,6 +297,224 @@ await test("dashboard highlights stalled worker with project and activity age", 
   assertFits(frame, 132, 30);
 });
 
+await test("active worker ordering surfaces stalled processes before routine work", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-10-08T02:00:00.000Z");
+  const worker = (label, status, age) => ({
+    id: label,
+    pid: 1000 + age,
+    label,
+    command: label,
+    cwd: "C:/work/active",
+    project_root: "C:/work/active",
+    started_at: new Date(now.getTime() - 900_000).toISOString(),
+    last_activity_at: new Date(now.getTime() - age * 1000).toISOString(),
+    running: true,
+    exit_code: null,
+    signal: null,
+    liveness: status,
+  });
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 136,
+    height: 44,
+    processes: [
+      worker("routine-alpha", "active", 2),
+      worker("routine-beta", "active", 3),
+      worker("watch-this", "possibly_stalled", 660),
+      worker("quiet-job", "silent", 180),
+    ],
+  }));
+  const section = frame.split("├─ Workers ")[1]?.split("├─ Activity ")[0] || "";
+  assert.ok(section.indexOf("watch-this") >= 0 && section.indexOf("quiet-job") >= 0);
+  assert.ok(section.indexOf("watch-this") < section.indexOf("routine-alpha"));
+  assert.ok(section.indexOf("quiet-job") < section.indexOf("routine-alpha"));
+  assertFits(frame, 136, 44);
+});
+
+await test("worker-only activity is shown as working instead of idle", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-10-08T02:00:00.000Z");
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 128,
+    height: 36,
+    processes: [{
+      id: "still-working",
+      pid: 2001,
+      label: "compile",
+      command: "npm run build",
+      cwd: "C:/work/compile",
+      project_root: "C:/work/compile",
+      started_at: now.toISOString(),
+      last_activity_at: now.toISOString(),
+      running: true,
+      exit_code: null,
+      signal: null,
+      liveness: "active",
+    }],
+  }));
+  assert.match(frame, /WORK CONTINUES/);
+  assert.doesNotMatch(frame.split("├─ Current work ")[1]?.split("├─ Projects ")[0] || "", /idle/);
+  assertFits(frame, 128, 36);
+});
+
+await test("large TUI shows more than three active projects", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-10-08T02:00:00.000Z");
+  const sessions = Array.from({ length: 8 }, (_, index) => ({
+    session_id: "visible-" + index,
+    default_workspace: "C:/active/p" + index,
+    workspace_kind: "project",
+    project_root: "C:/active/p" + index,
+    project_alias: "visible-" + index,
+    connection: "connected",
+    created_at: now.toISOString(),
+    last_client_activity_at: now.toISOString(),
+    disconnected_at: null,
+    closed_at: null,
+  }));
+  const snapshot = runtime.getRuntimeSnapshot();
+  snapshot.active = sessions.map((session, index) => ({
+    id: "call-" + index,
+    tool: "run_command",
+    kind: "EXEC",
+    summary: "working",
+    started_at: now.toISOString(),
+    started_ms: now.getTime(),
+    session_id: session.session_id,
+    project_root: session.project_root,
+    workspace_kind: "project",
+  }));
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 160,
+    height: 60,
+    sessionCount: sessions.length,
+    runtime: snapshot,
+    sessions,
+  }));
+  const projectRows = frame.split("├─ Projects / transports ")[1]?.split("├─ Workers ")[0] || "";
+  for (let index = 0; index < 6; index++) assert.match(projectRows, new RegExp("visible-" + index));
+  assertFits(frame, 160, 60);
+});
+
+await test("operator dashboard neutralizes terminal controls inside external content", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-10-08T02:00:00.000Z");
+  const snapshot = runtime.getRuntimeSnapshot();
+  snapshot.active = [{
+    id: "unsafe",
+    tool: "run_command",
+    kind: "EXEC",
+    summary: "build\x1b[2J\x1b]0;spoof-title\x07\r\nhijacked",
+    started_at: new Date(now.getTime() - 1000).toISOString(),
+    started_ms: now.getTime() - 1000,
+  }];
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 120,
+    height: 32,
+    runtime: snapshot,
+    color: true,
+    messages: [{ level: "warn", time: now.toISOString(), text: "notice\x1b[H\x1b[0K\rspoof" }],
+  }));
+  assert.match(frame, /build/);
+  assert.doesNotMatch(frame, /\x1b\[2J|\x1b\]|\x1b\[H|\x1b\[0K/);
+  assert.doesNotMatch(dashboard.sanitizeTerminalText("\u202eabc\x1b[2J"), /\u202e|\x1b/);
+  assertFits(frame, 120, 32);
+});
+
+await test("disconnect alerts outrank a recent unrelated warning", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-10-08T02:00:00.000Z");
+  const snapshot = runtime.getRuntimeSnapshot();
+  snapshot.active = [{
+    id: "lost",
+    tool: "verify_project",
+    kind: "EXEC",
+    summary: "validation",
+    started_at: new Date(now.getTime() - 6000).toISOString(),
+    started_ms: now.getTime() - 6000,
+    session_id: "lost-transport",
+    project_root: "C:/work/active",
+    workspace_kind: "project",
+  }];
+  const frame = dashboard.renderDashboardFrame(baseModel(now, {
+    width: 120,
+    height: 32,
+    runtime: snapshot,
+    sessions: [{
+      session_id: "lost-transport",
+      default_workspace: "C:/work/active",
+      workspace_kind: "project",
+      project_root: "C:/work/active",
+      project_alias: "active",
+      connection: "disconnected",
+      created_at: now.toISOString(),
+      last_client_activity_at: now.toISOString(),
+      disconnected_at: now.toISOString(),
+      closed_at: null,
+    }],
+    messages: [{ level: "warn", time: now.toISOString(), text: "Routine warning" }],
+  }));
+  assert.match(frame.split("├─ Health ")[1] || "", /CHAT TRANSPORT LOST/);
+  assertFits(frame, 120, 32);
+});
+
+await test("crowded responsive layouts always retain the Health footer", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-10-08T02:00:00.000Z");
+  const sessions = Array.from({ length: 12 }, (_, index) => ({
+    session_id: "s" + index,
+    default_workspace: "C:/work/p" + index,
+    workspace_kind: "project",
+    project_root: "C:/work/p" + index,
+    project_alias: "project-" + index,
+    connection: index < 8 ? "connected" : "disconnected",
+    created_at: now.toISOString(),
+    last_client_activity_at: now.toISOString(),
+    disconnected_at: null,
+    closed_at: null,
+  }));
+  const processes = sessions.map((session, index) => ({
+    id: "p" + index,
+    pid: 1100 + index,
+    label: "worker-" + index,
+    command: "npm test",
+    cwd: session.project_root,
+    project_root: session.project_root,
+    started_at: now.toISOString(),
+    last_activity_at: now.toISOString(),
+    running: true,
+    exit_code: null,
+    signal: null,
+    liveness: index === 7 ? "possibly_stalled" : "active",
+  }));
+  const snapshot = runtime.getRuntimeSnapshot();
+  snapshot.active = sessions.slice(0, 6).map((session, index) => ({
+    id: "call" + index,
+    tool: "run_command",
+    kind: "EXEC",
+    summary: "working",
+    started_at: now.toISOString(),
+    started_ms: now.getTime() - 8000,
+    session_id: session.session_id,
+    project_root: session.project_root,
+    workspace_kind: "project",
+  }));
+  for (const width of [64, 80, 100, 132, 160]) for (let height = 20; height <= 60; height += 2) {
+    const frame = dashboard.renderDashboardFrame(baseModel(now, {
+      width,
+      height,
+      runtime: snapshot,
+      sessionCount: sessions.length,
+      sessions,
+      processes,
+      color: true,
+      codingLoops: [{ status: "active", phase: "verify", attempts: [], max_attempts: 4, goal: "work", source_workspace: "C:/work/p0", workspace: "C:/work/p0" }],
+    }));
+    assert.match(frame.split("\n").at(-3) || "", /Health/, "missing Health at " + width + "x" + height);
+    assertFits(frame, width, height);
+  }
+});
+
 await test("active projects are automatically listed before connected idle and offline projects", async () => {
   runtime.resetRuntimeStateForTests();
   const now = new Date("2026-09-14T13:30:00.000Z");
