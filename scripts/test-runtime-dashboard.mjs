@@ -145,12 +145,33 @@ await test("dashboard uses restrained state colors without changing terminal wid
   assertFits(frame, 120, 30);
 });
 
-await test("dashboard height preference defaults to 44 rows and stays bounded", async () => {
-  assert.equal(dashboard.preferredTerminalDashboardRows(undefined), 44);
+await test("dashboard defaults to automatic resizing and explicit height caps stay bounded", async () => {
+  assert.equal(dashboard.preferredTerminalDashboardRows(undefined), null);
   assert.equal(dashboard.preferredTerminalDashboardRows("36"), 36);
   assert.equal(dashboard.preferredTerminalDashboardRows("8"), 20);
   assert.equal(dashboard.preferredTerminalDashboardRows("200"), 60);
   assert.equal(dashboard.preferredTerminalDashboardRows("auto"), null);
+  assert.equal(dashboard.preferredTerminalDashboardRows("invalid"), null);
+  assert.equal(dashboard.dashboardViewportHeight(68, null), 68);
+  assert.equal(dashboard.dashboardViewportHeight(68, 44), 44);
+  assert.equal(dashboard.dashboardViewportHeight(18, 44), 18);
+  assert.equal(dashboard.dashboardViewportHeight(1, null), 1);
+});
+
+await test("resize sequence uses all available rows and wide columns, with no clipping", async () => {
+  runtime.resetRuntimeStateForTests();
+  const now = new Date("2026-10-08T03:00:00.000Z");
+  const sizes = [[120, 30], [218, 72], [76, 21], [38, 9], [280, 54], [1, 1]];
+  for (const [width, height] of sizes) {
+    const actualRows = dashboard.dashboardViewportHeight(height, null);
+    const frame = dashboard.renderDashboardFrame(baseModel(now, { width, height: actualRows, color: true }));
+    assertFits(frame, width, height);
+    if (width >= 64 && height >= 20) {
+      assert.equal(frame.split("\n").length, height, `${width}x${height} should fill the viewport`);
+      assert.equal(dashboard.measureTerminalCells(frame.split("\n")[0]), width, "wide header should fill viewport");
+      assert.match(frame.split("\n").at(-3) || "", /Health/, "Health should stay pinned");
+    }
+  }
 });
 
 await test("desktop activity renders the 20 latest completed tool calls", async () => {

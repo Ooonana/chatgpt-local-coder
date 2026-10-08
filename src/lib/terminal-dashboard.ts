@@ -64,7 +64,6 @@ const CURSOR_HIDE = `${CSI}?25l`;
 const CURSOR_SHOW = `${CSI}?25h`;
 const CLEAR = `${CSI}2J${CSI}H`;
 const ANSI_RE = /\x1B\[[0-?]*[ -\/]*[@-~]/g;
-const DEFAULT_DASHBOARD_ROWS = 44;
 const MIN_DASHBOARD_ROWS = 20;
 const MAX_DASHBOARD_ROWS = 60;
 
@@ -160,11 +159,17 @@ function healthColor(percent: number): string {
 }
 
 export function preferredTerminalDashboardRows(raw = process.env.LOCAL_CODER_TUI_HEIGHT): number | null {
-  const value = (raw ?? String(DEFAULT_DASHBOARD_ROWS)).trim().toLowerCase();
+  // Follow the real viewport unless the operator explicitly requests a cap.
+  const value = (raw ?? "auto").trim().toLowerCase();
   if (["auto", "full", "off", "0", "false", "no"].includes(value)) return null;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return DEFAULT_DASHBOARD_ROWS;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return Math.max(MIN_DASHBOARD_ROWS, Math.min(MAX_DASHBOARD_ROWS, parsed));
+}
+
+export function dashboardViewportHeight(terminalRows: number, preferredRows: number | null): number {
+  const rows = Number.isFinite(terminalRows) && terminalRows > 0 ? Math.trunc(terminalRows) : 24;
+  return Math.max(1, preferredRows === null ? rows : Math.min(rows, preferredRows));
 }
 
 function codePointWidth(char: string): number {
@@ -525,8 +530,8 @@ function finishFrame(lines: string[], width: number, height: number, color = fal
 
 export function renderDashboardFrame(rawModel: DashboardRenderModel): string {
   const model = safeDashboardModel(rawModel);
-  const width = Math.max(1, Math.min(Math.trunc(model.width || 80), 160));
-  const height = Math.max(1, Math.trunc(model.height || 24));
+  const width = Math.max(1, Number.isFinite(model.width) ? Math.trunc(model.width) : 80);
+  const height = Math.max(1, Number.isFinite(model.height) ? Math.trunc(model.height) : 24);
   // The full operator layout needs 20 rows in its most compact crowded state
   // (tunnel + loop + active call + project overflow + worker overflow + Health).
   // Below that, prefer the compact view instead of clipping the pinned alert.
@@ -796,7 +801,7 @@ export function startTerminalDashboard(options: DashboardOptions): {
     const memory = process.memoryUsage();
     if (process.stdout.columns && process.stdout.columns > 0) lastWidth = process.stdout.columns;
     if (process.stdout.rows && process.stdout.rows > 0) lastHeight = process.stdout.rows;
-    const dashboardHeight = preferredRows === null ? lastHeight : Math.min(lastHeight, preferredRows);
+    const dashboardHeight = dashboardViewportHeight(lastHeight, preferredRows);
     const frame = renderDashboardFrame({
       now: new Date(),
       startedAtMs,
@@ -827,7 +832,9 @@ export function startTerminalDashboard(options: DashboardOptions): {
     const dimensions = `${lastWidth}x${dashboardHeight}`;
     if (frame === lastFrame && dimensions === lastFrameDimensions) return;
     const needsClear = dimensions !== lastFrameDimensions || lastWidth < 64 || dashboardHeight < 20;
-    process.stdout.write(`${needsClear ? CLEAR : CSI + "H"}${frame}`);
+    // CRLF keeps each row at column one even when the terminal does not
+    // implement automatic newline mode. LF alone can indent following rows.
+    process.stdout.write(`${needsClear ? CLEAR : CSI + "H"}${frame.replace(/\n/g, "\r\n")}`);
     lastFrame = frame;
     lastFrameDimensions = dimensions;
   };
@@ -860,6 +867,8 @@ export function startTerminalDashboard(options: DashboardOptions): {
     resizeTimer.unref?.();
   };
   process.stdout.on("resize", resize);
+  // The xterm window-size request is optional and is intentionally not sent
+  // in auto mode: many Windows terminals ignore it or require user consent.
   const resizeRequest = preferredRows !== null && lastHeight < preferredRows
     ? `${CSI}8;${preferredRows};${Math.max(40, lastWidth)}t`
     : "";
