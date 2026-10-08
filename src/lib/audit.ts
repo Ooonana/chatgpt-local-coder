@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { randomUUID } from "node:crypto";
 import { appendActivity } from "./activity-log.js";
 import { boundDiagnosticValue } from "./bounded-value.js";
 import { getRuntimeIdentity } from "./runtime-identity.js";
@@ -21,6 +22,31 @@ const AUDIT_LOG_MAX_BYTES = (() => {
   return Math.min(Math.max(Math.trunc(parsed), 1024 * 1024), 100 * 1024 * 1024);
 })();
 let auditWriteQueue = Promise.resolve();
+
+/**
+ * Start a fresh active audit log without destroying its history. The old log is
+ * moved to a uniquely named archive in the durable state folder under a write
+ * queue barrier, so concurrent audit events remain correctly ordered.
+ */
+export async function archiveCurrentAuditLog(): Promise<string | null> {
+  const operation = auditWriteQueue.catch(() => undefined).then(async () => {
+    try {
+      await fs.stat(auditPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    // Keep archives alongside the configured audit destination. This also
+    // prevents isolated test logs from polluting the production state tree.
+    const dir = path.join(path.dirname(auditPath), ".mcp-state", "audit-archive");
+    await fs.mkdir(dir, { recursive: true });
+    const archive = path.join(dir, `audit-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}.log`);
+    await fs.rename(auditPath, archive);
+    return archive;
+  });
+  auditWriteQueue = operation.then(() => undefined, () => undefined);
+  return operation;
+}
 
 async function appendAuditLine(line: string): Promise<void> {
   const bytes = Buffer.byteLength(line, "utf8");

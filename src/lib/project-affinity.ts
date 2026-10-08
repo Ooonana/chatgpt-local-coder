@@ -10,11 +10,12 @@ import {
 import { sameResolvedPath } from "./path-identity.js";
 import { atomicWriteText } from "./atomic-file.js";
 
-interface ProjectRegistryEntry {
+export interface ProjectRegistryEntry {
   root: string;
   alias: string;
   last_used_at: string;
   uses: number;
+  pinned?: boolean;
   identity?: string;
   previous_roots?: string[];
 }
@@ -32,6 +33,11 @@ const activeRoots = new Map<string, string>();
 const detectionCache = new Map<string, string>();
 let registryWriteQueue = Promise.resolve();
 const execFileAsync = promisify(execFile);
+
+function orderRegistry(entries: ProjectRegistryEntry[]): void {
+  entries.sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned))
+    || b.last_used_at.localeCompare(a.last_used_at));
+}
 
 function registryPath(): string {
   return path.resolve(process.env.MCP_PROJECT_REGISTRY_PATH?.trim() || path.join(process.cwd(), ".mcp-state", "projects.json"));
@@ -217,7 +223,7 @@ export async function recordProjectAffinity(inputPath: string): Promise<string> 
     // different projects concurrently. The registry is recent-project history
     // only; execution scope is derived per tool call.
     registry.active_root = null;
-    registry.entries.sort((a, b) => b.last_used_at.localeCompare(a.last_used_at));
+    orderRegistry(registry.entries);
     registry.entries = registry.entries.slice(0, MAX_RECENTS);
     await writeRegistry(registry);
   }).catch(() => undefined);
@@ -255,6 +261,44 @@ export async function getProjectAffinity(fallback?: string): Promise<{
 
 export function clearProjectDetectionCache(): void {
   detectionCache.clear();
+}
+
+/** Read-only registry listing. Never discovers or creates projects as a side effect. */
+export async function listRegisteredProjects(): Promise<ProjectRegistryEntry[]> {
+  const registry = await readRegistry();
+  return registry.entries.map((entry) => ({ ...entry, previous_roots: entry.previous_roots?.slice() }));
+}
+
+export async function setRegisteredProjectPinned(root: string, pinned: boolean): Promise<boolean> {
+  return mutateRegistry(async () => {
+    const registry = await readRegistry();
+    const entry = registry.entries.find((item) => sameResolvedPath(item.root, root));
+    if (!entry) return false;
+    entry.pinned = pinned;
+    orderRegistry(registry.entries);
+    await writeRegistry(registry);
+    return true;
+  });
+}
+
+/** Removes a recent-project registry entry, never files or Git worktrees. */
+export async function forgetRegisteredProject(
+  root: string,
+  inUse?: (root: string) => boolean
+): Promise<boolean> {
+  return mutateRegistry(async () => {
+    if ([...activeRoots.values()].some((active) => sameResolvedPath(active, root)) || inUse?.(root)) {
+      throw new Error("Workspace is in use; stop its work and disconnect its sessions first.");
+    }
+    const registry = await readRegistry();
+    const remaining = registry.entries.filter((entry) => !sameResolvedPath(entry.root, root));
+    if (remaining.length === registry.entries.length) return false;
+    registry.entries = remaining;
+    registry.active_root = null;
+    await writeRegistry(registry);
+    clearProjectDetectionCache();
+    return true;
+  });
 }
 
 export function clearProjectAffinitySession(sessionId: string): void {

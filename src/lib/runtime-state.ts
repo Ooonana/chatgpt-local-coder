@@ -77,6 +77,13 @@ let totalOk = 0;
 let totalErrors = 0;
 let lastCompletedSignature = "";
 
+/** Clear displayed completed-call history without altering active work or KPIs. */
+export function clearCompletedToolHistory(): void {
+  recent.length = 0;
+  lastCompletedSignature = "";
+  notify();
+}
+
 function percentile(values: number[], ratio: number): number {
   if (!values.length) return 0;
   const sorted = [...values].sort((a, b) => a - b);

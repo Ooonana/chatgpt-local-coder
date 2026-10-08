@@ -1,5 +1,20 @@
-import { getRuntimeSnapshot, subscribeRuntimeState, type RuntimeSnapshot } from "./runtime-state.js";
-import { setActivityConsoleEnabled } from "./activity-log.js";
+import { getRuntimeSnapshot, subscribeRuntimeState, clearCompletedToolHistory, type RuntimeSnapshot } from "./runtime-state.js";
+import { emitKeypressEvents } from "node:readline";
+import {
+  setActivityConsoleEnabled, getRecentActivity, clearRecentActivity, loadAuditHistory,
+  type ActivityEntry,
+} from "./activity-log.js";
+import { archiveCurrentAuditLog } from "./audit.js";
+import {
+  listRegisteredProjects, setRegisteredProjectPinned, forgetRegisteredProject,
+  type ProjectRegistryEntry,
+} from "./project-affinity.js";
+import {
+  initialConsoleView, reduceConsoleKey, type ConsoleViewState, type ConsoleSort,
+} from "./tui-console-state.js";
+import {
+  consoleHistory, consoleItems, consoleWorkspaces, renderTuiConsolePage, workspaceHasLiveWork,
+} from "./tui-console-view.js";
 import { getManagedProcessSnapshot } from "../tools/shell.js";
 import { getPtySessionSnapshot } from "../tools/pty.js";
 import { listSubagents } from "./subagent-manager.js";
@@ -758,12 +773,19 @@ export function startTerminalDashboard(options: DashboardOptions): {
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
   let codingLoopTimer: NodeJS.Timeout | undefined;
+  let listRefreshTimer: NodeJS.Timeout | undefined;
   let codingLoops: CodingLoopRecord[] = [];
   let resizeTimer: NodeJS.Timeout | undefined;
   let renderQueued = false;
   let lastFrame = "";
   let lastFrameDimensions = "";
   let loopRefreshInFlight = false;
+  let viewState = initialConsoleView();
+  let registeredProjects: ProjectRegistryEntry[] = [];
+  let auditHistory: ActivityEntry[] = [];
+  let latestModel: DashboardRenderModel | null = null;
+  let refreshPromise: Promise<void> | null = null;
+  let pendingWorkspaceRoot: string | null = null;
   let previousCpu = process.cpuUsage();
   let previousCpuAt = Date.now();
   let cpuPercent = 0;
@@ -802,7 +824,7 @@ export function startTerminalDashboard(options: DashboardOptions): {
     if (process.stdout.columns && process.stdout.columns > 0) lastWidth = process.stdout.columns;
     if (process.stdout.rows && process.stdout.rows > 0) lastHeight = process.stdout.rows;
     const dashboardHeight = dashboardViewportHeight(lastHeight, preferredRows);
-    const frame = renderDashboardFrame({
+    const model: DashboardRenderModel = {
       now: new Date(),
       startedAtMs,
       width: lastWidth,
@@ -828,6 +850,11 @@ export function startTerminalDashboard(options: DashboardOptions): {
       codingLoops,
       messages,
       color,
+    };
+    latestModel = model;
+    const frame = renderTuiConsolePage(model, {
+      state: viewState, registry: registeredProjects,
+      auditHistory, liveHistory: getRecentActivity(500),
     });
     const dimensions = `${lastWidth}x${dashboardHeight}`;
     if (frame === lastFrame && dimensions === lastFrameDimensions) return;
@@ -846,6 +873,32 @@ export function startTerminalDashboard(options: DashboardOptions): {
   }
 
   const unsubscribe = subscribeRuntimeState(queueRender);
+  const refreshLists = (): Promise<void> => {
+    if (stopped) return Promise.resolve();
+    if (refreshPromise) return refreshPromise;
+    refreshPromise = (async () => {
+      try {
+        const [projects, history] = await Promise.all([
+          listRegisteredProjects(), loadAuditHistory(200),
+        ]);
+        if (stopped) return;
+        registeredProjects = projects;
+        auditHistory = history;
+        queueRender();
+      } catch (error) {
+        viewState.notice = "Refresh failed: " + String(error);
+        queueRender();
+      }
+    })().finally(() => { refreshPromise = null; });
+    return refreshPromise;
+  };
+  void refreshLists();
+  listRefreshTimer = setInterval(() => {
+    if (viewState.tab === "workspaces" || viewState.tab === "history" || viewState.tab === "logs") {
+      void refreshLists();
+    }
+  }, 5000);
+  listRefreshTimer.unref?.();
   const refreshCodingLoops = async () => {
     if (stopped || loopRefreshInFlight) return;
     loopRefreshInFlight = true;
@@ -867,6 +920,105 @@ export function startTerminalDashboard(options: DashboardOptions): {
     resizeTimer.unref?.();
   };
   process.stdout.on("resize", resize);
+  const stdin = process.stdin;
+  const keyboardAvailable = Boolean(stdin.isTTY && typeof stdin.setRawMode === "function");
+  const previousRawMode = Boolean(stdin.isRaw);
+  const stdinWasPaused = stdin.isPaused();
+  let keyboardEnabled = false;
+  let keyActionInFlight = false;
+  const queuedKeys: Array<{ text: string; key: { name?: string; ctrl?: boolean; shift?: boolean } }> = [];
+  const onKeypress = (text: string, key: { name?: string; ctrl?: boolean; shift?: boolean }) => {
+    if (stopped) return;
+    if (key.ctrl && key.name === "c") {
+      // Raw mode does not synthesize SIGINT. Preserve the server's existing
+      // signal handler rather than swallowing Ctrl+C inside the dashboard.
+      process.kill(process.pid, "SIGINT");
+      return;
+    }
+    if (keyActionInFlight) {
+      // Don't silently swallow quick shortcuts while the registry/audit file
+      // is loading or a previously confirmed mutation is being persisted.
+      if (queuedKeys.length < 16) queuedKeys.push({ text, key });
+      return;
+    }
+    const name = key.name === "return" ? "enter" : (key.name || text).toLowerCase();
+    if (!name) return;
+    const current = latestModel;
+    if (!current) return;
+    const before = viewState;
+    const data = { state: before, registry: registeredProjects, auditHistory, liveHistory: getRecentActivity(500) };
+    const rows = consoleItems(current, data);
+    const selectedWorkspace = before.tab === "workspaces"
+      ? consoleWorkspaces(current, registeredProjects, before.sort)[before.selected]
+      : undefined;
+    const outcome = reduceConsoleKey(before, name, rows.length);
+    viewState = outcome.state;
+    if (viewState.pending === "forget" && !before.pending) pendingWorkspaceRoot = selectedWorkspace?.root || null;
+    if (!viewState.pending && outcome.action !== "forget") pendingWorkspaceRoot = null;
+    queueRender();
+    if (outcome.action === "none") return;
+    keyActionInFlight = true;
+    void (async () => {
+      try {
+        if (outcome.action === "refresh") await refreshLists();
+        if (outcome.action === "pin") {
+          if (!selectedWorkspace?.registered) throw new Error("This is a live-only workspace, not a saved registry entry.");
+          if (!await setRegisteredProjectPinned(selectedWorkspace.root, !selectedWorkspace.pinned)) throw new Error("Workspace is no longer registered.");
+          await refreshLists();
+          viewState.notice = selectedWorkspace.pinned ? "Unpinned workspace" : "Pinned workspace";
+        }
+        if (outcome.action === "forget") {
+          if (!selectedWorkspace || !pendingWorkspaceRoot
+            || normalizedProjectKey(selectedWorkspace.root) !== normalizedProjectKey(pendingWorkspaceRoot)) {
+            throw new Error("Selection changed; removal cancelled.");
+          }
+          if (!selectedWorkspace.registered) throw new Error("Live-only workspace has no registry entry.");
+          const isBusy = (root: string) => {
+            const fresh: DashboardRenderModel = {
+              ...current, sessions: options.sessionSnapshot?.() ?? [],
+              runtime: getRuntimeSnapshot(), processes: getManagedProcessSnapshot(),
+              ptys: getPtySessionSnapshot(), subagents: listSubagents(), codingLoops,
+            };
+            return workspaceHasLiveWork(fresh, root);
+          };
+          if (!await forgetRegisteredProject(selectedWorkspace.root, isBusy)) throw new Error("Workspace is not registered.");
+          pendingWorkspaceRoot = null;
+          viewState.selected = Math.max(0, viewState.selected - 1);
+          await refreshLists();
+          viewState.notice = "Unregistered only; folder and files remain untouched.";
+        }
+        if (outcome.action === "archive") {
+          const archivePath = await archiveCurrentAuditLog();
+          clearRecentActivity();
+          clearCompletedToolHistory();
+          auditHistory = [];
+          messages.length = 0;
+          viewState.selected = 0;
+          viewState.notice = archivePath
+            ? "Active audit log archived safely; current history cleared."
+            : "Current history cleared; no audit file existed.";
+        }
+      } catch (error) {
+        viewState.notice = error instanceof Error ? error.message : String(error);
+      } finally {
+        keyActionInFlight = false;
+        queueRender();
+        const queued = queuedKeys.shift();
+        if (queued && !stopped) setImmediate(() => onKeypress(queued.text, queued.key));
+      }
+    })();
+  };
+  if (keyboardAvailable) {
+    try {
+      emitKeypressEvents(stdin);
+      stdin.setRawMode(true);
+      stdin.on("keypress", onKeypress);
+      stdin.resume();
+      keyboardEnabled = true;
+    } catch {
+      viewState.notice = "Keyboard input unavailable; see Admin UI for controls.";
+    }
+  }
   // The xterm window-size request is optional and is intentionally not sent
   // in auto mode: many Windows terminals ignore it or require user consent.
   const resizeRequest = preferredRows !== null && lastHeight < preferredRows
@@ -882,9 +1034,15 @@ export function startTerminalDashboard(options: DashboardOptions): {
     stopped = true;
     if (timer) clearInterval(timer);
     if (codingLoopTimer) clearInterval(codingLoopTimer);
+    if (listRefreshTimer) clearInterval(listRefreshTimer);
     if (resizeTimer) clearTimeout(resizeTimer);
     unsubscribe();
     process.stdout.off("resize", resize);
+    if (keyboardEnabled) {
+      stdin.off("keypress", onKeypress);
+      try { stdin.setRawMode(previousRawMode); } catch {}
+      if (stdinWasPaused) stdin.pause();
+    }
     process.off("exit", stop);
     setActivityConsoleEnabled(true);
     console.log = original.log;

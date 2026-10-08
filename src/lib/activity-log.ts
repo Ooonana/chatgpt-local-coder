@@ -119,6 +119,11 @@ export function getRecentActivity(limit = 100, sinceId?: string): ActivityEntry[
   return entries.slice(idx + 1).reverse();
 }
 
+/** Clear only the in-process recent feed; the durable audit log is separate. */
+export function clearRecentActivity(): void {
+  entries.length = 0;
+}
+
 function writeConsole(entry: ActivityEntry): void {
   const sid = entry.session_id ? ` session=${entry.session_id.slice(0, 8)}` : "";
   const dur = entry.duration_ms != null ? ` ${entry.duration_ms}ms` : "";

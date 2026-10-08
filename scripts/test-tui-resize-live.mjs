@@ -30,7 +30,7 @@ function restore(key) {
 }
 
 function inspectFrame(chunks, width, height) {
-  const output = chunks.filter((value) => value.includes("Local Coder")).at(-1);
+  const output = chunks.filter((value) => /local coder/i.test(value)).at(-1);
   assert.ok(output, `missing TUI redraw at ${width}x${height}`);
   assert.ok(chunks.some((value) => value.startsWith("\x1b[2J\x1b[H")), "viewport change must clear stale cells");
   const frame = output.replace(/^(?:\x1b\[2J)?\x1b\[H/, "");
