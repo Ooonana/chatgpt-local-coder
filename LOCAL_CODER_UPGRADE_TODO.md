@@ -2,17 +2,60 @@
 
 Workspace: `C:\Users\7ryan\chatgpt-local-coder`
 Persistent task: `8cb9b6c9-c71e-4938-9ee7-4267fed4cec7`
-Last verified: 2026-11-09. QuackStudio and all other repositories excluded.
+Last verified: 2026-11-09 (mid-check after commit f189eea).
+QuackStudio and all other repositories excluded.
 
-`[x]` means verified complete; `[ ]` means pending or partially implemented.
-Use the persistent task's 33 finer-grained plan steps for detailed progress.
+`[x]` means verified complete. An unchecked item is explicitly tagged
+**PARTIAL** or **PENDING**; a passing test does not close broader work.
+The 23 top-level items here differ from the persistent task's 33 finer-grained
+plan steps.
+
+## Mid-check snapshot and priorities (2026-11-09)
+
+- **Persistent task**: 21/33 complete (64%), with 12 steps in progress or
+  pending. This saved plan does not execute autonomously.
+- **High-level checklist**: 12/23 complete, 10 partial, 1 pending.
+- **Mid-audit remediation**: 12/14 complete; historical reconciliation and
+  live restart/connector stress are still open.
+- **Repository**: f189eea on main, four commits ahead of fork/main at review;
+  the machine-specific `profiles/mcp-upstream.json` is uncommitted and must
+  be preserved.
+- **Running MCP**: healthy, b025431 (schema 10), while the latest committed
+  source declares schema 11. A connector refresh alone does not load new code.
+- **Tests at this mid-check**: TypeScript build, Admin UI 7/7, recovery API
+  including 12 concurrent project-isolated requests, npm production audit
+  (0 advisories), and pnpm audit (0 advisories). Full `npm test` and
+  `npm run test:integration` passed in the previous implementation turn,
+  but were not repeated in this mid-check.
+
+### Prioritized next tasks
+
+1. **Safe with other projects active (P2.4/P2.5):** benchmark result bytes
+   and latency; make measured reductions. Refine Admin UI/TUI recovery and
+   operator-approval status using isolated test fixtures.
+2. **Read-only only (P0.4/P2.2):** review Local Coder's own old plans and
+   linked loops. Propose manual reconciliation; never finish, abandon,
+   archive, rollback, delete, or update old records automatically.
+   Other projects' state remains out of scope.
+3. **Pending investigation (P2):** measure unnecessary retries, identify
+   verifiably idempotent steps, and add failure-injection regressions.
+4. **Defer to a maintenance window (P2.6/P3.2/P3.4):** live human Windows
+   approval-dialog test, schema-11 service activation, connector refresh
+   and sustained restart/reconnect stress. Do not interrupt active work.
+
+Do not restart the server, push GitHub commits, touch other repositories,
+alter the user's custom app picture, or modify machine-specific profiles
+during this checklist-only review.
 
 ## P0 — Baseline and reliability
 - [x] Review current code, Git history, and previous unfinished work.
 - [x] Run existing tests and identify regressions.
-- [ ] Fix stale task/loop status and recovery inconsistencies.
+- [ ] **PARTIAL** Fix stale task/loop status and recovery inconsistencies.
   - Done: distinguish saved plans, workers, and manually managed completed coding loops.
-  - Remaining: broader recovery and interruption stress tests.
+  - Done: read-only project-specific review, reopened-step timestamp repair,
+    cross-project mutation guards and Phase 6 regression coverage.
+  - Remaining: manual reconciliation of historical state and live restart /
+    interruption stress. Existing records intentionally remain untouched.
 
 ## P1 — Computer Use 2.0
 - [x] Evaluate and integrate Vercel agent-desktop through native Windows MCP.
@@ -40,7 +83,7 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
   - Admin UI, versioned scope controls, restricted-path protection, regression tests.
 
 ## P2 — Agent orchestration
-- [ ] Improve task recovery after disconnections.
+- [ ] **PARTIAL** Improve task recovery after disconnections.
   - Done: Phase 6 reconnection, process isolation, transaction rollback,
     stale-loop and parallel-batch recovery scenarios pass in the full suite.
   - Done: `agent_task(action=review, workspace=...)` safely classifies stale
@@ -54,50 +97,63 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
     Existing task mutations reject mismatched workspace/project-bound sessions.
   - Remaining: evaluate/manual reconcile actual historic records after evidence
     review; no automatic finishing or deletion of resumable states.
-- [ ] Improve concurrent tasks and worktree isolation.
+- [ ] **PARTIAL** Improve concurrent tasks and worktree isolation.
   - Done: a confirmed cross-project task mutation gap was closed:
     project-bound sessions and explicit workspace selectors must match the
     task's stored project before modifying its state (Phase 6 regression).
-- [ ] Reduce failed-step retries and redundant operations.
+  - Remaining: sustained concurrency and worktree-collision testing with
+    disposable fixtures rather than live user projects.
+- [ ] **PENDING** Reduce failed-step retries and redundant operations.
+  - Next: quantify redundant attempts and add safe-retry tests. Never replay
+    uncertain side effects without clear idempotency evidence.
 
 ## P2 — Performance and interface
-- [ ] Reduce tool response size and context usage.
+- [ ] **PARTIAL** Reduce tool response size and context usage.
   - Done: MCP tools/list pagination correctly discovers 156 agent-browser tools
     without exposing them to ChatGPT; bounded, deduplicated, cached discovery.
     Measured 157 ms cold / approximately 0 ms warm cache lookup on Windows;
     default ChatGPT profile still advertises only 42 native tools.
-- [ ] Improve Admin UI and terminal dashboard.
+  - Remaining: measure representative response sizes and latency, establish
+    a baseline, then verify improvements against that baseline.
+- [ ] **PARTIAL** Improve Admin UI and terminal dashboard.
   - Done: Admin UI computer-use preset and Skills management panels.
   - Done: Project-scoped, read-only recovery review panel and Admin API;
     it requires explicit workspace selection and never auto-scans other
     projects. Includes separate stale tasks, loops, transaction counts,
     suggested manual actions and incomplete-scan warnings.
-- [ ] Add clearer diagnostics, task progress, and logs.
+  - Remaining: fuller TUI parity, approval policy/status and clearer saved
+    plan versus running worker labeling.
+- [ ] **PARTIAL** Add clearer diagnostics, task progress, and logs.
   - Done: task versus worker execution-status diagnostics.
   - Done: Admin recovery report displays status/links without exposing
     captured file paths or offering destructive lifecycle controls.
+  - Remaining: review operator-facing logs and error recovery guidance after
+    reconnects and failed tool calls.
 
 ## P2 — Security
-- [ ] Add per-tool permissions and sensitive-action confirmation.
+- [ ] **PARTIAL** Add per-tool permissions and sensitive-action confirmation.
   - Done: unsafe-runtime gating, explicit input opt-in, restricted command allowlist.
   - Done: conservative write/unsafe-runtime restriction on direct MCP proxies,
     overriding untrusted upstream readOnlyHint annotations; default Windows
     operator approval for sensitive computer-use actions with scoped 90s leases.
   - Remaining: live human UI approval verification and confirmation policy UX;
     unrestricted shell access is outside the security boundary.
-- [ ] Improve logging, secrets protection, and computer-use safeguards.
+- [ ] **PARTIAL** Improve logging, secrets protection, and computer-use safeguards.
   - Done: audit entries, browser protocol restrictions, snapshot verification.
+  - Remaining: more failure-oriented redaction testing and a live human test
+    of the Windows approval prompt at an agreed maintenance window.
 
 ## P3 — Final verification
-- [ ] Run full regression and reconnect stress tests.
+- [ ] **PARTIAL** Run full regression and reconnect stress tests.
   - Done: updated full npm test (exit 0; Phase 6 28/28), MCP integration
     (exit 0), isolated live desktop, Chrome and Electron reconnect checks.
   - Remaining: end-to-end service restart and sustained connector stress.
 - [x] Review changes, update documentation, and create local commits.
   - Source edits, README/AGENTS, tests and checklist committed locally (no push).
-- [ ] Verify repository and runtime status before handoff.
-  - Running MCP service still uses an earlier build; latest source schema
-    contract version is 10. Controlled restart and connector refresh required.
+- [ ] **PARTIAL** Verify repository and runtime status before handoff.
+  - Running MCP service uses b025431 / schema 10; latest committed source
+    f189eea declares schema 11. Controlled restart and connector refresh
+    are required before the new Admin recovery panel is actually deployed.
 
 ### Operation notes
 
