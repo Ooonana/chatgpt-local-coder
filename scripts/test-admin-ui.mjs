@@ -96,5 +96,23 @@ test("responsive UI keeps dedicated mobile layouts", () => {
   if (!css.includes("@media (max-width: 460px)")) throw new Error("missing compact mobile breakpoint");
 });
 
+test("project recovery UI only loads data on explicit review", () => {
+  for (const id of ["recovery-workspace", "recovery-stale-hours", "recovery-review-btn", "recovery-review-results"]) {
+    if (!html.includes('id="' + id + '"')) throw new Error("Missing recovery element: " + id);
+  }
+  if (!js.includes("async function reviewProjectRecovery()")) {
+    throw new Error("Project-scoped recovery UI handler is missing");
+  }
+  if (!js.includes("new URLSearchParams({ workspace, stale_hours: hours })")) {
+    throw new Error("Recovery review lacks explicit workspace and age parameters");
+  }
+  if (!js.includes("esc(label)") || !js.includes("esc(suggested)")) {
+    throw new Error("Recovery entries are not escaped before HTML rendering");
+  }
+  if (!html.includes("Read-only") || html.includes('id="recovery-delete-btn"')) {
+    throw new Error("Recovery panel must remain explicitly read-only");
+  }
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

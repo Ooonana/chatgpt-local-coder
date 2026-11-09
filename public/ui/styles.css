@@ -116,6 +116,13 @@ body {
   background: rgba(255,255,255,0.025);
 }
 .runtime-chip.subtle { color: var(--muted); }
+.recovery-summary { padding: 0.8rem 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.recovery-summary .muted { margin-top: 0.3rem; }
+.recovery-group { padding: 0.7rem 0; border-bottom: 1px solid var(--border); }
+.recovery-group h3 { margin: 0 0 0.5rem; font-size: 0.86rem; font-weight: 600; }
+.recovery-entry { padding: 0.65rem 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.recovery-entry strong { font-size: 0.84rem; }
+.recovery-entry .muted { margin-top: 0.25rem; font-size: 0.75rem; }
 .status-dot {
   width: 0.55rem;
   height: 0.55rem;

@@ -530,6 +530,72 @@ async function loadProject() {
     preview.preview + (preview.truncated ? "\n\n… (truncated)" : "");
 }
 
+async function reviewProjectRecovery() {
+  const projectField = document.getElementById("recovery-workspace");
+  const workspace = projectField.value.trim();
+  if (!workspace) {
+    projectField.focus();
+    throw new Error("Enter one project workspace before requesting a recovery review");
+  }
+  const hours = document.getElementById("recovery-stale-hours").value;
+  const output = document.getElementById("recovery-review-results");
+  const button = document.getElementById("recovery-review-btn");
+  button.disabled = true;
+  output.textContent = "Reading saved records in the selected workspace only…";
+  try {
+    const params = new URLSearchParams({ workspace, stale_hours: hours });
+    const result = await api("/api/recovery/review?" + params.toString());
+    const counts = result.counts || {};
+    const groups = [
+      ["Active or blocked plans", result.findings || [], "tasks"],
+      ["Active coding loops", result.stale_loops || [], "coding_loops"],
+      ["Active edit transactions", result.stale_transactions || [], "edit_transactions"],
+    ];
+    const renderEntry = (row, type) => {
+      const identifier = row.id || "Unknown record";
+      const label = type === "tasks" ? row.title || identifier : identifier;
+      const info = [
+        row.status,
+        row.phase,
+        Number.isFinite(row.age_hours) ? row.age_hours + "h old" : null,
+        type === "tasks" && row.execution?.linked_loop
+          ? "loop " + row.execution.linked_loop.status : null,
+        type === "edit_transactions" ? (row.files || 0) + " files, " + (row.edits || 0) + " edits" : null,
+        type === "coding_loops" && row.transaction_status ? "transaction " + row.transaction_status : null,
+      ].filter(Boolean).join(" · ");
+      const suggested = String(row.suggested_action || "inspect_manually").replaceAll("_", " ");
+      return '<div class="recovery-entry">' +
+        '<strong>' + esc(label) + '</strong>' +
+        '<div class="muted">' + esc(identifier) + '</div>' +
+        '<div class="muted">' + esc(info) + '</div>' +
+        '<div class="muted">Suggested: ' + esc(suggested) + '</div>' +
+        '</div>';
+    };
+    output.innerHTML = '<div class="recovery-summary">' +
+      '<strong>' + esc(result.workspace || workspace) + '</strong>' +
+      '<div class="muted">' + Number(counts.tasks || 0) + ' stale tasks · ' +
+        Number(counts.coding_loops || 0) + ' stale loops · ' +
+        Number(counts.edit_transactions || 0) + ' stale transactions</div>' +
+      '<div class="muted">Read-only review. No records were modified.</div>' +
+      '</div>' +
+      groups.map(([heading, entries, type]) =>
+        '<div class="recovery-group"><h3>' + esc(heading) + '</h3>' +
+        (entries.length ? entries.map((row) => renderEntry(row, type)).join("") :
+          '<div class="muted">No matching stale records.</div>') +
+        (result.truncated?.[type] ? '<div class="muted">Additional results omitted by the review limit.</div>' : '') +
+        '</div>'
+      ).join("") +
+      (result.source_limits?.potentially_incomplete
+        ? '<div class="runtime-alert">Source scan limit reached. This review may be incomplete.</div>'
+        : '');
+  } catch (error) {
+    output.textContent = "Recovery review failed: " + error.message;
+    throw error;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function loadServers() {
   const health = await api("/health");
   const cfg = await api("/api/upstream");
@@ -1017,6 +1083,8 @@ document.getElementById("activity-clear").addEventListener("click", () => {
 document.getElementById("add-server").addEventListener("click", () => openServerDialog(null));
 document.getElementById("skills-refresh").addEventListener("click", () => loadSkills().catch((err) => toast(err.message, true)));
 document.getElementById("skills-control-scope").addEventListener("change", () => loadSkills().catch((err) => toast(err.message, true)));
+document.getElementById("recovery-review-btn").addEventListener("click", () =>
+  reviewProjectRecovery().catch((err) => toast(err.message, true)));
 document.getElementById("add-computer-use-presets").addEventListener("click", async () => {
   try {
     const result = await api("/api/upstream/presets/computer-use", { method: "POST" });

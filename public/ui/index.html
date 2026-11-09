@@ -189,6 +189,24 @@
 
       <section id="project" class="view">
         <div class="panel">
+          <div class="panel-head">
+            <h2>Workspace recovery review</h2>
+            <button type="button" class="btn ghost" id="recovery-review-btn">Review records</button>
+          </div>
+          <p class="muted">Read-only. Select one project explicitly. No tasks, loops, or transactions will be changed.</p>
+          <div class="inline-form">
+            <input type="text" id="recovery-workspace" aria-label="Workspace path to review" placeholder="Project path (required)" autocomplete="off" />
+            <select id="recovery-stale-hours" aria-label="Minimum inactive age">
+              <option value="24">Older than 24h</option>
+              <option value="168">Older than 7 days</option>
+              <option value="720">Older than 30 days</option>
+            </select>
+          </div>
+          <div id="recovery-review-results" class="runtime-list" aria-live="polite">
+            <div class="muted">Enter a workspace and choose Review records. Nothing has been scanned.</div>
+          </div>
+        </div>
+        <div class="panel">
           <div class="panel-head"><h2>MCP instructions (ChatGPT context)</h2></div>
           <p class="muted">Content injected into each MCP session — CLAUDE.md, Git state, and agent instructions.</p>
           <div id="project-meta" class="stat-grid"></div>

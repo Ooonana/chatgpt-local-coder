@@ -41,6 +41,7 @@ import { getPersistentAuditMetrics } from "../lib/audit-metrics.js";
 import { getRuntimeIdentity } from "../lib/runtime-identity.js";
 import { getProjectAffinity } from "../lib/project-affinity.js";
 import { getAgentTaskProgress, listAgentTasks } from "../lib/agent-task-store.js";
+import { buildWorkspaceRecoveryReview } from "../lib/recovery-review.js";
 import { listOperationHistory } from "../lib/operation-store.js";
 import { listEditTransactions } from "../lib/edit-transaction-store.js";
 import { getCodingLoopStateErrors, listCodingLoops } from "../lib/coding-loop-store.js";
@@ -229,6 +230,50 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         heap_total_bytes: memory.heapTotal,
       },
     });
+  });
+
+  router.get("/api/recovery/review", async (req, res) => {
+    // Require explicit workspace selection: a project recovery report must
+    // never silently show other ongoing projects or change durable records.
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const requested = req.query.workspace;
+      if (typeof requested !== "string" || !requested.trim() || requested.length > 4000) {
+        res.status(400).json({ ok: false, error: "Explicit workspace path required for recovery review" });
+        return;
+      }
+      const workspace = await validatePath(requested);
+      if (req.query.stale_hours !== undefined && typeof req.query.stale_hours !== "string") {
+        res.status(400).json({ ok: false, error: "stale_hours must be a single numeric value" });
+        return;
+      }
+      const hoursValue = req.query.stale_hours === undefined ? 24 : Number(req.query.stale_hours);
+      if (!Number.isFinite(hoursValue) || hoursValue < 1 || hoursValue > 720) {
+        res.status(400).json({ ok: false, error: "stale_hours must be between 1 and 720" });
+        return;
+      }
+      const [tasks, loops, transactions] = await Promise.all([
+        listAgentTasks(),
+        listCodingLoops(100),
+        listEditTransactions(500),
+      ]);
+      const review = buildWorkspaceRecoveryReview({
+        workspace, tasks, loops, transactions,
+        workers: getManagedProcessSnapshot(),
+        staleHours: hoursValue,
+      });
+      res.json({
+        ok: true,
+        ...review,
+        source_limits: {
+          coding_loops: 100,
+          edit_transactions: 500,
+          potentially_incomplete: loops.length >= 100 || transactions.length >= 500,
+        },
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   router.get("/api/instructions/preview", (_req, res) => {

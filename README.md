@@ -165,6 +165,17 @@ step is reopened, its old `completed_at` timestamp is cleared; older records
 with that inconsistency are normalized in memory without rewriting their
 historical files simply because they were read.
 
+The Admin UI's **Project → Workspace recovery review** panel exposes the same
+project-scoped, read-only status through
+`GET /api/recovery/review?workspace=<project-path>&stale_hours=24`.
+The panel requires you to enter a project path and press **Review records**;
+it never polls other projects or changes a task, loop or transaction.
+The response contains bounded record summaries, no snapshot payload paths,
+and `source_limits.potentially_incomplete` when a store scan reached its cap.
+The endpoint is covered by the normal localhost/Admin authentication controls.
+Run `node scripts/test-admin-recovery.mjs` for isolated API isolation and
+concurrent-request tests; no live durable records are used by that test.
+
 Additional optional Windows checks:
 `node scripts/test-desktop-mcp-live.mjs` creates a disposable WinForms window,
 verifies its control ref and a real click, then closes it.

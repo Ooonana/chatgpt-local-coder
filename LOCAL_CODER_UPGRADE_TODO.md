@@ -68,8 +68,14 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
     default ChatGPT profile still advertises only 42 native tools.
 - [ ] Improve Admin UI and terminal dashboard.
   - Done: Admin UI computer-use preset and Skills management panels.
+  - Done: Project-scoped, read-only recovery review panel and Admin API;
+    it requires explicit workspace selection and never auto-scans other
+    projects. Includes separate stale tasks, loops, transaction counts,
+    suggested manual actions and incomplete-scan warnings.
 - [ ] Add clearer diagnostics, task progress, and logs.
   - Done: task versus worker execution-status diagnostics.
+  - Done: Admin recovery report displays status/links without exposing
+    captured file paths or offering destructive lifecycle controls.
 
 ## P2 — Security
 - [ ] Add per-tool permissions and sensitive-action confirmation.
