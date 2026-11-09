@@ -44,7 +44,13 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
   - Done: Phase 6 reconnection, process isolation, transaction rollback,
     stale-loop and parallel-batch recovery scenarios pass in the full suite.
   - Done: `agent_task(action=review, workspace=...)` safely classifies stale
-    plans and linked workers/loops without changing records or other projects.
+    plans, linked workers/loops, and old active edit transactions without
+    changing records or other projects. Reports include link/scan diagnostics,
+    never transaction snapshot contents.
+  - Done: reopened task steps no longer retain a stale completion timestamp;
+    historical records are normalized in memory without rewriting on read.
+  - Done: linked transactions in isolated worktrees are included only when
+    linked to a coding loop owned by the selected source project.
     Existing task mutations reject mismatched workspace/project-bound sessions.
   - Remaining: evaluate/manual reconcile actual historic records after evidence
     review; no automatic finishing or deletion of resumable states.

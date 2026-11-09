@@ -11,6 +11,7 @@ import {
   updateAgentTaskStep,
 } from "../dist/lib/agent-task-store.js";
 import { summarizeTaskActivity } from "../dist/lib/task-activity.js";
+import { buildWorkspaceRecoveryReview } from "../dist/lib/recovery-review.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -45,6 +46,71 @@ await run("task status distinguishes saved plans, linked loops, and live workers
   }
   const mismatch = summarizeTaskActivity(source, [{ id: "loop-c", task_id: "task-a", status: "completed", managed_task: true }], []);
   if (!mismatch.explanation.includes("reconciliation")) throw new Error("missed managed-task lifecycle mismatch");
+});
+
+await run("recovery review isolates project records without exposing captured file contents", async () => {
+  const age = 48 * 3_600_000;
+  const now = Date.now();
+  const stale = new Date(now - age).toISOString();
+  const project = path.join(root, "fixture-project");
+  const other = path.join(root, "other-project");
+  const own = {
+    id: "owned-task", title: "Inspect state", objective: "Never auto-delete",
+    workspace: project, status: "active", updated_at: stale,
+    plan: ["inspect"], steps: [{ id: "s", title: "inspect", status: "pending", updated_at: stale }],
+    notes: [], created_at: stale,
+  };
+  const foreign = { ...own, id: "foreign-task", workspace: other };
+  const loop = {
+    id: "loop_owned", workspace: project, source_workspace: project,
+    status: "active", phase: "editing", task_id: own.id,
+    transaction_id: "tx_owned", updated_at: stale,
+  };
+  const foreignLoop = { ...loop, id: "loop_foreign", source_workspace: other,
+    workspace: other, task_id: foreign.id, transaction_id: "tx_foreign" };
+  const tx = {
+    id: "tx_owned", workspace: project, status: "active", updated_at: stale,
+    snapshots: [{ path: "SECRET_CAPTURED_FILE_NAME" }], edits: [{ paths: ["SECRET_EDIT"] }],
+  };
+  const foreignTx = { ...tx, id: "tx_foreign", workspace: other };
+  const records = { tasks: [own, foreign], loops: [loop, foreignLoop], transactions: [tx, foreignTx] };
+  const original = JSON.stringify(records);
+  const review = buildWorkspaceRecoveryReview({
+    workspace: project, ...records, workers: [], staleHours: 24, now,
+  });
+  if (review.counts.tasks !== 1 || review.counts.coding_loops !== 1 ||
+      review.counts.edit_transactions !== 1) throw new Error(JSON.stringify(review));
+  if (review.stale_transactions[0].suggested_action !== "inspect_active_loop_before_transaction_changes") {
+    throw new Error("Review did not link active loop to its open transaction");
+  }
+  if (JSON.stringify(review).includes("SECRET") || JSON.stringify(review).includes("foreign-task")) {
+    throw new Error("Review leaked another project or transaction snapshot contents");
+  }
+  const chosen = buildWorkspaceRecoveryReview({
+    workspace: project, ...records, workers: [], staleHours: 24, now, taskId: "other-task",
+  });
+  if (chosen.counts.tasks || chosen.counts.coding_loops || chosen.counts.edit_transactions) {
+    throw new Error("Review ignored explicit task selection");
+  }
+  const worktree = path.join(root, "temporary-worktree-for-fixture");
+  const isolatedLoop = {
+    ...loop, id: "loop_isolated", workspace: worktree,
+    transaction_id: "tx_isolated", task_id: own.id,
+  };
+  const isolatedTransaction = {
+    ...tx, id: "tx_isolated", workspace: worktree, snapshots: [], edits: [],
+  };
+  const withWorktree = buildWorkspaceRecoveryReview({
+    workspace: project, tasks: [own, foreign],
+    loops: [isolatedLoop, foreignLoop],
+    transactions: [isolatedTransaction, foreignTx],
+    workers: [], staleHours: 24, now,
+  });
+  if (withWorktree.counts.edit_transactions !== 1 ||
+      withWorktree.stale_transactions[0].id !== "tx_isolated") {
+    throw new Error("The isolated project worktree transaction was lost or a foreign one leaked");
+  }
+  if (JSON.stringify(records) !== original) throw new Error("Read-only review modified source objects");
 });
 
 await fs.rm(stateDir, { recursive: true, force: true });
@@ -86,6 +152,12 @@ await run("structured plan step progress and resume", async () => {
   let updated = await updateAgentTaskStep(task.id, { step_index: 0 }, { status: "in_progress", note: "reproducing" });
   if (updated.steps[0].status !== "in_progress") throw new Error(JSON.stringify(updated.steps[0]));
   updated = await updateAgentTaskStep(task.id, { step_index: 0 }, { status: "completed", note: "reproduced" });
+  if (!updated.steps[0].completed_at) throw new Error("Completed step missing completion timestamp");
+  updated = await updateAgentTaskStep(task.id, { step_index: 0 }, { status: "in_progress" });
+  if (updated.steps[0].completed_at !== undefined) {
+    throw new Error("Reopened step incorrectly retains completed_at");
+  }
+  updated = await updateAgentTaskStep(task.id, { step_index: 0 }, { status: "completed" });
   updated = await updateAgentTaskStep(task.id, { step_index: 1 }, { status: "in_progress" });
   const progress = getAgentTaskProgress(updated);
   if (progress.completed !== 1 || progress.current_step?.title !== "inspect logs") throw new Error(JSON.stringify(progress));
@@ -127,6 +199,41 @@ await run("v1 task index migrates to structured plan", async () => {
   } finally {
     process.env.MCP_AGENT_TASK_STATE_DIR = previous;
     await fs.rm(legacyDir, { recursive: true, force: true });
+  }
+});
+
+await run("stale completion timestamps normalize on read without rewriting historic state", async () => {
+  const fixtureDir = path.join(root, ".tool-test-tmp", "agent-task-reopened-v2");
+  await fs.rm(fixtureDir, { recursive: true, force: true });
+  await fs.mkdir(fixtureDir, { recursive: true });
+  const now = new Date().toISOString();
+  const file = path.join(fixtureDir, "index.json");
+  const original = JSON.stringify({
+    version: 2,
+    tasks: [{
+      id: "legacy-reopened", title: "Legacy reopened", objective: "test",
+      workspace: root, status: "active", plan: ["reopen"],
+      steps: [{
+        id: "one", title: "reopen", status: "in_progress",
+        started_at: now, completed_at: now, updated_at: now,
+      }],
+      notes: [], created_at: now, updated_at: now,
+    }],
+  });
+  await fs.writeFile(file, original, "utf8");
+  const previous = process.env.MCP_AGENT_TASK_STATE_DIR;
+  process.env.MCP_AGENT_TASK_STATE_DIR = fixtureDir;
+  try {
+    const fetched = await getAgentTask("legacy-reopened");
+    if (fetched?.steps[0]?.completed_at !== undefined) {
+      throw new Error("Legacy reopened step still reports completed_at");
+    }
+    if (await fs.readFile(file, "utf8") !== original) {
+      throw new Error("Read-only historical normalization rewrote the original index");
+    }
+  } finally {
+    process.env.MCP_AGENT_TASK_STATE_DIR = previous;
+    await fs.rm(fixtureDir, { recursive: true, force: true });
   }
 });
 

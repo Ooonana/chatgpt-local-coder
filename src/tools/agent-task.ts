@@ -24,7 +24,8 @@ import {
 import { sameResolvedPath } from "../lib/path-identity.js";
 import { getManagedProcessSnapshot } from "./shell.js";
 import { listCodingLoops } from "../lib/coding-loop-store.js";
-import { summarizeTaskActivity } from "../lib/task-activity.js";
+import { listEditTransactions } from "../lib/edit-transaction-store.js";
+import { buildWorkspaceRecoveryReview } from "../lib/recovery-review.js";
 
 const statusSchema = z.enum(["active", "blocked", "completed", "cancelled", "abandoned", "archived"]);
 const stepStatusSchema = z.enum(["pending", "in_progress", "completed", "blocked", "skipped"]);
@@ -86,30 +87,29 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
         const records = (await listAgentTasks())
           .filter((task) => sameResolvedPath(task.workspace, resolvedWorkspace) && (!id || task.id === id));
         if (id && !records.length) throw new Error("Task id does not belong to the requested workspace");
-        const [loops, workers] = [await listCodingLoops(500), getManagedProcessSnapshot()];
-        const now = Date.now();
-        const matches = records.filter((task) => ["active", "blocked"].includes(task.status) &&
-          Number.isFinite(Date.parse(task.updated_at)) &&
-          now - Date.parse(task.updated_at) >= stale_hours * 3_600_000);
-        const findings = matches.map((task) => {
-          const activity = summarizeTaskActivity(task, loops, workers);
-          const completeLoop = activity.linked_loop?.status === "completed";
-          return {
-            id: task.id, title: task.title, status: task.status, updated_at: task.updated_at,
-            age_hours: Math.round((now - Date.parse(task.updated_at)) / 360_000) / 10,
-            progress: getAgentTaskProgress(task), execution: activity,
-            suggested_action: activity.running_worker_count > 0 ? "inspect_running_worker" :
-              completeLoop ? "inspect_and_finish_manually" :
-              activity.linked_loop?.status === "active" ? "resume_loop_or_explicitly_abandon" :
-              "resume_or_mark_blocked_with_reason",
-            auto_modified: false,
-          };
+        // Review reports only the requested workspace, never mutates global
+        // task/loop/transaction stores, and never infers stale = disposable.
+        const [loops, transactions] = await Promise.all([
+          listCodingLoops(100),
+          listEditTransactions(500),
+        ]);
+        const review = buildWorkspaceRecoveryReview({
+          workspace: resolvedWorkspace,
+          tasks: records,
+          loops,
+          transactions,
+          workers: getManagedProcessSnapshot(),
+          staleHours: stale_hours,
+          taskId: id,
         });
         return toolResult("agent_task", {
-          action, workspace: resolvedWorkspace, threshold_hours: stale_hours,
-          findings: findings.slice(0, 50), count: findings.length,
-          note: "Read-only review. No task, loop, transaction, or project state was modified.",
-        }, { summary: `Review: ${findings.length} stale task(s) in ${resolvedWorkspace}; nothing changed` });
+          action, ...review,
+          source_limits: {
+            coding_loops: 100,
+            edit_transactions: 500,
+            potentially_incomplete: loops.length >= 100 || transactions.length >= 500,
+          },
+        }, { summary: `Review: ${review.counts.tasks} task(s), ${review.counts.coding_loops} loop(s), ${review.counts.edit_transactions} transaction(s) in ${resolvedWorkspace}; nothing changed` });
       }
 
       if (action === "resume") {

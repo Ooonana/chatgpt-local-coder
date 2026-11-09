@@ -145,12 +145,25 @@ the approved native read-only integration instead.
 ### Reviewing stale task records
 
 Use `agent_task(action="review", workspace="C:\\path\\to\\project", stale_hours=24)`
-to identify old active/blocked plans, their linked coding loops, active
-workers, and suggested manual recovery action. Review is strictly read-only:
+to identify old active/blocked plans, active coding loops, and active edit
+transactions in **only that workspace**. The report includes linked loop and
+transaction status, registered workers, record counts, and suggested manual
+recovery actions. It does not expose transaction snapshot contents, and a
+stale record is not automatically considered disposable. Pass a task `id` to
+inspect only that task and its linked loop/transaction; omit it to include
+standalone transactions in the workspace. Review is strictly read-only:
 it never marks a task complete, deletes transactions, or edits other projects.
+An isolated worktree transaction is included only when it is explicitly linked
+to a coding loop belonging to the selected source project and its transaction
+workspace matches that loop's worktree exactly. Unrelated worktree records are
+excluded.
+Listings have explicit scan and output limits, reported in `source_limits`.
 Explicit task updates now validate an optional `workspace` against the task's
 stored project and reject cross-project mutations from project-bound MCP
-sessions. Task state is not an autonomous worker.
+sessions. Task state is not an autonomous worker. When a completed checklist
+step is reopened, its old `completed_at` timestamp is cleared; older records
+with that inconsistency are normalized in memory without rewriting their
+historical files simply because they were read.
 
 Additional optional Windows checks:
 `node scripts/test-desktop-mcp-live.mjs` creates a disposable WinForms window,

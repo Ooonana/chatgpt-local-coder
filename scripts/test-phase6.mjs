@@ -82,6 +82,8 @@ await test("stale task review is read-only and task mutation enforces project ow
     title: "Separate workspace-B task", objective: "must remain untouched", workspace: projectB,
     plan: ["unrelated work"],
   });
+  const txA = await transactions.beginEditTransaction(projectA, "Read-only review A");
+  const txB = await transactions.beginEditTransaction(projectB, "Read-only review B");
   const client = await openMcp("phase6-stale-task-review", projectA);
   try {
     let result = await client.call("agent_task", {
@@ -102,8 +104,28 @@ await test("stale task review is read-only and task mutation enforces project ow
     assert.equal(result.structuredContent.data.count, 1);
     assert.equal(result.structuredContent.data.findings[0].id, taskA.id);
     assert.equal(result.structuredContent.data.findings[0].auto_modified, false);
+    assert.equal(result.structuredContent.data.counts.coding_loops, 0);
+    assert.equal(result.structuredContent.data.counts.edit_transactions, 0,
+      "Task-id review must not include unrelated standalone transactions");
     assert.equal((await tasks.getAgentTask(taskA.id))?.status, "active");
     assert.equal((await tasks.getAgentTask(taskB.id))?.status, "active");
+    const originalNowAgain = Date.now;
+    try {
+      Date.now = () => originalNowAgain() + 2 * 60 * 60 * 1000;
+      result = await client.call("agent_task", {
+        action: "review", workspace: projectA, stale_hours: 1,
+      });
+    } finally {
+      Date.now = originalNowAgain;
+    }
+    assert.equal(result.structuredContent?.ok, true);
+    assert.equal(result.structuredContent.data.counts.edit_transactions, 1);
+    assert.equal(result.structuredContent.data.stale_transactions[0].id, txA.id);
+    assert.equal(result.structuredContent.data.stale_transactions[0].auto_modified, false);
+    assert.equal((await transactions.getEditTransaction(txA.id)).status, "active");
+    assert.equal((await transactions.getEditTransaction(txB.id)).status, "active");
+    assert.ok(!JSON.stringify(result.structuredContent).includes(txB.id),
+      "Cross-workspace transaction leaked in task review");
 
     result = await client.call("agent_task", {
       action: "update", id: taskB.id, workspace: projectA, note: "should not appear",
@@ -762,7 +784,7 @@ await test("tunnel diagnostics redact MCP and API secrets", async () => {
 });
 
 await test("Phase 6 schema/tool budget contract is explicit", async () => {
-  assert.equal(SCHEMA_CONTRACT_VERSION, 10);
+  assert.equal(SCHEMA_CONTRACT_VERSION, 11);
   // Keep a bounded tool-schema budget, with room for the two opt-in computer-use tools.
   assert.ok(SLIM_CHATGPT_TOOLS.size <= 44, `slim tools=${SLIM_CHATGPT_TOOLS.size}`);
 });

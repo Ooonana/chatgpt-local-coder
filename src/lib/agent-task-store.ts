@@ -111,6 +111,13 @@ function normalizeV2(index: AgentTaskIndexV2): AgentTaskIndexV2 {
     if (!Array.isArray(task.steps)) {
       task.steps = task.plan.map((title) => newStep(title, task.updated_at || new Date().toISOString()));
     }
+    // Earlier releases left a completion timestamp when a step reopened.
+    // Correct the in-memory view without rewriting historic files on read.
+    for (const step of task.steps) {
+      if (step.status !== "completed" && step.status !== "skipped") {
+        delete step.completed_at;
+      }
+    }
   }
   return index;
 }
@@ -318,7 +325,9 @@ export async function updateAgentTaskStep(
     if (updates.note?.trim()) step.note = updates.note.trim();
     if (updates.status === "in_progress" && !step.started_at) step.started_at = now;
     if (updates.status === "completed" || updates.status === "skipped") step.completed_at = now;
-    if (updates.status === "pending" || updates.status === "blocked") step.completed_at = undefined;
+    if (updates.status !== "completed" && updates.status !== "skipped") {
+      delete step.completed_at;
+    }
     if (task.steps.some((candidate) => candidate.status === "blocked")) task.status = "blocked";
     else if (task.status === "blocked") task.status = "active";
     task.updated_at = now;
