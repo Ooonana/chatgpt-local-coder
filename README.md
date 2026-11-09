@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="public/ui/assets/local-coder-icon.png" alt="Local Coder icon" width="96" height="96" />
+
 # ChatGPT Local Coder
 
 **Turn the ChatGPT app into a local coding agent — files, shell, git, patches, and extensible MCP tools.**

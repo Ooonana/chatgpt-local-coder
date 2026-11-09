@@ -504,6 +504,13 @@ export function createMcpServer(
     {
       name: "chatgpt-local-coder",
       version: "2.0.0",
+      title: "Local Coder",
+      description: "Local coding, terminal, Git, and guarded computer automation through ChatGPT.",
+      icons: [{
+        src: "https://raw.githubusercontent.com/Ooonana/chatgpt-local-coder/main/public/ui/assets/local-coder-icon.png",
+        mimeType: "image/png",
+        sizes: ["96x96"],
+      }],
     },
     {
       capabilities: {

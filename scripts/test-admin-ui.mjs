@@ -6,6 +6,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const html = fs.readFileSync(path.join(root, "public/ui/index.html"), "utf8");
 const js = fs.readFileSync(path.join(root, "public/ui/app.js"), "utf8");
 const css = fs.readFileSync(path.join(root, "public/ui/styles.css"), "utf8");
+const icon = fs.readFileSync(path.join(root, "public/ui/assets/local-coder-icon.png"));
 
 let passed = 0;
 let failed = 0;
@@ -30,6 +31,15 @@ function declaredUiIds() {
 test("Admin UI JavaScript parses", () => {
   // Parsing only: the browser globals are intentionally not executed in Node.
   new Function(js);
+});
+
+test("Local Coder icon is a valid PNG and is referenced in Admin UI", () => {
+  if (!icon.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    throw new Error("invalid PNG signature");
+  }
+  if (!html.includes('rel="icon"') || !html.includes('class="brand-mark"')) {
+    throw new Error("icon missing from UI branding");
+  }
 });
 
 test("literal getElementById references exist in HTML", () => {

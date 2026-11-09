@@ -43,7 +43,7 @@ body {
 }
 
 .brand { display: flex; gap: 0.65rem; align-items: center; padding: 0 0.5rem 1.25rem; }
-.brand-mark { color: var(--text); font-size: 1.1rem; }
+.brand-mark { width: 34px; height: 34px; border-radius: 9px; object-fit: cover; flex: 0 0 auto; }
 .brand-title { font-weight: 600; font-size: 0.95rem; letter-spacing: 0.02em; }
 .brand-sub { font-size: 0.72rem; color: var(--muted); margin-top: 0.1rem; }
 
