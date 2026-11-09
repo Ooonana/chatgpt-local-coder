@@ -70,7 +70,6 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
   - Done: updated full npm test (exit 0; Phase 6 27/27), MCP integration
     (exit 0), isolated live desktop, Chrome and Electron reconnect checks.
   - Remaining: end-to-end service restart and sustained connector stress.
-  - Remaining: end-to-end service restart and extended stress scenarios.
 - [x] Review changes, update documentation, and create local commits.
   - Source edits, README/AGENTS, tests and checklist committed locally (no push).
 - [ ] Verify repository and runtime status before handoff.
@@ -87,3 +86,30 @@ The other seven existing provider entries were preserved.
 Never mistake `agent_task.status=active` for autonomous execution.
 Do not restart the running MCP service during a live ChatGPT connector session.
 Do not push without explicit request.
+
+## Mid-audit remediation checklist (2026-11-09)
+
+- [x] Close the full-profile `mcp_call` bypass of disabled, `none`,
+  `meta_only` and per-tool allowlist restrictions.
+- [x] Report upstream `structuredContent.ok=false`, nested errors and
+  JSON-text failure results as failures instead of success.
+- [x] Require writes to be enabled for generic mutating `mcp_call`.
+- [x] Bind desktop `ref_id` actions to a recently observed window ID,
+  rejecting mismatched or stale refs before any input; clear refs after input.
+- [x] Verify same-window desktop clicks and screenshot fallback using a
+  disposable WinForms fixture (no existing user apps touched).
+- [x] Fix quoted/folded YAML skill frontmatter and limit skill file reads.
+- [x] Replace whole-file Skills UI toggles with serialized single-name updates.
+- [x] Apply compatible npm security updates (7 advisories to 0) and raise the
+  minimum direct Zod version.
+- [x] Synchronize the alternate pnpm lockfile, constrain the vulnerable
+  transitive packages and fix its additional critical proxy-addr advisory.
+  Both npm and pnpm audits now report zero known vulnerabilities.
+- [ ] Independently enforce user approval for sensitive desktop/browser
+  actions; `allow_input=true` alone does not establish human consent.
+- [ ] Implement scope-safe reconciliation of old tasks/loops/transactions;
+  never purge unrelated projects or intentionally resumable records.
+- [ ] Stress-test service-level restart and ChatGPT connector refresh.
+
+These repairs do not automatically complete the broader P0/P2/P3 roadmap.
+Always recheck Git status and the persistent 33-step task after an increment.

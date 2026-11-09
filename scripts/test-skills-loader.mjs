@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  getSkillControls, saveSkillControls, loadProjectSkills, loadProjectSkill,
+  getSkillControls, saveSkillControls, setSkillEnabled, loadProjectSkills, loadProjectSkill,
 } from "../dist/lib/skills-loader.js";
 
 const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "local-coder-skills-"));
@@ -26,6 +26,26 @@ try {
   await add(path.join(project, ".claude", "skills"), "priority", "Should be shadowed");
   await add(path.join(project, ".codex", "skills"), "codex-skill", "Codex project skill");
   await add(path.join(project, ".agents", "skills", "group"), "nested-skill", "Nested skill");
+  await add(path.join(project, ".agents", "skills"), "quoted", "Placeholder");
+  await fs.writeFile(path.join(project, ".agents", "skills", "quoted", "SKILL.md"), [
+    "---",
+    'name: "quoted-skill"',
+    "description: 'Quoted: it''s valid'",
+    "---",
+    "# Quoted heading",
+  ].join("\n"));
+  await add(path.join(project, ".agents", "skills"), "folded", "Placeholder");
+  await fs.writeFile(path.join(project, ".agents", "skills", "folded", "SKILL.md"), [
+    "---",
+    "name: folded-skill",
+    "description: >-",
+    "  Reads the first line",
+    "  and the second line",
+    "---",
+    "# Folded heading",
+  ].join("\n"));
+  await add(path.join(project, ".agents", "skills"), "very-large", "Large document");
+  await fs.appendFile(path.join(project, ".agents", "skills", "very-large", "SKILL.md"), "x".repeat(350_000));
   await add(extra, "priority", "Global should be shadowed");
   await add(extra, "global-skill", "Configured global skill");
   process.env.LOCAL_CODER_SKILL_DIRS = extra;
@@ -37,6 +57,12 @@ try {
   assert.equal(found.find((x) => x.name === "nested-skill")?.source, "project");
   assert.equal(found.find((x) => x.name === "codex-skill")?.source, "project");
   assert.equal(found.find((x) => x.name === "global-skill")?.source, "global");
+  assert.equal(found.find((x) => x.name === "quoted-skill")?.description, "Quoted: it's valid");
+  assert.equal(found.find((x) => x.name === "folded-skill")?.description, "Reads the first line and the second line");
+  assert.equal(found.some((x) => x.name === '"quoted-skill"'), false);
+  const limited = await loadProjectSkill(project, "very-large", 24);
+  assert.equal(limited.truncated, true);
+  assert.ok(Buffer.byteLength(limited.content, "utf8") <= 24);
   const loaded = await loadProjectSkill(project, "global-skill");
   assert.match(loaded.content, /Configured global skill/);
   const referenceFolder = path.join(project, ".agents", "skills", "priority", "references");
@@ -65,6 +91,19 @@ try {
   assert.deepEqual((await getSkillControls(project, "project")).disabled, ["priority"]);
   assert.equal((await loadProjectSkills(project)).some((skill) => skill.name === "priority"), false);
   assert.equal((await loadProjectSkills(project, true)).find((skill) => skill.name === "priority")?.enabled, false);
+  await saveSkillControls(project, "project", { version: 1, disabled: [] });
+  await Promise.all([
+    setSkillEnabled(project, "project", "priority", false),
+    setSkillEnabled(project, "project", "quoted-skill", false),
+  ]);
+  assert.deepEqual(new Set((await getSkillControls(project, "project")).disabled),
+    new Set(["priority", "quoted-skill"]));
+  await Promise.all([
+    setSkillEnabled(project, "project", "priority", true),
+    setSkillEnabled(project, "project", "folded-skill", false),
+  ]);
+  assert.deepEqual(new Set((await getSkillControls(project, "project")).disabled),
+    new Set(["quoted-skill", "folded-skill"]));
   await saveSkillControls(project, "project", { version: 1, disabled: [] });
   await saveSkillControls(project, "global", { version: 1, disabled: ["global-skill"] });
   assert.equal((await loadProjectSkills(project)).some((skill) => skill.name === "global-skill"), false);

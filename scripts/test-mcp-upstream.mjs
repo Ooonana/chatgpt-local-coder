@@ -400,6 +400,14 @@ try {
         allow_unsafe_runtimes: true,
       });
 
+      const denied = await client.callTool({ name: "mcp_call", arguments: { server_id: "mockhttp", tool: "add", arguments: { a: 2, b: 3 } } }).catch((err) => err);
+      if (!/write|permission|denied/i.test(String(JSON.stringify(denied)))) {
+        throw new Error(`mcp_call allowed mutation with allow_write=false: ${JSON.stringify(denied)}`);
+      }
+      savePermissionConfig({
+        profile: "custom", path_roots: [root], allow_write: true,
+        allow_commands: false, allow_unsafe_runtimes: true,
+      });
       const rawBridge = await client.callTool({ name: "mcp_call", arguments: { server_id: "mockhttp", tool: "add", arguments: { a: 2, b: 3 } } });
       if (!JSON.stringify(rawBridge).includes("5")) throw new Error(`mcp_call was not allowed by explicit unsafe-runtime opt-in: ${JSON.stringify(rawBridge)}`);
       const direct = await client.callTool({ name: "mockhttp__add", arguments: { a: 3, b: 4 } });

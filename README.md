@@ -75,6 +75,9 @@ JSON controls to `<project>/.local-coder/skills.json` and
 `~/.local-coder/skills.json`, respectively. A global disable always takes
 precedence over the project toggle. Disabled skills are omitted from
 `list_skills` and cannot be loaded by name. Invalid settings fail visibly.
+The Admin UI saves individual toggles atomically, so simultaneous changes do
+not overwrite unrelated skill controls. Skill name/description YAML scalars
+support quoted values and folded descriptions; discovery uses bounded reads.
 
 ### Opt-in Vercel computer-use MCP providers
 
@@ -89,10 +92,14 @@ expose. The default `meta_only` exposure deliberately advertises no direct
 upstream tools. Once enabled, Local Coder offers `computer_observe` and
 `computer_act` in the slim profile with an explicit allowlist, rather than
 automatically advertising all upstream controls. Input requires
-`allow_input=true` and an unsafe-runtime-enabled permission profile.
-It can verify a fresh snapshot against `expected_text`; desktop verification
-requires a specific `verification_target.app` or `verification_target.window_id`
-so that an unrelated foreground window is never mistaken for the target.
+`allow_input=true` and an unsafe-runtime-enabled permission profile. The
+`allow_input` flag is provided by the caller; it is **not** independent proof
+of human approval. Host-side confirmation depends on the MCP client.
+It can verify a fresh snapshot against `expected_text`; desktop input by
+`ref_id` requires a recent `computer_observe` snapshot scoped to
+`arguments.window_id` and a matching `verification_target.window_id`.
+Refs are bound to the observed window and invalidated after input; this
+prevents verifying the result in an unrelated foreground window.
 Failed verification can trigger `screenshot_on_failure`, restricted to that
 same window. Input is retried only if `safe_retries=1` is explicitly set and
 the upstream declares `disposition.delivery=not_delivered` and
@@ -116,6 +123,10 @@ Local Coder collects all paginated MCP tool-list pages with explicit bounds,
 deduplication and a 60-second cache; the full browser provider currently
 contains more than 100 tools, but only the native computer-use entrypoints
 are advertised to ChatGPT.
+The full-profile `mcp_call` fallback also enforces the upstream server's
+`expose`/allowlist policy and local write/unsafe-runtime permission. It cannot
+invoke hidden `meta_only` or disabled tools. Structured upstream failures are
+reported as errors, not successful calls.
 
 Additional optional Windows checks:
 `node scripts/test-desktop-mcp-live.mjs` creates a disposable WinForms window,

@@ -61,13 +61,96 @@ export async function saveSkillControls(
   return controls;
 }
 
+const pendingSkillUpdates = new Map<string, Promise<SkillControls>>();
+
+/**
+ * Update one toggle without overwriting unrelated toggles. Concurrent changes
+ * within a Local Coder process are serialized per controls file.
+ */
+export async function setSkillEnabled(
+  workspaceRoot: string, scope: SkillControlScope, name: string, enabled: boolean
+): Promise<SkillControls> {
+  if (typeof name !== "string" || !name.trim() || name.length > 200 || typeof enabled !== "boolean") {
+    throw new Error("Skill toggle requires a valid name and boolean enabled");
+  }
+  const key = controlsPath(workspaceRoot, scope);
+  const previous = pendingSkillUpdates.get(key);
+  const next = (previous?.catch(() => ({ version: 1 as const, disabled: [] })) ?? Promise.resolve())
+    .then(async () => {
+      const controls = await getSkillControls(workspaceRoot, scope);
+      const disabled = new Set(controls.disabled);
+      if (enabled) disabled.delete(name.trim());
+      else disabled.add(name.trim());
+      return saveSkillControls(workspaceRoot, scope, { version: 1, disabled: [...disabled] });
+    });
+  pendingSkillUpdates.set(key, next);
+  try {
+    return await next;
+  } finally {
+    if (pendingSkillUpdates.get(key) === next) pendingSkillUpdates.delete(key);
+  }
+}
+
+function yamlScalar(value: string): string {
+  const text = value.trim();
+  if (text.startsWith('"') && text.endsWith('"')) {
+    try { return JSON.parse(text) as string; }
+    catch { return text.slice(1, -1); }
+  }
+  if (text.startsWith("'") && text.endsWith("'")) {
+    return text.slice(1, -1).replace(/''/g, "'");
+  }
+  return text.replace(/\s+#.*$/, "").trim();
+}
+
 function parseFrontmatter(content: string): { name?: string; description?: string } {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!match) return {};
-  const block = match[1];
-  const name = block.match(/^name:\s*(.+)$/m)?.[1]?.trim();
-  const description = block.match(/^description:\s*(.+)$/m)?.[1]?.trim();
-  return { name, description };
+  const result: { name?: string; description?: string } = {};
+  const lines = match[1].split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const entry = lines[i].match(/^(name|description):[ \t]*(.*)$/);
+    if (!entry) continue;
+    let value = entry[2].trim();
+    if (/^[>|][+-]?$/.test(value)) {
+      const style = value[0];
+      const chunks: string[] = [];
+      while (i + 1 < lines.length && (!lines[i + 1].trim() || /^[ \t]+/.test(lines[i + 1]))) {
+        chunks.push(lines[++i].trim());
+      }
+      value = style === "|" ? chunks.join("\n").trim() : chunks.join(" ").replace(/\s+/g, " ").trim();
+    } else {
+      value = yamlScalar(value);
+    }
+    if (entry[1] === "name") result.name = value;
+    else result.description = value;
+  }
+  return result;
+}
+
+/** Read at most limit + 1 bytes. Discovery must not load untrusted giant SKILL.md files. */
+async function readFilePrefix(filePath: string, limit: number): Promise<{ content: string; truncated: boolean }> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 2_000_000) {
+    throw new Error("Skill read limit must be between 1 and 2000000 bytes");
+  }
+  const file = await fs.open(filePath, "r");
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile()) throw new Error("Skill must be a regular file");
+    const buffer = Buffer.alloc(Math.min(limit + 1, stat.size));
+    let used = 0;
+    while (used < buffer.length) {
+      const { bytesRead } = await file.read(buffer, used, buffer.length - used, used);
+      if (!bytesRead) break;
+      used += bytesRead;
+    }
+    return {
+      content: buffer.subarray(0, Math.min(limit, used)).toString("utf-8"),
+      truncated: stat.size > limit || used > limit,
+    };
+  } finally {
+    await file.close();
+  }
 }
 
 export async function loadProjectSkills(workspaceRoot: string, includeDisabled = false): Promise<SkillSummary[]> {
@@ -103,7 +186,7 @@ export async function loadProjectSkills(workspaceRoot: string, includeDisabled =
         const skillFile = path.join(full, "SKILL.md");
         try {
           await validatePath(skillFile);
-          const content = await fs.readFile(skillFile, "utf-8");
+          const { content } = await readFilePrefix(skillFile, 16_384);
           const fm = parseFrontmatter(content);
           const name = fm.name || entry.name;
           const description = fm.description || content.split("\n").find((l) => l.trim() && !l.startsWith("#"))?.trim() || name;
@@ -125,7 +208,7 @@ export async function loadProjectSkills(workspaceRoot: string, includeDisabled =
   if (computerUseSkill) {
     try {
       await validatePath(computerUseSkill);
-      const content = await fs.readFile(computerUseSkill, "utf-8");
+      const { content } = await readFilePrefix(computerUseSkill, 16_384);
       const frontmatter = parseFrontmatter(content);
       const name = frontmatter.name || "computer-use";
       if (!seenNames.has(name)) {
@@ -216,10 +299,10 @@ export async function loadProjectSkill(
       references: [reference],
     };
   }
-  const data = await fs.readFile(skill.path);
-  const content = data.subarray(0, maxBytes).toString("utf-8");
+  const data = await readFilePrefix(skill.path, maxBytes);
+  const content = data.content;
   let remaining = maxBytes - Buffer.byteLength(content);
-  let truncated = data.length > maxBytes;
+  let truncated = data.truncated;
   const references: Array<{ path: string; content: string; truncated: boolean }> = [];
 
   if (skill.source === "plugin" && skill.name === "computer-use" && remaining > 0) {
@@ -227,12 +310,10 @@ export async function loadProjectSkill(
     for (const file of ["guidance.md", "api.md", "confirmations.md"]) {
       const referencePath = path.join(pluginRoot, "docs", file);
       try {
-        const reference = await fs.readFile(referencePath);
-        const referenceContent = reference.subarray(0, remaining).toString("utf-8");
-        const referenceTruncated = reference.length > remaining;
-        references.push({ path: referencePath, content: referenceContent, truncated: referenceTruncated });
-        remaining -= Buffer.byteLength(referenceContent);
-        truncated ||= referenceTruncated;
+        const reference = await readFilePrefix(referencePath, remaining);
+        references.push({ path: referencePath, content: reference.content, truncated: reference.truncated });
+        remaining -= Buffer.byteLength(reference.content);
+        truncated ||= reference.truncated;
         if (remaining <= 0) break;
       } catch {
         // A Codex version may omit an optional Computer Use reference document.

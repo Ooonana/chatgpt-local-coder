@@ -561,16 +561,14 @@ async function loadSkills() {
     : '<div class="empty">No project or global skills found.</div>';
   for (const checkbox of container.querySelectorAll("input[data-skill-name]")) {
     checkbox.addEventListener("change", async () => {
-      const nextDisabled = new Set(disabled);
-      if (checkbox.checked) nextDisabled.delete(checkbox.dataset.skillName);
-      else nextDisabled.add(checkbox.dataset.skillName);
       checkbox.disabled = true;
       try {
         await api("/api/skills", {
-          method: "PUT",
+          method: "PATCH",
           body: JSON.stringify({
             path: result.root, scope,
-            controls: { version: 1, disabled: [...nextDisabled] },
+            name: checkbox.dataset.skillName,
+            enabled: checkbox.checked,
           }),
         });
         await loadSkills();

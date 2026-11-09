@@ -13,7 +13,7 @@ import {
 } from "../lib/mcp-upstream-config.js";
 import { getDefaultCwd, getFullDiskAccess, validatePath } from "../lib/path-security.js";
 import {
-  getSkillControls, loadProjectSkills, saveSkillControls,
+  getSkillControls, loadProjectSkills, saveSkillControls, setSkillEnabled,
   type SkillControlScope,
 } from "../lib/skills-loader.js";
 import { getCheckpointConfig } from "../lib/checkpoint.js";
@@ -307,6 +307,18 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         ? req.body.path : getDefaultCwd());
       const scope: SkillControlScope = req.body?.scope === "global" ? "global" : "project";
       const controls = await saveSkillControls(root, scope, req.body?.controls);
+      res.json({ ok: true, root, scope, controls, skills: await loadProjectSkills(root, true) });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.patch("/api/skills", async (req, res) => {
+    try {
+      const root = await validatePath(typeof req.body?.path === "string" && req.body.path.trim()
+        ? req.body.path : getDefaultCwd());
+      const scope: SkillControlScope = req.body?.scope === "global" ? "global" : "project";
+      const controls = await setSkillEnabled(root, scope, req.body?.name, req.body?.enabled);
       res.json({ ok: true, root, scope, controls, skills: await loadProjectSkills(root, true) });
     } catch (err) {
       res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });

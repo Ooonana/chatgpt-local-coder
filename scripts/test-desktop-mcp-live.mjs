@@ -131,7 +131,20 @@ try {
   assert.equal(acted.structuredContent?.data?.attempts, 1);
   console.log("OK real semantic click and window-scoped accessibility verification");
 
-  const absent = await call("computer_act", { ...clickArgs, expected_text: "MISSING_" + suffix });
+  // Input invalidates its previous qualified ref. Observe again before the
+  // intentional mismatch, so the tested screenshot fallback is not blocked
+  // earlier by the stale-ref safety gate.
+  const updated = await call("computer_observe", {
+    provider: "desktop", tool: "desktop_snapshot",
+    arguments: { window_id: windowId },
+  });
+  const updatedTree = JSON.parse(updated.structuredContent.data.output).data?.tree;
+  const updatedRef = findButton(updatedTree);
+  assert.ok(updatedRef, "Button not found in post-action snapshot");
+  const absent = await call("computer_act", {
+    ...clickArgs, arguments: { ref_id: updatedRef },
+    expected_text: "MISSING_" + suffix,
+  });
   assert.equal(absent.structuredContent?.ok, false, "Absent expected text must fail verification");
   assert.equal(absent.structuredContent?.data?.verification?.passed, false);
   assert.equal(absent.structuredContent?.data?.attempts, 1);

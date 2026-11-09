@@ -45,7 +45,10 @@ const manager = {
       return { structuredContent: { exitCode: 1, response: { ok: false, error: "ACTION_FAILED" } } };
     }
     if (tool.endsWith("_snapshot")) {
-      return { content: [{ type: "text", text: JSON.stringify({ ok: true, data: { text: "Ready" } }) }] };
+      const ref_id = args.window_id === "w-B" ? "@s2:e1" : "@s1:e1";
+      return { content: [{ type: "text", text: JSON.stringify({
+        ok: true, data: { text: "Ready", tree: { name: "root", children: [{ name: "Button", ref_id }] } },
+      }) }] };
     }
     if (tool.endsWith("_screenshot")) {
       return { content: [{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" }] };
@@ -105,19 +108,55 @@ try {
   console.log("OK action verified by post-action DOM snapshot, exactly once");
 
   result = await call("computer_act", {
-    provider: "desktop", tool: "desktop_click", arguments: { element: "e2" },
+    provider: "desktop", tool: "desktop_click", arguments: { ref_id: "@s1:e1" },
     allow_input: true, expected_text: "Not there",
-    verification_target: { app: "isolated-test.exe" },
+    verification_target: { window_id: "w-A" },
     screenshot_on_failure: true,
+  });
+  assert.match(JSON.stringify(result), /not bound/);
+  assert.equal(invoked.filter((x) => x.tool === "desktop_click").length, 0);
+
+  await call("computer_observe", {
+    provider: "desktop", tool: "desktop_snapshot", arguments: { window_id: "w-A" },
+  });
+  await call("computer_observe", {
+    provider: "desktop", tool: "desktop_snapshot", arguments: { window_id: "w-B" },
+  });
+  result = await call("computer_act", {
+    provider: "desktop", tool: "desktop_click", arguments: { ref_id: "@s1:e1" },
+    allow_input: true, expected_text: "Ready", verification_target: { window_id: "w-B" },
+  });
+  assert.match(JSON.stringify(result), /not bound/);
+  assert.equal(invoked.filter((x) => x.tool === "desktop_click").length, 0);
+  result = await call("computer_act", {
+    provider: "desktop", tool: "desktop_click", arguments: { ref_id: "@s1:e1" },
+    allow_input: true, expected_text: "Ready", verification_target: { window_id: "w-A" },
+  });
+  assert.equal(result.structuredContent?.ok, true);
+  assert.equal(result.structuredContent?.data?.verification?.passed, true);
+  assert.equal(invoked.filter((x) => x.tool === "desktop_click").length, 1);
+  // Action invalidates observed refs; a new snapshot is required.
+  result = await call("computer_act", {
+    provider: "desktop", tool: "desktop_click", arguments: { ref_id: "@s1:e1" },
+    allow_input: true, verification_target: { window_id: "w-A" },
+  });
+  assert.match(JSON.stringify(result), /not bound/);
+
+  await call("computer_observe", {
+    provider: "desktop", tool: "desktop_snapshot", arguments: { window_id: "w-A" },
+  });
+  result = await call("computer_act", {
+    provider: "desktop", tool: "desktop_click", arguments: { ref_id: "@s1:e1" },
+    allow_input: true, expected_text: "Not there",
+    verification_target: { window_id: "w-A" }, screenshot_on_failure: true,
   });
   assert.equal(result.structuredContent?.ok, false);
   assert.equal(result.structuredContent?.data?.verification?.passed, false);
   assert.ok(result.content?.some((item) => item.type === "image"));
-  assert.equal(invoked.filter((x) => x.tool === "desktop_click").length, 1);
-  assert.equal(invoked.find((x) => x.tool === "desktop_snapshot")?.args.app, undefined);
-  assert.ok(invoked.some((x) => x.tool === "desktop_snapshot" && x.args.app === "isolated-test.exe"));
-  assert.ok(invoked.some((x) => x.tool === "desktop_screenshot" && x.args.app === "isolated-test.exe"));
-  console.log("OK failed verification returns screenshot and does not retry an input");
+  assert.equal(invoked.filter((x) => x.tool === "desktop_click").length, 2);
+  assert.ok(invoked.some((x) => x.tool === "desktop_snapshot" && x.args.window_id === "w-A"));
+  assert.ok(invoked.some((x) => x.tool === "desktop_screenshot" && x.args.window_id === "w-A"));
+  console.log("OK refs are bound to observed windows, stale refs rejected, and screenshots window-scoped");
 
   const desktopBefore = invoked.filter((x) => x.tool === "desktop_click").length;
   result = await call("computer_act", {

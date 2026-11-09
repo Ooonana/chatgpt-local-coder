@@ -165,17 +165,16 @@ try {
 
   const tools = await callTool(`http://127.0.0.1:${mcpPort}`, sessionId, "mcp_tools", { server_id: "mockhttp" });
   const toolsPayload = JSON.parse(tools.result.content[0].text);
-  if (!toolsPayload.ok || toolsPayload.data.count < 1) throw new Error(JSON.stringify(toolsPayload));
+  if (!toolsPayload.ok || toolsPayload.data.count !== 0) throw new Error("meta_only exposed tools: " + JSON.stringify(toolsPayload));
 
-  const called = await callTool(`http://127.0.0.1:${mcpPort}`, sessionId, "mcp_call", {
+  const blocked = await callTool(`http://127.0.0.1:${mcpPort}`, sessionId, "mcp_call", {
     server_id: "mockhttp",
     tool: "add",
     arguments: { a: 4, b: 6 },
   });
-  const callPayload = JSON.parse(called.result.content[0].text);
-  if (!callPayload.ok) throw new Error(JSON.stringify(callPayload));
-  const outputText = JSON.stringify(callPayload.data);
-  if (!outputText.includes("10")) throw new Error(outputText);
+  if (!/not exposed for direct calls/i.test(JSON.stringify(blocked))) {
+    throw new Error("meta_only bypassed by mcp_call: " + JSON.stringify(blocked));
+  }
 
   const listBefore = await mcpPost(
     `http://127.0.0.1:${mcpPort}`,
@@ -221,6 +220,16 @@ try {
     throw new Error(`proxy missing after allowlist: ${toolNamesAfter.join(",")}`);
   }
   log(`tools/list after allowlist: mockhttp__add present`);
+
+  const called = await callTool(`http://127.0.0.1:${mcpPort}`, sessionId, "mcp_call", {
+    server_id: "mockhttp",
+    tool: "add",
+    arguments: { a: 4, b: 6 },
+  });
+  const callPayload = JSON.parse(called.result.content[0].text);
+  if (!callPayload.ok || !JSON.stringify(callPayload.data).includes("10")) {
+    throw new Error("Explicitly allowlisted MCP tool failed: " + JSON.stringify(callPayload));
+  }
 
   const proxied = await callTool(`http://127.0.0.1:${mcpPort}`, sessionId, "mockhttp__add", { a: 1, b: 2 });
   const proxiedPayload = JSON.parse(proxied.result.content[0].text);

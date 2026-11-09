@@ -45,6 +45,7 @@ function summarizeUpstream(raw: unknown) {
   return {
     ok: successful,
     retrySafe,
+    payload,
     text: asText.slice(0, 60_000),
     truncated: asText.length > 60_000,
     images: (result.content ?? []).filter((item) => item.type === "image"),
@@ -63,6 +64,31 @@ function mustEnableProvider(manager: McpUpstreamManager, provider: ComputerUsePr
 export function registerComputerUseTools(server: McpServer, manager: McpUpstreamManager): void {
   const providerSchema = z.enum(["desktop", "browser"]);
   const argumentSchema = z.record(z.string(), z.unknown()).optional().default({});
+  // Qualified accessibility refs are tied to the window-scoped observation
+  // that returned them, not to an unrelated caller-supplied verification target.
+  // This registry is local to the MCP session; refs expire and are invalidated
+  // after every desktop input to avoid acting on stale UI state.
+  const observedRefs = new Map<string, { windowId: string; capturedAt: number }>();
+  const REF_TTL_MS = 60_000;
+  function rememberWindowRefs(payload: Record<string, unknown> | null | undefined, windowId: string): void {
+    const data = payload?.data as Record<string, unknown> | undefined;
+    if (!data?.tree) return;
+    const now = Date.now();
+    for (const [ref, entry] of observedRefs) {
+      if (now - entry.capturedAt >= REF_TTL_MS) observedRefs.delete(ref);
+    }
+    let visited = 0;
+    function visit(node: unknown): void {
+      if (++visited > 5000 || !node || typeof node !== "object") return;
+      const item = node as { ref_id?: unknown; children?: unknown };
+      if (typeof item.ref_id === "string" && /^@[^\s:]+:e\d+$/.test(item.ref_id)) {
+        observedRefs.set(item.ref_id, { windowId, capturedAt: now });
+      }
+      if (Array.isArray(item.children)) for (const child of item.children) visit(child);
+    }
+    visit(data.tree);
+    while (observedRefs.size > 5000) observedRefs.delete(observedRefs.keys().next().value!);
+  }
   server.registerTool(
     "computer_observe",
     {
@@ -95,6 +121,10 @@ export function registerComputerUseTools(server: McpServer, manager: McpUpstream
       const advertised = await manager.listTools(serverId);
       if (!advertised.some((item) => item.name === tool)) throw new Error("Unsupported upstream observation tool: " + tool);
       const result = summarizeUpstream(await manager.callTool(serverId, tool, args));
+      if (provider === "desktop" && tool === "desktop_snapshot" && result.ok &&
+        typeof args.window_id === "string") {
+        rememberWindowRefs(result.payload, args.window_id);
+      }
       await audit({ tool: "computer_observe", action: tool, target: provider, status: result.ok ? "ok" : "error" });
       const output = toolResult("computer_observe", {
         provider, tool, output: result.text, truncated: result.truncated,
@@ -118,7 +148,7 @@ export function registerComputerUseTools(server: McpServer, manager: McpUpstream
         verification_target: z.object({
           app: z.string().min(1).max(200).optional(),
           window_id: z.string().min(1).max(200).optional(),
-        }).optional().describe("Desktop app or window to verify; required for desktop expected_text checks"),
+        }).optional().describe("Desktop window_id must match a previously observed window-scoped snapshot for input by ref"),
         safe_retries: z.number().int().min(0).max(1).optional().default(0).describe("Retry only when upstream confirms the action was NOT delivered and retry is safe"),
         screenshot_on_failure: z.boolean().optional().default(false),
       },
@@ -130,9 +160,25 @@ export function registerComputerUseTools(server: McpServer, manager: McpUpstream
       requireWriteAllowed();
       requireUnsafeRuntimeAllowed("computer-use input");
       validateComputerUseTool(provider, "act", tool, args);
-      if (provider === "desktop" && (expected_text || screenshot_on_failure) &&
-        !verification_target?.app && !verification_target?.window_id) {
-        throw new Error("Desktop verification/screenshot requires verification_target.app or verification_target.window_id");
+      if (provider === "desktop") {
+        if ((expected_text || screenshot_on_failure) && !verification_target?.window_id) {
+          throw new Error("Desktop verification/screenshot requires verification_target.window_id");
+        }
+        if (tool !== "desktop_wait" && !verification_target?.window_id) {
+          throw new Error("Desktop input requires verification_target.window_id from a window-scoped snapshot");
+        }
+        if (tool === "desktop_focus_window") {
+          if (args.window_id !== verification_target?.window_id) {
+            throw new Error("Desktop focus target must match verification_target.window_id");
+          }
+        } else if (tool !== "desktop_wait") {
+          const ref = args.ref_id;
+          const binding = typeof ref === "string" ? observedRefs.get(ref) : undefined;
+          if (!binding || binding.windowId !== verification_target?.window_id ||
+            Date.now() - binding.capturedAt >= REF_TTL_MS) {
+            throw new Error("Desktop ref_id is not bound to the specified window; call computer_observe desktop_snapshot with window_id first");
+          }
+        }
       }
       if (provider === "browser" && verification_target) {
         throw new Error("verification_target is only supported for desktop actions");
@@ -147,6 +193,7 @@ export function registerComputerUseTools(server: McpServer, manager: McpUpstream
         outcome = summarizeUpstream(await manager.callTool(serverId, tool, args));
         attempts += 1;
       }
+      if (provider === "desktop" && tool !== "desktop_wait") observedRefs.clear();
       let verification: { checked: boolean; passed: boolean | null; snapshot: string; error?: string } = {
         checked: false, passed: null, snapshot: "",
       };

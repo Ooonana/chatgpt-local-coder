@@ -704,7 +704,7 @@ await test("tunnel diagnostics redact MCP and API secrets", async () => {
 });
 
 await test("Phase 6 schema/tool budget contract is explicit", async () => {
-  assert.equal(SCHEMA_CONTRACT_VERSION, 8);
+  assert.equal(SCHEMA_CONTRACT_VERSION, 9);
   // Keep a bounded tool-schema budget, with room for the two opt-in computer-use tools.
   assert.ok(SLIM_CHATGPT_TOOLS.size <= 44, `slim tools=${SLIM_CHATGPT_TOOLS.size}`);
 });

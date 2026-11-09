@@ -66,14 +66,14 @@ The default `slim` profile includes the high-value read/edit/search tools, bound
 | Rewind | `rewind` | `list` → `preview` → `restore` for automatic file-edit checkpoints. |
 | Project rules | `project_context`, `load_path_rules` | Loads project and path-scoped instructions. |
 | Skills | `list_skills`, `load_skill` | Load matching project/plugin skills before use. |
-| Computer use | `computer_observe`, `computer_act` | Opt-in Vercel desktop/browser MCP; explicit action permission, window-scoped verification, safe-only input retry and optional screenshot fallback. Electron via localhost `agent_browser_connect`. |
+| Computer use | `computer_observe`, `computer_act` | Opt-in desktop/browser MCP: Windows input refs must come from the same recent window-scoped snapshot; one safe-only input retry and scoped screenshot fallback. `allow_input` is caller-provided, not proof of independent user approval. Electron CDP is loopback-only. |
 | Persistent task state | `agent_task` | Stores objective, plan, notes, workspace, and status across MCP sessions. It is **not** a subagent. |
 | Resumable chat working state | `context_capsule` | Stores a bounded semantic handoff plus live task/loop/transaction/Git state when ChatGPT conversation context may be lost. |
 | External subagent | `subagent` | Runs a separately configured model-capable process, optionally in an isolated Git worktree. It cannot reuse the parent ChatGPT subscription. |
 | Delegate discovery | `delegate_status` | Detects supported Claude/Codex/Grok/OpenCode CLIs without launching them. |
 | Isolated Git work | `git_worktree` | Useful for parallel or experimental branches without switching the main checkout. |
 | Upstream MCP | `<server>__<tool>` | Enabled upstream tools are exposed directly when possible. |
-| Upstream diagnostics | `mcp_servers`, `mcp_tools`, `mcp_call` | Low-level bridge/fallback; some are full-profile only. |
+| Upstream diagnostics | `mcp_servers`, `mcp_tools`, `mcp_call` | Low-level bridge/fallback; `mcp_call` enforces the upstream exposure allowlist and write/unsafe-runtime permissions. |
 
 Real delegated subagents are available through the external-runner `subagent` tool when explicitly configured. Web browsing, general uploaded-file understanding, data analysis, and browser/site tooling can still be supplied by the ChatGPT host instead of being duplicated in Local Coder.
 
