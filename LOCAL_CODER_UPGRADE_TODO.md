@@ -47,6 +47,20 @@ Do not restart the server, push GitHub commits, touch other repositories,
 alter the user's custom app picture, or modify machine-specific profiles
 during this checklist-only review.
 
+### P2.4 incremental efficiency result (2026-11-10)
+
+- `project_context` now uses bounded file-handle prefix reads instead of
+  whole-file reads; unchanged file metadata still permits repeat cache hits.
+- Isolated 32 MiB fixture with a 1 KiB prefix: measured **1,024 bytes read**
+  versus the previous full-file read of **33,554,432 bytes** (32,768× less
+  cold-read I/O). This is not a latency or token-reduction estimate.
+- `scripts/test-context-prefix.mjs` verifies the read budget, warm cache,
+  same-sized file rewrites, empty files, and invalid limits. Integrated into
+  the regular `npm test` path.
+- Remaining: representative end-to-end tool-result bytes, context/token
+  overhead and wall-clock latency baselines and optimizations. Keep the
+  high-level performance item partial until those are measured.
+
 ## P0 — Baseline and reliability
 - [x] Review current code, Git history, and previous unfinished work.
 - [x] Run existing tests and identify regressions.

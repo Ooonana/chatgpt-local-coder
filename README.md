@@ -165,6 +165,15 @@ step is reopened, its old `completed_at` timestamp is cleared; older records
 with that inconsistency are normalized in memory without rewriting their
 historical files simply because they were read.
 
+`project_context` uses bounded file-handle reads rather than loading an entire
+file when only its first `max_bytes_per_file` bytes are requested (valid range:
+1–200,000 bytes). Cached prefixes are reused only while the file size and
+modification/change times still match. `node scripts/test-context-prefix.mjs`
+verifies this using an isolated 32 MiB fixture: a 1 KiB requested prefix
+performs 1 KiB of cold reads instead of 32 MiB, a 32,768× reduction in file
+bytes read for that case. This is an I/O measurement, **not** a claim of a
+32,768× latency or token-usage improvement.
+
 The Admin UI's **Project → Workspace recovery review** panel exposes the same
 project-scoped, read-only status through
 `GET /api/recovery/review?workspace=<project-path>&stale_hours=24`.

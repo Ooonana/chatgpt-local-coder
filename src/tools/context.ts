@@ -158,7 +158,10 @@ async function findContextFiles(root: string, maxDepth: number): Promise<string[
   return [...new Set(found)];
 }
 
-async function readContextFileCached(file: string, maxBytes: number): Promise<{ content: string; truncated: boolean }> {
+export async function readContextFileCached(file: string, maxBytes: number): Promise<{ content: string; truncated: boolean }> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 200_000) {
+    throw new Error("Context file prefix limit must be 1–200000 bytes");
+  }
   const stat = await fs.stat(file);
   const cacheKey = `${file}|${maxBytes}`;
   const cached = contextFileCache.get(cacheKey);
@@ -166,16 +169,35 @@ async function readContextFileCached(file: string, maxBytes: number): Promise<{ 
     cacheContextFile(cacheKey, cached);
     return { content: cached.content, truncated: stat.size > maxBytes };
   }
-  const buf = await fs.readFile(file);
-  const content = buf.subarray(0, maxBytes).toString("utf-8");
-  cacheContextFile(cacheKey, {
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-    ctimeMs: stat.ctimeMs,
-    retainedBytes: Math.max(Buffer.byteLength(content, "utf8"), content.length * 2),
-    content,
-  });
-  return { content, truncated: buf.length > maxBytes };
+  // Never allocate/read the entire file just to return a bounded prefix.
+  // Read through a handle so large or growing context files have predictable
+  // memory and I/O costs even on cold-cache requests.
+  const handle = await fs.open(file, "r");
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile()) throw new Error("Context entry must be a regular file");
+    const buffer = Buffer.alloc(Math.min(maxBytes, opened.size));
+    let used = 0;
+    while (used < buffer.length) {
+      const result = await handle.read(buffer, used, buffer.length - used, used);
+      if (!result.bytesRead) break;
+      used += result.bytesRead;
+    }
+    const content = buffer.subarray(0, used).toString("utf-8");
+    const after = await handle.stat();
+    const unchanged = opened.size === after.size &&
+      opened.mtimeMs === after.mtimeMs && opened.ctimeMs === after.ctimeMs;
+    if (unchanged && used === buffer.length) {
+      cacheContextFile(cacheKey, {
+        size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs,
+        retainedBytes: Math.max(Buffer.byteLength(content, "utf8"), content.length * 2),
+        content,
+      });
+    }
+    return { content, truncated: after.size > maxBytes };
+  } finally {
+    await handle.close();
+  }
 }
 
 async function buildDoctor(workspaceRoot: string) {
