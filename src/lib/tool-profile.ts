@@ -85,6 +85,8 @@ export const LOCAL_TOOL_CATALOG = [
   "lsp",
 
   // Upstream MCP bridge
+  "computer_observe",
+  "computer_act",
   "mcp_servers",
   "mcp_tools",
   "mcp_call",
@@ -165,6 +167,8 @@ export const SLIM_CHATGPT_TOOLS = new Set([
   "load_skill",
   "rewind",
   "view_image",
+  "computer_observe",
+  "computer_act",
   "mcp_servers",
 ]);
 

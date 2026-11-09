@@ -1,4 +1,5 @@
 import fs from "fs/promises";
+import { existsSync } from "fs";
 import path from "path";
 import os from "os";
 import { atomicWriteText } from "./atomic-file.js";
@@ -62,6 +63,63 @@ const CONFIG_VERSION = 1 as const;
 
 export function defaultUpstreamConfig(): UpstreamConfigFile {
   return { version: CONFIG_VERSION, servers: [] };
+}
+
+/** Windows npm commands are usually .cmd/.ps1 shims, not spawnable executables. */
+function installedVercelCommand(pkg: "agent-desktop" | "agent-browser"): string {
+  if (process.platform !== "win32") return pkg;
+  const arch = process.arch === "arm64" ? "arm64" : "x64";
+  const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  const binary = path.join(appData, "npm", "node_modules", pkg, "bin",
+    pkg === "agent-desktop" ? `agent-desktop-win32-${arch}.exe` : "agent-browser-win32-x64.exe");
+  // Preserve an editable, disabled placeholder even when the CLI is not installed.
+  return existsSync(binary) ? binary : pkg;
+}
+
+function isolatedBrowserEnvironment(): Record<string, string> {
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  const env: Record<string, string> = {
+    AGENT_BROWSER_NAMESPACE: "chatgpt-local-coder",
+    AGENT_BROWSER_SESSION: "chatgpt-local-coder",
+    AGENT_BROWSER_PROFILE: path.join(localAppData, "ChatGPTLocalCoder", "browser-profile"),
+  };
+  if (process.platform === "win32") {
+    const chrome = path.join(process.env.PROGRAMFILES || "C:\\Program Files", "Google", "Chrome", "Application", "chrome.exe");
+    if (existsSync(chrome)) env.AGENT_BROWSER_EXECUTABLE_PATH = chrome;
+  }
+  return env;
+}
+
+/**
+ * Opt-in Vercel computer-use adapters. Creating presets neither installs
+ * executables nor enables input control or advertises remote MCP tools.
+ */
+export function computerUseMcpPresets(): UpstreamServerConfig[] {
+  return [
+    {
+      id: "vercel-agent-desktop",
+      name: "Vercel agent-desktop (native UI)",
+      enabled: false,
+      transport: "stdio",
+      command: installedVercelCommand("agent-desktop"),
+      args: ["mcp"],
+      auth: { type: "none" },
+      tool_prefix: "desktop",
+      expose: "meta_only",
+    },
+    {
+      id: "vercel-agent-browser",
+      name: "Vercel agent-browser (Chrome)",
+      enabled: false,
+      transport: "stdio",
+      command: installedVercelCommand("agent-browser"),
+      args: ["mcp", "--tools", "core"],
+      env: isolatedBrowserEnvironment(),
+      auth: { type: "none" },
+      tool_prefix: "browser",
+      expose: "meta_only",
+    },
+  ];
 }
 
 export function resolveUpstreamConfigPath(): string {

@@ -537,6 +537,51 @@ async function loadServers() {
   const el = document.getElementById("servers-table");
   el.innerHTML = serversTable(health.upstream || []);
   bindServerActions(el, cfg.config);
+  await loadSkills().catch((err) => {
+    document.getElementById("skills-table").textContent = err.message;
+  });
+}
+
+async function loadSkills() {
+  const scope = document.getElementById("skills-control-scope").value;
+  const projectPath = document.getElementById("skills-project-path").value.trim();
+  const params = new URLSearchParams({ scope });
+  if (projectPath) params.set("path", projectPath);
+  const result = await api("/api/skills?" + params.toString());
+  const disabled = new Set(result.controls.disabled);
+  const container = document.getElementById("skills-table");
+  container.innerHTML = result.skills.length
+    ? result.skills.map((skill) => {
+      const inScopeEnabled = !disabled.has(skill.name);
+      return `<label class="field checkbox"><input type="checkbox" data-skill-name="${esc(skill.name)}" ${inScopeEnabled ? "checked" : ""} />
+        <span><strong>${esc(skill.name)}</strong> · ${esc(skill.source || "project")}
+        ${skill.enabled ? "" : '<small class="muted"> (disabled)</small>'}
+        <br /><small class="muted">${esc(skill.description || "")}</small></span></label>`;
+    }).join("")
+    : '<div class="empty">No project or global skills found.</div>';
+  for (const checkbox of container.querySelectorAll("input[data-skill-name]")) {
+    checkbox.addEventListener("change", async () => {
+      const nextDisabled = new Set(disabled);
+      if (checkbox.checked) nextDisabled.delete(checkbox.dataset.skillName);
+      else nextDisabled.add(checkbox.dataset.skillName);
+      checkbox.disabled = true;
+      try {
+        await api("/api/skills", {
+          method: "PUT",
+          body: JSON.stringify({
+            path: result.root, scope,
+            controls: { version: 1, disabled: [...nextDisabled] },
+          }),
+        });
+        await loadSkills();
+        toast("Skill controls saved");
+      } catch (error) {
+        checkbox.checked = !checkbox.checked;
+        checkbox.disabled = false;
+        toast(error.message, true);
+      }
+    });
+  }
 }
 
 function bindServerActions(container, config) {
@@ -972,6 +1017,19 @@ document.getElementById("activity-clear").addEventListener("click", () => {
 });
 
 document.getElementById("add-server").addEventListener("click", () => openServerDialog(null));
+document.getElementById("skills-refresh").addEventListener("click", () => loadSkills().catch((err) => toast(err.message, true)));
+document.getElementById("skills-control-scope").addEventListener("change", () => loadSkills().catch((err) => toast(err.message, true)));
+document.getElementById("add-computer-use-presets").addEventListener("click", async () => {
+  try {
+    const result = await api("/api/upstream/presets/computer-use", { method: "POST" });
+    toast(result.added.length
+      ? "Computer-use presets added (disabled). Install the CLIs, then review and enable them."
+      : "Computer-use presets already configured; no settings changed.");
+    await loadServers();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
 document.getElementById("save-env").addEventListener("click", async () => {
   const values = {};
   document.querySelectorAll("#env-form input").forEach((el) => (values[el.name] = el.value));

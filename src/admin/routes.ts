@@ -4,13 +4,18 @@ import { Router, type Request, type Response } from "express";
 import type { McpUpstreamManager } from "../lib/mcp-upstream-manager.js";
 import {
   defaultUpstreamConfig,
+  computerUseMcpPresets,
   discoverMcpConfigs,
   findMcpConfigForSource,
   importMcpConfigFromFile,
   type McpImportSource,
   type UpstreamServerConfig,
 } from "../lib/mcp-upstream-config.js";
-import { getDefaultCwd, getFullDiskAccess } from "../lib/path-security.js";
+import { getDefaultCwd, getFullDiskAccess, validatePath } from "../lib/path-security.js";
+import {
+  getSkillControls, loadProjectSkills, saveSkillControls,
+  type SkillControlScope,
+} from "../lib/skills-loader.js";
 import { getCheckpointConfig } from "../lib/checkpoint.js";
 import { getLocalPluginsConfig, saveLocalPluginsConfig } from "../lib/plugin-config.js";
 import { getCodexHooks, saveCodexHooks } from "../lib/codex-hooks.js";
@@ -281,6 +286,33 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     res.json({ ok: true, config: manager.getConfig(), path: manager.getConfigPath() });
   });
 
+  router.get("/api/skills", async (req, res) => {
+    try {
+      const root = await validatePath(typeof req.query.path === "string" && req.query.path.trim()
+        ? req.query.path : getDefaultCwd());
+      const scope: SkillControlScope = req.query.scope === "global" ? "global" : "project";
+      const [controls, skills] = await Promise.all([
+        getSkillControls(root, scope),
+        loadProjectSkills(root, true),
+      ]);
+      res.json({ ok: true, root, scope, controls, skills });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.put("/api/skills", async (req, res) => {
+    try {
+      const root = await validatePath(typeof req.body?.path === "string" && req.body.path.trim()
+        ? req.body.path : getDefaultCwd());
+      const scope: SkillControlScope = req.body?.scope === "global" ? "global" : "project";
+      const controls = await saveSkillControls(root, scope, req.body?.controls);
+      res.json({ ok: true, root, scope, controls, skills: await loadProjectSkills(root, true) });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   router.get("/api/plugins", (_req, res) => {
     res.json({ ok: true, config: getLocalPluginsConfig(), available: { computer_use: process.platform === "win32" } });
   });
@@ -430,6 +462,20 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       }
       await manager.upsertServer(server);
       res.json({ ok: true, config: manager.getConfig() });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.post("/api/upstream/presets/computer-use", async (_req, res) => {
+    try {
+      const added = await manager.addMissingServers(computerUseMcpPresets());
+      res.json({
+        ok: true,
+        added,
+        config: manager.getConfig(),
+        note: "Presets are disabled by default. Install the CLIs separately, then review and enable them.",
+      });
     } catch (err) {
       res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }

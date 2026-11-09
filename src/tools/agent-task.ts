@@ -22,12 +22,22 @@ import {
   getCurrentSessionState,
 } from "../lib/session-context.js";
 import { sameResolvedPath } from "../lib/path-identity.js";
+import { getManagedProcessSnapshot } from "./shell.js";
 
 const statusSchema = z.enum(["active", "blocked", "completed", "cancelled", "abandoned", "archived"]);
 const stepStatusSchema = z.enum(["pending", "in_progress", "completed", "blocked", "skipped"]);
 
 function taskWithProgress<T extends Awaited<ReturnType<typeof getAgentTask>>>(task: NonNullable<T>) {
-  return { ...task, progress: getAgentTaskProgress(task) };
+  const runningWorkers = getManagedProcessSnapshot().filter((worker) => worker.running && worker.task_id === task.id);
+  return {
+    ...task,
+    progress: getAgentTaskProgress(task),
+    execution: {
+      status_scope: "persistent_plan",
+      running_worker_count: runningWorkers.length,
+      note: "Task status tracks a plan. It does not start or prove a running agent.",
+    },
+  };
 }
 
 export function registerAgentTaskTool(server: McpServer, defaultCwd: string): void {

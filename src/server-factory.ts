@@ -6,6 +6,7 @@ import { registerGitTools } from "./tools/git.js";
 import { registerContextTools } from "./tools/context.js";
 import { registerRewindTools } from "./tools/rewind.js";
 import { registerMcpBridgeTools } from "./tools/mcp-bridge.js";
+import { registerComputerUseTools } from "./tools/computer-use.js";
 import { registerNodeReplTool } from "./tools/node-repl.js";
 import { registerPonytailTurnTool } from "./tools/ponytail.js";
 import { registerAgentTaskTool } from "./tools/agent-task.js";
@@ -541,6 +542,7 @@ export function createMcpServer(
 
   if (upstreamManager) {
     registerMcpBridgeTools(server, upstreamManager);
+    registerComputerUseTools(server, upstreamManager);
     upstreamManager.registerMcpServer(server);
   }
 

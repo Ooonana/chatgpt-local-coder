@@ -139,6 +139,25 @@ export class McpUpstreamManager {
     });
   }
 
+  /** Insert missing providers atomically. Existing configuration always wins. */
+  async addMissingServers(incoming: UpstreamServerConfig[]): Promise<string[]> {
+    return this.withConfigMutation(async () => {
+      const current = await loadUpstreamConfig(this.configPath);
+      const ids = new Set(current.servers.map((server) => server.id));
+      const added: string[] = [];
+      const servers = [...current.servers];
+      for (const server of incoming) {
+        if (ids.has(server.id)) continue;
+        ids.add(server.id);
+        added.push(server.id);
+        servers.push({ ...server });
+      }
+      if (added.length) await this.applyConfigUnlocked({ version: 1, servers });
+      else this.config = current;
+      return added;
+    });
+  }
+
   async removeServer(serverId: string): Promise<boolean> {
     return this.withConfigMutation(async () => {
       const current = await loadUpstreamConfig(this.configPath);

@@ -66,6 +66,7 @@ The default `slim` profile includes the high-value read/edit/search tools, bound
 | Rewind | `rewind` | `list` → `preview` → `restore` for automatic file-edit checkpoints. |
 | Project rules | `project_context`, `load_path_rules` | Loads project and path-scoped instructions. |
 | Skills | `list_skills`, `load_skill` | Load matching project/plugin skills before use. |
+| Computer use | `computer_observe`, `computer_act` | Opt-in Vercel desktop/browser MCP; explicit action permission and optional post-action verification. The provider must be installed and enabled. |
 | Persistent task state | `agent_task` | Stores objective, plan, notes, workspace, and status across MCP sessions. It is **not** a subagent. |
 | Resumable chat working state | `context_capsule` | Stores a bounded semantic handoff plus live task/loop/transaction/Git state when ChatGPT conversation context may be lost. |
 | External subagent | `subagent` | Runs a separately configured model-capable process, optionally in an isolated Git worktree. It cannot reuse the parent ChatGPT subscription. |

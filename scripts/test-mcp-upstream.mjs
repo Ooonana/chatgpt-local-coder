@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
+  computerUseMcpPresets,
   importMcpConfigFromFile,
   importCursorMcpConfig,
   loadUpstreamConfig,
@@ -82,6 +83,45 @@ await run("jsonSchemaToZodShape respects required fields", async () => {
   const bParsed = shape.b.safeParse(undefined);
   if (aParsed.success) throw new Error("a should be required");
   if (!bParsed.success) throw new Error("b should be optional");
+});
+
+await run("computer-use MCP presets are opt-in, safe and idempotent", async () => {
+  const presets = computerUseMcpPresets();
+  if (presets.length !== 2 ||
+    presets.some((server) => server.enabled || server.transport !== "stdio" || server.expose !== "meta_only")) {
+    throw new Error("computer-use preset must be disabled and non-advertising");
+  }
+  if (!/agent-desktop(?:-win32-(?:x64|arm64)\.exe)?$/.test(presets[0].command) ||
+    !/agent-browser(?:-win32-x64\.exe)?$/.test(presets[1].command) ||
+    presets[1].args.join(" ") !== "mcp --tools core") {
+    throw new Error("unexpected Vercel computer-use CLI arguments");
+  }
+  if (!presets[1].env.AGENT_BROWSER_PROFILE ||
+    !presets[1].env.AGENT_BROWSER_NAMESPACE ||
+    !presets[1].env.AGENT_BROWSER_SESSION) {
+    throw new Error("browser preset must isolate and persist its automation session");
+  }
+  if (process.platform === "win32" &&
+    presets[0].command.endsWith(".exe") &&
+    presets[1].command.endsWith(".exe") &&
+    (!path.isAbsolute(presets[0].command) || !path.isAbsolute(presets[1].command))) {
+    throw new Error("Windows computer-use binaries must resolve to absolute executable paths");
+  }
+  await saveUpstreamConfig({ version: 1, servers: [] }, configPath);
+  const manager = new McpUpstreamManager(configPath);
+  await manager.init();
+  try {
+    const first = await manager.addMissingServers(presets);
+    const second = await manager.addMissingServers(presets);
+    if (first.length !== 2 || second.length !== 0) throw new Error("preset addition was not idempotent");
+    await manager.upsertServer({ ...presets[0], name: "User customized", enabled: false });
+    await manager.addMissingServers(presets);
+    if (manager.getServerConfig(presets[0].id)?.name !== "User customized") {
+      throw new Error("computer-use preset overwrote a user customization");
+    }
+  } finally {
+    await manager.shutdown();
+  }
 });
 
 await run("save and load upstream config", async () => {

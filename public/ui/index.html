@@ -115,9 +115,25 @@
         <div class="panel">
           <div class="panel-head">
             <h2>MCP Servers</h2>
+            <button type="button" class="btn ghost" id="add-computer-use-presets">+ Computer-use presets</button>
             <button type="button" class="btn primary" id="add-server">+ Add server</button>
           </div>
           <div id="servers-table" class="table-wrap"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Agent Skills</h2>
+            <button type="button" class="btn ghost" id="skills-refresh">Refresh skills</button>
+          </div>
+          <p class="muted">Enable or disable skills by project or globally. Global restrictions take precedence.</p>
+          <div class="inline-form">
+            <input type="text" id="skills-project-path" placeholder="Project path (blank = default workspace)" aria-label="Skills project root" />
+            <select id="skills-control-scope" aria-label="Skills control scope">
+              <option value="project">Current project</option>
+              <option value="global">Global</option>
+            </select>
+          </div>
+          <div id="skills-table" class="table-wrap"></div>
         </div>
       </section>
 

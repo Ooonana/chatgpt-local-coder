@@ -28,6 +28,7 @@ import { getRuntimeIdentity } from "../lib/runtime-identity.js";
 import { listAgentTasks } from "../lib/agent-task-store.js";
 import { listEditTransactions } from "../lib/edit-transaction-store.js";
 import { listCodingLoops } from "../lib/coding-loop-store.js";
+import { summarizeTaskActivity } from "../lib/task-activity.js";
 import { getTextReadCacheStats } from "../lib/text-read-cache.js";
 import {
   bindCurrentSessionMachine,
@@ -210,6 +211,7 @@ async function buildDoctor(workspaceRoot: string) {
   const tasks = tasksResult.status === "fulfilled" ? tasksResult.value : [];
   const transactions = transactionsResult.status === "fulfilled" ? transactionsResult.value : [];
   const loops = loopsResult.status === "fulfilled" ? loopsResult.value : [];
+  const workers = getManagedProcessSnapshot();
   const auditMetrics = auditMetricsResult.status === "fulfilled" ? auditMetricsResult.value : null;
   const activeLoops = loops.filter((loop) => loop.status === "active");
   const activeLoopTransactions = new Set(activeLoops.map((loop) => loop.transaction_id));
@@ -224,7 +226,14 @@ async function buildDoctor(workspaceRoot: string) {
   const staleTasks = tasks
     .filter((task) => ["active", "blocked"].includes(task.status) && isStale(task.updated_at))
     .slice(0, 20)
-    .map((task) => ({ id: task.id, title: task.title, status: task.status, age_hours: ageHours(task.updated_at), workspace: task.workspace }));
+    .map((task) => ({
+      id: task.id,
+      title: task.title,
+      status: task.status,
+      age_hours: ageHours(task.updated_at),
+      workspace: task.workspace,
+      execution: summarizeTaskActivity(task, loops, workers),
+    }));
   const staleLoops = activeLoops
     .filter((loop) => isStale(loop.updated_at))
     .slice(0, 20)
@@ -292,13 +301,14 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
     "list_skills",
     {
       title: "List Skills",
-      description: "List project skills and their short activation descriptions. Read a matching skill with load_skill before following it.",
-      inputSchema: {},
+      description: "Discover project and global skills. Pass path for a specific project; use load_skill with the same path.",
+      inputSchema: { path: z.string().optional().describe("Project root for skill discovery") },
       annotations: toolAnnotations("read"),
     },
-    async () => {
-      const skills = await loadProjectSkills(workspaceRoot);
-      return toolResult("list_skills", { skills, count: skills.length });
+    async ({ path: projectPath }) => {
+      const root = await validatePath(await resolveProjectReference(projectPath, getShellStatus().cwd || workspaceRoot));
+      const skills = await loadProjectSkills(root);
+      return toolResult("list_skills", { root, skills, count: skills.length });
     }
   );
 
@@ -306,15 +316,18 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
     "load_skill",
     {
       title: "Load Skill",
-      description: "Load one skill's complete instructions. Computer Use includes its bundled guidance, API, and confirmation references.",
+      description: "Load a skill's instructions, or read one .md/.txt reference using reference_path relative to that skill's directory. Computer Use plugin has bundled guidance.",
       inputSchema: {
         name: z.string().min(1).describe("Exact skill name returned by list_skills"),
+        path: z.string().optional().describe("Same project root used for list_skills"),
+        reference_path: z.string().max(2000).optional().describe("Optional reference file relative to skill directory, e.g. references/api.md"),
         max_bytes: z.number().int().positive().max(500000).optional().default(200000),
       },
       annotations: toolAnnotations("read"),
     },
-    async ({ name, max_bytes }) => {
-      const loaded = await loadProjectSkill(workspaceRoot, name, max_bytes);
+    async ({ name, path: projectPath, reference_path, max_bytes }) => {
+      const root = await validatePath(await resolveProjectReference(projectPath, getShellStatus().cwd || workspaceRoot));
+      const loaded = await loadProjectSkill(root, name, max_bytes, reference_path);
       await audit({ tool: "load_skill", action: "read", target: loaded.skill.path, status: "ok" });
       return toolResult("load_skill", loaded);
     }

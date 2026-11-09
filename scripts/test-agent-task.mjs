@@ -10,6 +10,7 @@ import {
   updateAgentTask,
   updateAgentTaskStep,
 } from "../dist/lib/agent-task-store.js";
+import { summarizeTaskActivity } from "../dist/lib/task-activity.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -23,6 +24,28 @@ function fail(name, err) { console.error(`FAIL ${name}: ${err?.stack || err}`); 
 async function run(name, fn) {
   try { await fn(); ok(name); } catch (err) { fail(name, err); }
 }
+
+await run("task status distinguishes saved plans, linked loops, and live workers", async () => {
+  const source = { id: "task-a", status: "active" };
+  const completedLoop = { id: "loop-a", task_id: "task-a", status: "completed", managed_task: false };
+  const stored = summarizeTaskActivity(source, [completedLoop], []);
+  if (stored.running_worker_count !== 0 || !stored.explanation.includes("externally managed")) {
+    throw new Error("completed unmanaged loop was mistaken for an executing task");
+  }
+  const executing = summarizeTaskActivity(source, [completedLoop], [
+    { id: "worker-a", task_id: "task-a", running: true },
+    { id: "worker-b", task_id: "unrelated", running: true },
+  ]);
+  if (executing.running_worker_count !== 1 || executing.worker_ids[0] !== "worker-a") {
+    throw new Error("live worker identification was not scoped to its task");
+  }
+  const pending = summarizeTaskActivity(source, [{ id: "loop-b", task_id: "task-a", status: "active" }], []);
+  if (!pending.explanation.includes("no registered running worker")) {
+    throw new Error("an active plan was mistaken for a running worker");
+  }
+  const mismatch = summarizeTaskActivity(source, [{ id: "loop-c", task_id: "task-a", status: "completed", managed_task: true }], []);
+  if (!mismatch.explanation.includes("reconciliation")) throw new Error("missed managed-task lifecycle mismatch");
+});
 
 await fs.rm(stateDir, { recursive: true, force: true });
 let task;

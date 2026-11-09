@@ -32,6 +32,8 @@ All tools return JSON: { ok, tool, summary, data }
 - git_status / git_diff / git_worktree / git_commit
 - rewind: action=list|preview|restore|status — undo file edits via automatic checkpoints
 - enabled upstream MCP tools are exposed directly as <server>__<tool> (for example chrome-devtools__list_pages, linear__get_user); prefer direct tools
+
+- computer_observe / computer_act: opt-in Vercel desktop/browser MCP; inspect UI or act with explicit authorization, allowlisted commands and optional post-action text verification. A saved agent_task is never proof that a computer operation is running.
 - mcp_servers: upstream status. mcp_tools / mcp_call are low-level full-profile diagnostics/fallbacks
 - Full/optional-profile helpers not normally advertised in slim include raw lsp, delegate_status, multi_edit, git_add/git_restore, raw binary I/O, search_files/list_allowed_directories, delete_directory, git_checkout/git_push/git_pull/git_reset, and mcp_tools/mcp_call
 - If a helper is hidden by the active profile, use an appropriate run_command equivalent or enable it in Admin UI, then open a new MCP chat

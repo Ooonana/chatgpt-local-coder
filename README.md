@@ -50,6 +50,60 @@ Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/dev
 
 ## 🚀 Quick Start
 
+### Agent Skills (project and global)
+
+Local Coder discovers skills from the current project's `.agents/skills`,
+`.claude/skills`, and `.codex/skills` directories, followed by the same three
+directories in the user's home folder. Additional global directories can be
+supplied through `LOCAL_CODER_SKILL_DIRS` (OS path delimiter separated).
+Project skills take precedence when multiple directories use the same skill name.
+Restricted permission profiles hide skills outside configured filesystem roots.
+
+Call `list_skills` to discover available skills, then `load_skill` to read one.
+Both tools accept an optional `path` to explicitly choose a project root.
+To read a supporting Markdown/text reference without reloading the entire skill,
+pass `reference_path` to `load_skill`, for example `references/api.md`.
+Reference paths are resolved inside their skill directory, and traversal or
+symlink escapes are rejected. Installing a skill does not automatically enable
+the programs or MCP tools that the skill describes.
+
+The Admin UI's **MCP Servers → Agent Skills** panel can disable or re-enable
+individual skills for a selected project or globally. It writes versioned
+JSON controls to `<project>/.local-coder/skills.json` and
+`~/.local-coder/skills.json`, respectively. A global disable always takes
+precedence over the project toggle. Disabled skills are omitted from
+`list_skills` and cannot be loaded by name. Invalid settings fail visibly.
+
+### Opt-in Vercel computer-use MCP providers
+
+From the Admin UI's **MCP Servers** view, choose **+ Computer-use presets**.
+This adds disabled upstream MCP entries for Vercel's `agent-desktop` (native
+accessibility/UI control) and `agent-browser` (Chrome/CDP). It does not download,
+start, or enable either program. Existing entries with those IDs are preserved.
+To use them, install the corresponding CLI separately (for example,
+`npm install -g agent-desktop` and `npm install -g agent-browser`), test its
+availability, then enable the server and select the MCP tools you want to
+expose. The default `meta_only` exposure deliberately advertises no direct
+upstream tools. Once enabled, Local Coder offers `computer_observe` and
+`computer_act` in the slim profile with an explicit allowlist, rather than
+automatically advertising all upstream controls. Input requires
+`allow_input=true` and an unsafe-runtime-enabled permission profile.
+It can verify a fresh snapshot against `expected_text`; failures can trigger
+`screenshot_on_failure`, never an automatic repeat click. Read-only screen
+access also requires the unsafe-runtime permission. Review tool permissions
+before enabling `all` upstream exposure.
+After changing the exposed tools, reconnect/refresh the ChatGPT connector.
+
+On Windows, installed npm shims resolve to native executables for MCP transport.
+The browser preset prefers installed Google Chrome and stores its own persistent
+profile in Local AppData (`ChatGPTLocalCoder/browser-profile`) rather than
+using the user's ordinary Chrome profile. An optional end-to-end check is
+`node scripts/test-vercel-mcp-live.mjs`; it uses a localhost fixture to verify
+DOM interaction and MCP reconnect without modifying existing user apps.
+
+Vercel sources: [agent-desktop](https://github.com/vercel-labs/agent-desktop)
+and [agent-browser](https://github.com/vercel-labs/agent-browser).
+
 **Requirements:** [Node.js](https://nodejs.org) 22.22.2+, npm, Git (optional, for git tools/worktree isolation)
 
 **Windows**

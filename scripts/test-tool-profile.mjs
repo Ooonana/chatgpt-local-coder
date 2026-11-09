@@ -50,7 +50,7 @@ try {
   }
   ok(`slim profile has ${SLIM_CHATGPT_TOOLS.size} tools`);
 
-  for (const t of ["apply_patch", "glob", "remember", "load_path_rules"]) {
+  for (const t of ["apply_patch", "glob", "remember", "load_path_rules", "computer_observe", "computer_act"]) {
     if (!shouldExposeTool(t, "slim")) throw new Error(`${t} missing from slim`);
   }
   ok("core tools exposed in slim");
