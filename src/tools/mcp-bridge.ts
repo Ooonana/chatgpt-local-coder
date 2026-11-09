@@ -70,7 +70,7 @@ export function registerMcpBridgeTools(server: McpServer, manager: McpUpstreamMa
         tool: z.string(),
         arguments: z.record(z.string(), z.any()).optional().default({}),
       },
-      annotations: toolAnnotations("edit"),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async ({ server_id, tool, arguments: args }) => {
       requireUnsafeRuntimeAllowed(`upstream MCP tool '${server_id}:${tool}'`);

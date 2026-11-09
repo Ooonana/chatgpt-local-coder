@@ -6,6 +6,7 @@ import type { RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { McpUpstreamManager } from "./mcp-upstream-manager.js";
 import type { UpstreamServerConfig } from "./mcp-upstream-config.js";
 import { toolAnnotations } from "./tool-annotations.js";
+import { requireUnsafeRuntimeAllowed, requireWriteAllowed } from "./permissions.js";
 
 const proxyRegistry = new WeakMap<McpServer, Map<string, RegisteredTool>>();
 
@@ -163,11 +164,23 @@ export async function refreshProxiedTools(server: McpServer, manager: McpUpstrea
           description: `[${config.name}] ${tool.description ?? tool.name}`,
           inputSchema: hasSchema ? inputShape : {},
           ...(hasOutputSchema ? { outputSchema: outputShape } : {}),
-          annotations: tool.annotations ?? toolAnnotations("edit"),
+          // Upstream annotations are supplied by an external provider and
+          // cannot grant read-only privileges to arbitrary executable tools.
+          // Conservatively treat direct proxy calls as potentially mutating.
+          annotations: {
+            ...toolAnnotations("destructive"),
+            ...(tool.annotations ?? {}),
+            readOnlyHint: false,
+            destructiveHint: true,
+            idempotentHint: false,
+            openWorldHint: true,
+          },
         },
         async (args: Record<string, unknown>) => {
           // Transparent MCP proxy: preserve the upstream CallToolResult exactly
           // (text, images, embedded resources, structuredContent and isError).
+          requireUnsafeRuntimeAllowed(`upstream MCP tool '${config.id}:${tool.name}'`);
+          requireWriteAllowed();
           return (await manager.callTool(config.id, tool.name, args ?? {})) as any;
         }
       );

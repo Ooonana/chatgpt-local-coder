@@ -4,6 +4,8 @@
  * Run: node scripts/test-electron-mcp-live.mjs
  */
 import assert from "node:assert/strict";
+// This disposable Electron fixture must never prompt the real desktop user.
+process.env.MCP_COMPUTER_APPROVAL_MODE = "off";
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";

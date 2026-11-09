@@ -10,6 +10,7 @@ import {
 import { requireUnsafeRuntimeAllowed, requireWriteAllowed } from "../lib/permissions.js";
 import { audit } from "../lib/audit.js";
 import { toolResult } from "../lib/tool-result.js";
+import { needsComputerApproval, requireComputerApproval } from "../lib/computer-approval.js";
 
 type UpstreamResult = {
   isError?: boolean;
@@ -186,6 +187,25 @@ export function registerComputerUseTools(server: McpServer, manager: McpUpstream
       const serverId = mustEnableProvider(manager, provider);
       const available = await manager.listTools(serverId);
       if (!available.some((item) => item.name === tool)) throw new Error("Unsupported upstream input tool: " + tool);
+
+      const approvalScope = provider === "desktop"
+        ? verification_target?.window_id || "desktop-global"
+        : tool === "agent_browser_connect" && typeof args.target === "string"
+          ? "cdp:" + args.target
+          : tool === "agent_browser_open" && typeof args.url === "string"
+            ? "browser:" + new URL(args.url).origin
+            : "browser-session";
+      try {
+        await requireComputerApproval(provider, tool, approvalScope);
+        if (needsComputerApproval(tool)) {
+          await audit({ tool: "computer_act", action: "operator_approval", target: provider,
+            status: "ok", details: { tool, approval_scope: "short_lived" } });
+        }
+      } catch (error) {
+        await audit({ tool: "computer_act", action: "operator_approval", target: provider,
+          status: "error", details: { tool, denied: true } });
+        throw error;
+      }
 
       let outcome = summarizeUpstream(await manager.callTool(serverId, tool, args));
       let attempts = 1;

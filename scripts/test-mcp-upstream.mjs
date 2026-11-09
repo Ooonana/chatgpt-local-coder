@@ -404,6 +404,12 @@ try {
       if (!/write|permission|denied/i.test(String(JSON.stringify(denied)))) {
         throw new Error(`mcp_call allowed mutation with allow_write=false: ${JSON.stringify(denied)}`);
       }
+      const directDenied = await client.callTool({
+        name: "mockhttp__add", arguments: { a: 3, b: 4 },
+      }).catch((err) => err);
+      if (!/write|permission|denied/i.test(String(JSON.stringify(directDenied)))) {
+        throw new Error(`direct upstream proxy bypassed allow_write=false: ${JSON.stringify(directDenied)}`);
+      }
       savePermissionConfig({
         profile: "custom", path_roots: [root], allow_write: true,
         allow_commands: false, allow_unsafe_runtimes: true,

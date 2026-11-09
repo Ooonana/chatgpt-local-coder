@@ -5,6 +5,8 @@
  * plus screenshot fallback, then terminates only the fixture process.
  */
 import assert from "node:assert/strict";
+// Isolated fixture actions are pre-authorized by this test only.
+process.env.MCP_COMPUTER_APPROVAL_MODE = "off";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";

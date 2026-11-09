@@ -95,6 +95,15 @@ automatically advertising all upstream controls. Input requires
 `allow_input=true` and an unsafe-runtime-enabled permission profile. The
 `allow_input` flag is provided by the caller; it is **not** independent proof
 of human approval. Host-side confirmation depends on the MCP client.
+Local Coder also has a separate Windows operator prompt for sensitive actions
+(typing, form filling, connecting to CDP, navigation, and similar actions).
+`MCP_COMPUTER_APPROVAL_MODE=sensitive` is the default; `all` requests approval
+for every non-wait computer action, and `off` disables this additional gate
+on explicitly trusted systems. The approval dialog defaults to No, times out
+after 30 seconds and allows repeat actions in the same window/browser scope
+for 90 seconds. CI fixtures use `off` so they do not control your real desktop.
+This is an additional consent layer, **not** an OS sandbox: an unrestricted
+terminal or a separate computer automation program could bypass it.
 It can verify a fresh snapshot against `expected_text`; desktop input by
 `ref_id` requires a recent `computer_observe` snapshot scoped to
 `arguments.window_id` and a matching `verification_target.window_id`.
@@ -127,6 +136,21 @@ The full-profile `mcp_call` fallback also enforces the upstream server's
 `expose`/allowlist policy and local write/unsafe-runtime permission. It cannot
 invoke hidden `meta_only` or disabled tools. Structured upstream failures are
 reported as errors, not successful calls.
+Direct upstream proxies use the same conservative write/unsafe-runtime
+restriction even if the remote tool claims `readOnlyHint=true`: annotations
+from other servers cannot weaken the local permission boundary. This means
+strict read-only profiles cannot call direct upstream tools unless they use
+the approved native read-only integration instead.
+
+### Reviewing stale task records
+
+Use `agent_task(action="review", workspace="C:\\path\\to\\project", stale_hours=24)`
+to identify old active/blocked plans, their linked coding loops, active
+workers, and suggested manual recovery action. Review is strictly read-only:
+it never marks a task complete, deletes transactions, or edits other projects.
+Explicit task updates now validate an optional `workspace` against the task's
+stored project and reject cross-project mutations from project-bound MCP
+sessions. Task state is not an autonomous worker.
 
 Additional optional Windows checks:
 `node scripts/test-desktop-mcp-live.mjs` creates a disposable WinForms window,

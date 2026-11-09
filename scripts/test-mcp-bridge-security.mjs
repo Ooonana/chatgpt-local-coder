@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerMcpBridgeTools } from "../dist/tools/mcp-bridge.js";
+import { refreshProxiedTools } from "../dist/lib/mcp-tool-proxy.js";
 import { savePermissionConfig } from "../dist/lib/permissions.js";
 
 const dir = await fs.mkdtemp(path.join(os.tmpdir(), "local-coder-mcp-security-"));
@@ -14,10 +15,11 @@ process.env.PERMISSIONS_CONFIG = path.join(dir, "permissions.json");
 savePermissionConfig({ profile: "open" });
 let config = { id: "sensitive", enabled: true, tool_prefix: "hidden", expose: "meta_only", tools: [] };
 const available = ["allowed", "not_allowed", "structuredFailure", "nestedFailure", "textFailure"]
-  .map((name) => ({ name, description: name }));
+  .map((name) => ({ name, description: name, annotations: { readOnlyHint: true } }));
 const calls = [];
 const manager = {
   getServerConfig: (id) => id === "sensitive" ? config : undefined,
+  listServerConfigs: () => [config],
   async listTools() { return available; },
   getProxiedToolNames(cfg, tools) {
     if (!cfg.enabled || cfg.expose === "none" || cfg.expose === "meta_only") return [];
@@ -56,6 +58,7 @@ try {
   config = { ...config, expose: "none" };
   await denied("allowed");
   config = { ...config, expose: "allowlist", tools: ["allowed", "structuredFailure", "nestedFailure", "textFailure"] };
+  await refreshProxiedTools(server, manager);
   await denied("not_allowed");
   list = await invoke("mcp_tools", { server_id: "sensitive" });
   assert.equal(list.structuredContent?.data?.count, 4);
@@ -67,6 +70,20 @@ try {
     assert.equal(failure.structuredContent?.ok, false, tool + " was reported as successful");
   }
   assert.equal(calls.length, 4, "Denied tools must never reach the upstream provider");
+  savePermissionConfig({
+    profile: "custom", path_roots: [dir], allow_write: false,
+    allow_commands: false, allow_unsafe_runtimes: true,
+  });
+  const beforeProxy = calls.length;
+  const untrustedReadOnly = await invoke("hidden__allowed", {}).catch((error) => error);
+  assert.match(JSON.stringify(untrustedReadOnly), /write|permission|denied/i,
+    "Upstream readOnlyHint=true must not bypass the Local Coder write restriction");
+  assert.equal(calls.length, beforeProxy);
+  savePermissionConfig({ profile: "open" });
+  const proxiedAllowed = await invoke("hidden__allowed", {});
+  assert.equal(proxiedAllowed.isError, undefined, JSON.stringify(proxiedAllowed));
+  assert.equal(calls.length, beforeProxy + 1);
+  console.log("OK upstream-supplied readOnlyHint cannot bypass direct proxy permissions");
   config = { ...config, expose: "all", disabled_tools: ["allowed"] };
   await denied("allowed");
   config = { ...config, enabled: false };

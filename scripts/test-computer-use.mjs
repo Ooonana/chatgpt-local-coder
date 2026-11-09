@@ -12,6 +12,8 @@ import {
 } from "../dist/lib/computer-use-policy.js";
 import { savePermissionConfig } from "../dist/lib/permissions.js";
 
+// Automated fixture: do not display a real operator confirmation dialog.
+process.env.MCP_COMPUTER_APPROVAL_MODE = "off";
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "local-coder-computer-use-"));
 const previousPermissions = process.env.PERMISSIONS_CONFIG;
 process.env.PERMISSIONS_CONFIG = path.join(root, "permissions.json");

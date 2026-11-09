@@ -73,6 +73,64 @@ async function openMcp(label, defaultWorkspace = temp) {
   };
 }
 
+await test("stale task review is read-only and task mutation enforces project ownership", async () => {
+  const taskA = await tasks.createAgentTask({
+    title: "Old workspace-A task", objective: "verify scoped recovery", workspace: projectA,
+    plan: ["review evidence", "finish only after explicit verification"],
+  });
+  const taskB = await tasks.createAgentTask({
+    title: "Separate workspace-B task", objective: "must remain untouched", workspace: projectB,
+    plan: ["unrelated work"],
+  });
+  const client = await openMcp("phase6-stale-task-review", projectA);
+  try {
+    let result = await client.call("agent_task", {
+      action: "review", id: taskA.id, stale_hours: 1,
+    });
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result), /explicit workspace/);
+    const originalNow = Date.now;
+    try {
+      Date.now = () => originalNow() + 2 * 60 * 60 * 1000;
+      result = await client.call("agent_task", {
+        action: "review", workspace: projectA, id: taskA.id, stale_hours: 1,
+      });
+    } finally {
+      Date.now = originalNow;
+    }
+    assert.equal(result.structuredContent?.ok, true, JSON.stringify(result));
+    assert.equal(result.structuredContent.data.count, 1);
+    assert.equal(result.structuredContent.data.findings[0].id, taskA.id);
+    assert.equal(result.structuredContent.data.findings[0].auto_modified, false);
+    assert.equal((await tasks.getAgentTask(taskA.id))?.status, "active");
+    assert.equal((await tasks.getAgentTask(taskB.id))?.status, "active");
+
+    result = await client.call("agent_task", {
+      action: "update", id: taskB.id, workspace: projectA, note: "should not appear",
+    });
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result), /belongs to.*requested workspace/i);
+
+    await inSession("phase6-stale-task-review", async () => {
+      sessionContext.bindCurrentSessionProject(projectA);
+    });
+    result = await client.call("agent_task", {
+      action: "update", id: taskB.id, note: "cross-project write",
+    });
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result), /Cross-workspace mutation blocked/);
+    assert.equal((await tasks.getAgentTask(taskB.id))?.notes?.length, 0);
+    result = await client.call("agent_task", {
+      action: "step", id: taskA.id, workspace: projectA, step_index: 0,
+      step_status: "in_progress",
+    });
+    assert.equal(result.structuredContent?.ok, true, JSON.stringify(result));
+    assert.equal((await tasks.getAgentTask(taskB.id))?.status, "active");
+  } finally {
+    await client.close();
+  }
+});
+
 await test("fresh MCP transports do not inherit hidden cwd by default", async () => {
   await inSession("phase6-a", async () => {
     await shell.bootstrapShellSession(projectA, "phase6-a");
@@ -704,7 +762,7 @@ await test("tunnel diagnostics redact MCP and API secrets", async () => {
 });
 
 await test("Phase 6 schema/tool budget contract is explicit", async () => {
-  assert.equal(SCHEMA_CONTRACT_VERSION, 9);
+  assert.equal(SCHEMA_CONTRACT_VERSION, 10);
   // Keep a bounded tool-schema budget, with room for the two opt-in computer-use tools.
   assert.ok(SLIM_CHATGPT_TOOLS.size <= 44, `slim tools=${SLIM_CHATGPT_TOOLS.size}`);
 });

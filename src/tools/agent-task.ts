@@ -23,6 +23,8 @@ import {
 } from "../lib/session-context.js";
 import { sameResolvedPath } from "../lib/path-identity.js";
 import { getManagedProcessSnapshot } from "./shell.js";
+import { listCodingLoops } from "../lib/coding-loop-store.js";
+import { summarizeTaskActivity } from "../lib/task-activity.js";
 
 const statusSchema = z.enum(["active", "blocked", "completed", "cancelled", "abandoned", "archived"]);
 const stepStatusSchema = z.enum(["pending", "in_progress", "completed", "blocked", "skipped"]);
@@ -48,7 +50,7 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
       description:
         "Persistent coding-agent plan state for regular ChatGPT. Tracks objective, structured plan-step progress, notes, workspace, and resume state across MCP/chat sessions; Local Coder stores the loop while ChatGPT remains the reasoning model.",
       inputSchema: {
-        action: z.enum(["start", "list", "get", "resume", "update", "step", "finish", "cancel", "abandon", "archive"]),
+        action: z.enum(["start", "list", "get", "resume", "review", "update", "step", "finish", "cancel", "abandon", "archive"]),
         id: z.string().optional(),
         title: z.string().max(200).optional(),
         objective: z.string().max(10000).optional(),
@@ -59,10 +61,11 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
         step_id: z.string().optional(),
         step_index: z.number().int().min(0).max(99).optional(),
         step_status: stepStatusSchema.optional(),
+        stale_hours: z.number().min(1).max(720).optional().default(24).describe("Review-only: minimum age in hours for stale active/blocked tasks"),
       },
       annotations: toolAnnotations("edit"),
     },
-    async ({ action, id, title, objective, workspace, plan, note, status, step_id, step_index, step_status }) => {
+    async ({ action, id, title, objective, workspace, plan, note, status, step_id, step_index, step_status, stale_hours }) => {
       if (action === "list") {
         const resolvedWorkspace = workspace ? await validatePath(workspace) : null;
         const tasks = (await listAgentTasks(status as AgentTaskStatus | undefined))
@@ -75,6 +78,38 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
         const task = await getAgentTask(id);
         if (!task) throw new Error(`Unknown agent task id: ${id}`);
         return toolResult("agent_task", { action, task: taskWithProgress(task) }, { summary: `${task.title} — ${task.status}` });
+      }
+
+      if (action === "review") {
+        if (!workspace) throw new Error("Review requires an explicit workspace; it never scans or edits other projects");
+        const resolvedWorkspace = await validatePath(workspace);
+        const records = (await listAgentTasks())
+          .filter((task) => sameResolvedPath(task.workspace, resolvedWorkspace) && (!id || task.id === id));
+        if (id && !records.length) throw new Error("Task id does not belong to the requested workspace");
+        const [loops, workers] = [await listCodingLoops(500), getManagedProcessSnapshot()];
+        const now = Date.now();
+        const matches = records.filter((task) => ["active", "blocked"].includes(task.status) &&
+          Number.isFinite(Date.parse(task.updated_at)) &&
+          now - Date.parse(task.updated_at) >= stale_hours * 3_600_000);
+        const findings = matches.map((task) => {
+          const activity = summarizeTaskActivity(task, loops, workers);
+          const completeLoop = activity.linked_loop?.status === "completed";
+          return {
+            id: task.id, title: task.title, status: task.status, updated_at: task.updated_at,
+            age_hours: Math.round((now - Date.parse(task.updated_at)) / 360_000) / 10,
+            progress: getAgentTaskProgress(task), execution: activity,
+            suggested_action: activity.running_worker_count > 0 ? "inspect_running_worker" :
+              completeLoop ? "inspect_and_finish_manually" :
+              activity.linked_loop?.status === "active" ? "resume_loop_or_explicitly_abandon" :
+              "resume_or_mark_blocked_with_reason",
+            auto_modified: false,
+          };
+        });
+        return toolResult("agent_task", {
+          action, workspace: resolvedWorkspace, threshold_hours: stale_hours,
+          findings: findings.slice(0, 50), count: findings.length,
+          note: "Read-only review. No task, loop, transaction, or project state was modified.",
+        }, { summary: `Review: ${findings.length} stale task(s) in ${resolvedWorkspace}; nothing changed` });
       }
 
       if (action === "resume") {
@@ -126,6 +161,14 @@ export function registerAgentTaskTool(server: McpServer, defaultCwd: string): vo
       if (!id) throw new Error(`id is required for ${action}`);
       const existing = await getAgentTask(id);
       if (!existing) throw new Error(`Unknown agent task id: ${id}`);
+      if (workspace) {
+        const requestedWorkspace = await validatePath(workspace);
+        if (!sameResolvedPath(existing.workspace, requestedWorkspace)) {
+          throw new Error(`Task ${id} belongs to ${existing.workspace}, not the requested workspace ${requestedWorkspace}`);
+        }
+      }
+      await assertCurrentSessionMutationPath(existing.workspace, `agent_task ${action}`);
+      requireWriteAllowed(existing.workspace);
       if (action === "step") {
         if (step_id === undefined && step_index === undefined) throw new Error("step_id or step_index is required for step");
         if (!step_status) throw new Error("step_status is required for step");

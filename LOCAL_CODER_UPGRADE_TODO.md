@@ -43,8 +43,15 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
 - [ ] Improve task recovery after disconnections.
   - Done: Phase 6 reconnection, process isolation, transaction rollback,
     stale-loop and parallel-batch recovery scenarios pass in the full suite.
-  - Remaining: implement and validate further recovery fixes where evidenced.
+  - Done: `agent_task(action=review, workspace=...)` safely classifies stale
+    plans and linked workers/loops without changing records or other projects.
+    Existing task mutations reject mismatched workspace/project-bound sessions.
+  - Remaining: evaluate/manual reconcile actual historic records after evidence
+    review; no automatic finishing or deletion of resumable states.
 - [ ] Improve concurrent tasks and worktree isolation.
+  - Done: a confirmed cross-project task mutation gap was closed:
+    project-bound sessions and explicit workspace selectors must match the
+    task's stored project before modifying its state (Phase 6 regression).
 - [ ] Reduce failed-step retries and redundant operations.
 
 ## P2 — Performance and interface
@@ -61,19 +68,24 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
 ## P2 — Security
 - [ ] Add per-tool permissions and sensitive-action confirmation.
   - Done: unsafe-runtime gating, explicit input opt-in, restricted command allowlist.
-  - Remaining: actual host confirmation and provider-side permission verification.
+  - Done: conservative write/unsafe-runtime restriction on direct MCP proxies,
+    overriding untrusted upstream readOnlyHint annotations; default Windows
+    operator approval for sensitive computer-use actions with scoped 90s leases.
+  - Remaining: live human UI approval verification and confirmation policy UX;
+    unrestricted shell access is outside the security boundary.
 - [ ] Improve logging, secrets protection, and computer-use safeguards.
   - Done: audit entries, browser protocol restrictions, snapshot verification.
 
 ## P3 — Final verification
 - [ ] Run full regression and reconnect stress tests.
-  - Done: updated full npm test (exit 0; Phase 6 27/27), MCP integration
+  - Done: updated full npm test (exit 0; Phase 6 28/28), MCP integration
     (exit 0), isolated live desktop, Chrome and Electron reconnect checks.
   - Remaining: end-to-end service restart and sustained connector stress.
 - [x] Review changes, update documentation, and create local commits.
   - Source edits, README/AGENTS, tests and checklist committed locally (no push).
 - [ ] Verify repository and runtime status before handoff.
-  - Running MCP service still uses the previous build; restart and connector refresh required.
+  - Running MCP service still uses an earlier build; latest source schema
+    contract version is 10. Controlled restart and connector refresh required.
 
 ### Operation notes
 
@@ -105,10 +117,15 @@ Do not push without explicit request.
 - [x] Synchronize the alternate pnpm lockfile, constrain the vulnerable
   transitive packages and fix its additional critical proxy-addr advisory.
   Both npm and pnpm audits now report zero known vulnerabilities.
-- [ ] Independently enforce user approval for sensitive desktop/browser
-  actions; `allow_input=true` alone does not establish human consent.
+- [x] Add an independent local Windows operator prompt for sensitive desktop/
+  browser actions, with denial, timeouts, 90-second scope, and opt-out mode.
+  Mock approval/denial tests pass; real human GUI confirmation is still untested.
 - [ ] Implement scope-safe reconciliation of old tasks/loops/transactions;
   never purge unrelated projects or intentionally resumable records.
+- [x] Add read-only workspace-scoped stale task review, plus task mutation
+  project ownership checks and regression coverage.
+- [x] Prevent malicious upstream readOnlyHint annotations from bypassing
+  write/unsafe-runtime checks for directly exposed upstream tools.
 - [ ] Stress-test service-level restart and ChatGPT connector refresh.
 
 These repairs do not automatically complete the broader P0/P2/P3 roadmap.
