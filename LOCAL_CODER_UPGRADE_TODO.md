@@ -17,20 +17,21 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
 ## P1 — Computer Use 2.0
 - [x] Evaluate and integrate Vercel agent-desktop through native Windows MCP.
   - Installed 1.2.0; native launcher; live MCP handshake; app enumeration.
-- [ ] Add structured Windows UI inspection and actions.
-  - Implemented guarded `computer_observe` and `computer_act`; mock input tests passed.
-  - Remaining: isolated live Windows UI action and target-resolution validation.
-- [ ] Implement action verification, retries, and screenshot fallback.
-  - Done: expected-text snapshot verification, screenshot fallback, no blind retries.
-  - Remaining: bounded safe retries and live Windows fallback validation.
+- [x] Add structured Windows UI inspection and actions.
+  - Guarded `computer_observe` and `computer_act` passed real isolated WinForms
+    accessibility, semantic click and same-window state verification.
+- [x] Implement action verification, retries, and screenshot fallback.
+  - Window-scoped expected text, real screenshot fallback, no uncertain replay.
+  - One retry only when the upstream confirms not-delivered and retry=safe.
 
 ## P1 — Browser automation
 - [x] Integrate agent-browser and Chrome CDP (version 0.41.2).
 - [x] Add browser snapshots, navigation, and element interaction.
   - Verified on isolated localhost page with real Chrome and MCP.
-- [ ] Support persistent sessions and Electron apps.
-  - Done: isolated Chrome profile, persistent session after MCP reconnect.
-  - Remaining: Electron-specific automation testing.
+- [x] Support persistent sessions and Electron apps.
+  - Isolated Chrome profile and live VS Code Electron CDP targeting verified.
+  - Electron accessibility snapshot and MCP reconnect passed with temporary
+    VS Code profile; no modifications to the user's existing editor session.
 
 ## P1 — Agent Skills
 - [x] Support standard SKILL.md and .agents/skills directories.
@@ -40,11 +41,18 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
 
 ## P2 — Agent orchestration
 - [ ] Improve task recovery after disconnections.
+  - Done: Phase 6 reconnection, process isolation, transaction rollback,
+    stale-loop and parallel-batch recovery scenarios pass in the full suite.
+  - Remaining: implement and validate further recovery fixes where evidenced.
 - [ ] Improve concurrent tasks and worktree isolation.
 - [ ] Reduce failed-step retries and redundant operations.
 
 ## P2 — Performance and interface
 - [ ] Reduce tool response size and context usage.
+  - Done: MCP tools/list pagination correctly discovers 156 agent-browser tools
+    without exposing them to ChatGPT; bounded, deduplicated, cached discovery.
+    Measured 157 ms cold / approximately 0 ms warm cache lookup on Windows;
+    default ChatGPT profile still advertises only 42 native tools.
 - [ ] Improve Admin UI and terminal dashboard.
   - Done: Admin UI computer-use preset and Skills management panels.
 - [ ] Add clearer diagnostics, task progress, and logs.
@@ -59,7 +67,9 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
 
 ## P3 — Final verification
 - [ ] Run full regression and reconnect stress tests.
-  - Done: full npm test, MCP integration, live browser reconnect checks.
+  - Done: updated full npm test (exit 0; Phase 6 27/27), MCP integration
+    (exit 0), isolated live desktop, Chrome and Electron reconnect checks.
+  - Remaining: end-to-end service restart and sustained connector stress.
   - Remaining: end-to-end service restart and extended stress scenarios.
 - [x] Review changes, update documentation, and create local commits.
   - Source edits, README/AGENTS, tests and checklist committed locally (no push).
@@ -71,7 +81,9 @@ Use the persistent task's 33 finer-grained plan steps for detailed progress.
 Computer-use providers were installed globally and configured `enabled=true`
 with `expose=meta_only` in the machine-specific
 `profiles/mcp-upstream.json`. This file is intentionally separate from the source
-commit. The other seven existing provider entries were preserved.
+commit. The browser uses `--tools all` internally to allow Electron CDP but
+only the guarded two native computer-use tools are exposed by default.
+The other seven existing provider entries were preserved.
 Never mistake `agent_task.status=active` for autonomous execution.
 Do not restart the running MCP service during a live ChatGPT connector session.
 Do not push without explicit request.

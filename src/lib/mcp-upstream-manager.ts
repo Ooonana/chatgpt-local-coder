@@ -32,6 +32,37 @@ export interface UpstreamServerStatus {
   pid?: number | null;
 }
 
+/** MCP tools/list may be paginated; silently keeping only page one hides tools. */
+export async function collectPaginatedTools(
+  fetchPage: (cursor?: string) => Promise<{ tools?: Tool[]; nextCursor?: string }>,
+  limits: { maxPages?: number; maxTools?: number } = {},
+): Promise<Tool[]> {
+  const maxPages = limits.maxPages ?? 32;
+  const maxTools = limits.maxTools ?? 2048;
+  const seenCursors = new Set<string>();
+  const names = new Set<string>();
+  const collected: Tool[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const data = await fetchPage(cursor);
+    for (const tool of data.tools ?? []) {
+      if (!names.has(tool.name)) {
+        names.add(tool.name);
+        collected.push(tool);
+        if (collected.length > maxTools) {
+          throw new Error("Upstream MCP tool listing exceeds the safe tool limit");
+        }
+      }
+    }
+    const next = data.nextCursor;
+    if (!next) return collected;
+    if (seenCursors.has(next)) throw new Error("Upstream MCP tools/list returned a repeated cursor");
+    seenCursors.add(next);
+    cursor = next;
+  }
+  throw new Error("Upstream MCP tools/list exceeded the page limit");
+}
+
 interface UpstreamConnection {
   config: UpstreamServerConfig;
   client: Client;
@@ -361,8 +392,8 @@ export class McpUpstreamManager {
     const attempt = (async (): Promise<UpstreamConnection> => {
       const { client, transport, pid } = await this.withConnectTimeout(this.createTransport(config), serverId);
       try {
-        const list = await this.withConnectTimeout(client.listTools(), serverId);
-        const tools = list.tools ?? [];
+        const tools = await collectPaginatedTools((cursor) =>
+          this.withConnectTimeout(client.listTools(cursor ? { cursor } : undefined), serverId));
         const conn: UpstreamConnection = {
           config,
           client,
@@ -416,8 +447,8 @@ export class McpUpstreamManager {
     if (cached && cached.expiresAt > Date.now()) return cached.tools;
 
     const conn = await this.connect(serverId);
-    const list = await conn.client.listTools();
-    const tools = list.tools ?? [];
+    const tools = await collectPaginatedTools((cursor) =>
+      this.withConnectTimeout(conn.client.listTools(cursor ? { cursor } : undefined), serverId));
     conn.tools = tools;
     this.toolsCache.set(serverId, { tools, expiresAt: Date.now() + this.toolsCacheTtlMs });
     return tools;

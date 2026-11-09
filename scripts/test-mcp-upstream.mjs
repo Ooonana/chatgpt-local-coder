@@ -15,7 +15,7 @@ import {
   parseOpenCodeConfig,
   saveUpstreamConfig,
 } from "../dist/lib/mcp-upstream-config.js";
-import { McpUpstreamManager } from "../dist/lib/mcp-upstream-manager.js";
+import { McpUpstreamManager, collectPaginatedTools } from "../dist/lib/mcp-upstream-manager.js";
 import { refreshProxiedTools, jsonSchemaToZodShape } from "../dist/lib/mcp-tool-proxy.js";
 import { registerMcpBridgeTools } from "../dist/tools/mcp-bridge.js";
 import { createMcpServer } from "../dist/server-factory.js";
@@ -73,6 +73,40 @@ await fs.mkdir(tmpDir, { recursive: true });
 const configPath = path.join(tmpDir, "upstream.json");
 process.env.MCP_UPSTREAM_CONFIG = configPath;
 
+await run("MCP pagination merges all tools, deduplicates and rejects broken cursors", async () => {
+  const cursors = [];
+  const merged = await collectPaginatedTools(async (cursor) => {
+    cursors.push(cursor || "");
+    if (!cursor) return { tools: [{ name: "first" }], nextCursor: "page2" };
+    if (cursor === "page2") return { tools: [{ name: "first" }, { name: "second" }], nextCursor: "page3" };
+    if (cursor === "page3") return { tools: [{ name: "third" }] };
+    throw new Error("Unexpected cursor " + cursor);
+  });
+  if (merged.map((tool) => tool.name).join(",") !== "first,second,third" ||
+    cursors.join(",") !== ",page2,page3") throw new Error("Paged tool enumeration lost tools");
+
+  try {
+    await collectPaginatedTools(async () => ({ tools: [], nextCursor: "repeated" }));
+    throw new Error("Expected repeated cursor rejection");
+  } catch (error) {
+    if (!/repeated cursor/.test(error.message)) throw error;
+  }
+  try {
+    await collectPaginatedTools(async () => ({ tools: [{ name: "one" }], nextCursor: "next" }),
+      { maxPages: 1 });
+    throw new Error("Expected page limit rejection");
+  } catch (error) {
+    if (!/page limit/.test(error.message)) throw error;
+  }
+  try {
+    await collectPaginatedTools(async () => ({ tools: [{ name: "one" }, { name: "two" }] }),
+      { maxTools: 1 });
+    throw new Error("Expected tool limit rejection");
+  } catch (error) {
+    if (!/tool limit/.test(error.message)) throw error;
+  }
+});
+
 await run("jsonSchemaToZodShape respects required fields", async () => {
   const shape = jsonSchemaToZodShape({
     type: "object",
@@ -93,7 +127,7 @@ await run("computer-use MCP presets are opt-in, safe and idempotent", async () =
   }
   if (!/agent-desktop(?:-win32-(?:x64|arm64)\.exe)?$/.test(presets[0].command) ||
     !/agent-browser(?:-win32-x64\.exe)?$/.test(presets[1].command) ||
-    presets[1].args.join(" ") !== "mcp --tools core") {
+    presets[1].args.join(" ") !== "mcp --tools all") {
     throw new Error("unexpected Vercel computer-use CLI arguments");
   }
   if (!presets[1].env.AGENT_BROWSER_PROFILE ||

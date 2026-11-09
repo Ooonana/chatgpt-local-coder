@@ -34,9 +34,17 @@ function summarizeUpstream(raw: unknown) {
   const successful = result.isError !== true &&
     payload?.ok !== false && nested?.ok !== false &&
     (typeof payload?.exitCode !== "number" || payload.exitCode === 0);
+  // Upstream failures include delivery metadata. Never retry uncertain delivery.
+  const error = payload?.error && typeof payload.error === "object"
+    ? payload.error as Record<string, unknown> : null;
+  const disposition = error?.disposition && typeof error.disposition === "object"
+    ? error.disposition as Record<string, unknown> : null;
+  const retrySafe = !successful &&
+    disposition?.delivery === "not_delivered" && disposition?.retry === "safe";
   const asText = JSON.stringify(payload ?? text);
   return {
     ok: successful,
+    retrySafe,
     text: asText.slice(0, 60_000),
     truncated: asText.length > 60_000,
     images: (result.content ?? []).filter((item) => item.type === "image"),
@@ -107,28 +115,45 @@ export function registerComputerUseTools(server: McpServer, manager: McpUpstream
         arguments: argumentSchema,
         allow_input: z.boolean().optional().default(false).describe("Must be true for actual user-visible interaction"),
         expected_text: z.string().max(1000).optional().describe("Optional text expected in a new post-action snapshot"),
+        verification_target: z.object({
+          app: z.string().min(1).max(200).optional(),
+          window_id: z.string().min(1).max(200).optional(),
+        }).optional().describe("Desktop app or window to verify; required for desktop expected_text checks"),
+        safe_retries: z.number().int().min(0).max(1).optional().default(0).describe("Retry only when upstream confirms the action was NOT delivered and retry is safe"),
         screenshot_on_failure: z.boolean().optional().default(false),
       },
       // Computer input changes external state, so never mark it auto-approved.
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async ({ provider, tool, arguments: args, allow_input, expected_text, screenshot_on_failure }) => {
+    async ({ provider, tool, arguments: args, allow_input, expected_text, verification_target, safe_retries, screenshot_on_failure }) => {
       if (!allow_input) throw new Error("Computer input requires allow_input=true and user authorization");
       requireWriteAllowed();
       requireUnsafeRuntimeAllowed("computer-use input");
       validateComputerUseTool(provider, "act", tool, args);
+      if (provider === "desktop" && (expected_text || screenshot_on_failure) &&
+        !verification_target?.app && !verification_target?.window_id) {
+        throw new Error("Desktop verification/screenshot requires verification_target.app or verification_target.window_id");
+      }
+      if (provider === "browser" && verification_target) {
+        throw new Error("verification_target is only supported for desktop actions");
+      }
       const serverId = mustEnableProvider(manager, provider);
       const available = await manager.listTools(serverId);
       if (!available.some((item) => item.name === tool)) throw new Error("Unsupported upstream input tool: " + tool);
 
-      const outcome = summarizeUpstream(await manager.callTool(serverId, tool, args));
+      let outcome = summarizeUpstream(await manager.callTool(serverId, tool, args));
+      let attempts = 1;
+      if (!outcome.ok && safe_retries > 0 && outcome.retrySafe) {
+        outcome = summarizeUpstream(await manager.callTool(serverId, tool, args));
+        attempts += 1;
+      }
       let verification: { checked: boolean; passed: boolean | null; snapshot: string; error?: string } = {
         checked: false, passed: null, snapshot: "",
       };
       let screenshot: ReturnType<typeof summarizeUpstream> | undefined;
       if (outcome.ok && expected_text) {
         const snapshotTool = provider === "desktop" ? "desktop_snapshot" : "agent_browser_snapshot";
-        const snapshotArgs = provider === "desktop" && typeof args.app === "string" ? { app: args.app } : {};
+        const snapshotArgs = provider === "desktop" ? { ...verification_target } : {};
         try {
           const observed = summarizeUpstream(await manager.callTool(serverId, snapshotTool, snapshotArgs));
           verification = {
@@ -148,19 +173,19 @@ export function registerComputerUseTools(server: McpServer, manager: McpUpstream
           screenshot = summarizeUpstream(await manager.callTool(
             serverId,
             provider === "desktop" ? "desktop_screenshot" : "agent_browser_screenshot",
-            {},
+            provider === "desktop" ? { ...verification_target } : {},
           ));
         } catch {}
       }
       const success = outcome.ok && verification.passed !== false;
       await audit({ tool: "computer_act", action: tool, target: provider, status: success ? "ok" : "error",
-        details: { verified: verification.passed, screenshot_fallback: Boolean(screenshot) } });
+        details: { verified: verification.passed, screenshot_fallback: Boolean(screenshot), attempts } });
       const output = toolResult("computer_act", {
-        provider, tool, action_output: outcome.text,
+        provider, tool, action_output: outcome.text, attempts,
         verification, screenshot_fallback: screenshot ? screenshot.text.slice(0, 4000) : null,
       }, {
         ok: success,
-        summary: !outcome.ok ? "Computer action failed; not retried" :
+        summary: !outcome.ok ? (attempts > 1 ? "Computer action failed after one safe retry" : "Computer action failed; not retried") :
           verification.passed === false ? "Action completed but expected state was not verified" :
             expected_text ? "Computer action verified" : "Computer action sent; no expected state provided",
       });

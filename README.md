@@ -88,8 +88,13 @@ upstream tools. Once enabled, Local Coder offers `computer_observe` and
 `computer_act` in the slim profile with an explicit allowlist, rather than
 automatically advertising all upstream controls. Input requires
 `allow_input=true` and an unsafe-runtime-enabled permission profile.
-It can verify a fresh snapshot against `expected_text`; failures can trigger
-`screenshot_on_failure`, never an automatic repeat click. Read-only screen
+It can verify a fresh snapshot against `expected_text`; desktop verification
+requires a specific `verification_target.app` or `verification_target.window_id`
+so that an unrelated foreground window is never mistaken for the target.
+Failed verification can trigger `screenshot_on_failure`, restricted to that
+same window. Input is retried only if `safe_retries=1` is explicitly set and
+the upstream declares `disposition.delivery=not_delivered` and
+`disposition.retry=safe`; uncertain delivery is never replayed. Read-only screen
 access also requires the unsafe-runtime permission. Review tool permissions
 before enabling `all` upstream exposure.
 After changing the exposed tools, reconnect/refresh the ChatGPT connector.
@@ -100,6 +105,22 @@ profile in Local AppData (`ChatGPTLocalCoder/browser-profile`) rather than
 using the user's ordinary Chrome profile. An optional end-to-end check is
 `node scripts/test-vercel-mcp-live.mjs`; it uses a localhost fixture to verify
 DOM interaction and MCP reconnect without modifying existing user apps.
+
+The browser MCP process uses `--tools all` internally (not exposed directly
+because `expose=meta_only`) to support `agent_browser_connect` for Electron.
+The guarded `computer_act` interface allows CDP connection only to a
+localhost port/endpoint and disallows session/namespace overrides.
+Local Coder collects all paginated MCP tool-list pages with explicit bounds,
+deduplication and a 60-second cache; the full browser provider currently
+contains more than 100 tools, but only the native computer-use entrypoints
+are advertised to ChatGPT.
+
+Additional optional Windows checks:
+`node scripts/test-desktop-mcp-live.mjs` creates a disposable WinForms window,
+verifies its control ref and a real click, then closes it.
+`node scripts/test-electron-mcp-live.mjs` starts VS Code with a temporary,
+separate profile and local CDP port, checks target discovery, snapshots and
+reconnection, and cleans up. Both tests intentionally avoid existing user apps.
 
 Vercel sources: [agent-desktop](https://github.com/vercel-labs/agent-desktop)
 and [agent-browser](https://github.com/vercel-labs/agent-browser).

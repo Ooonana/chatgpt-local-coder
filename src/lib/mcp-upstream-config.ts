@@ -113,7 +113,10 @@ export function computerUseMcpPresets(): UpstreamServerConfig[] {
       enabled: false,
       transport: "stdio",
       command: installedVercelCommand("agent-browser"),
-      args: ["mcp", "--tools", "core"],
+      // The connect command needed for Electron CDP is in the full MCP
+      // catalog. expose=meta_only hides those tools from ChatGPT; the two
+      // native computer-use entrypoints still enforce a strict allowlist.
+      args: ["mcp", "--tools", "all"],
       env: isolatedBrowserEnvironment(),
       auth: { type: "none" },
       tool_prefix: "browser",

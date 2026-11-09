@@ -29,6 +29,18 @@ const manager = {
   },
   async callTool(id, tool, args) {
     invoked.push({ id, tool, args });
+    if (args.simulateSafeOnce && invoked.filter((entry) => entry.args.simulateSafeOnce).length === 1) {
+      return { structuredContent: {
+        ok: false,
+        error: { disposition: { delivery: "not_delivered", retry: "safe" } },
+      } };
+    }
+    if (args.simulateUnsafeFailure) {
+      return { structuredContent: {
+        ok: false,
+        error: { disposition: { delivery: "uncertain", retry: "unsafe" } },
+      } };
+    }
     if (args.simulateFailure) {
       return { structuredContent: { exitCode: 1, response: { ok: false, error: "ACTION_FAILED" } } };
     }
@@ -50,6 +62,12 @@ try {
   assert.throws(() => validateComputerUseTool("desktop", "act", "desktop_clipboard_set", {}), /allowlisted/);
   assert.throws(() => validateComputerUseTool("browser", "act", "agent_browser_open", { url: "file:///etc/passwd" }), /http/);
   assert.throws(() => validateComputerUseTool("browser", "act", "agent_browser_open", { url: "javascript:alert(1)" }), /http/);
+  assert.doesNotThrow(() => validateComputerUseTool("browser", "act", "agent_browser_connect", { target: "9222" }));
+  assert.doesNotThrow(() => validateComputerUseTool("browser", "act", "agent_browser_connect", { target: "http://127.0.0.1:9222" }));
+  assert.throws(() => validateComputerUseTool("browser", "act", "agent_browser_connect", { target: "https://example.org:9222" }), /localhost/);
+  assert.throws(() => validateComputerUseTool("browser", "act", "agent_browser_connect", { target: "127.0.0.2:9222" }), /localhost/);
+  assert.throws(() => validateComputerUseTool("browser", "act", "agent_browser_connect",
+    { target: "9222", namespace: "user-browser" }), /only target/);
   console.log("OK computer-use safety allowlist and navigation protocols");
 
   server = new McpServer({ name: "computer-use-test", version: "1.0.0" });
@@ -88,13 +106,49 @@ try {
 
   result = await call("computer_act", {
     provider: "desktop", tool: "desktop_click", arguments: { element: "e2" },
-    allow_input: true, expected_text: "Not there", screenshot_on_failure: true,
+    allow_input: true, expected_text: "Not there",
+    verification_target: { app: "isolated-test.exe" },
+    screenshot_on_failure: true,
   });
   assert.equal(result.structuredContent?.ok, false);
   assert.equal(result.structuredContent?.data?.verification?.passed, false);
   assert.ok(result.content?.some((item) => item.type === "image"));
   assert.equal(invoked.filter((x) => x.tool === "desktop_click").length, 1);
+  assert.equal(invoked.find((x) => x.tool === "desktop_snapshot")?.args.app, undefined);
+  assert.ok(invoked.some((x) => x.tool === "desktop_snapshot" && x.args.app === "isolated-test.exe"));
+  assert.ok(invoked.some((x) => x.tool === "desktop_screenshot" && x.args.app === "isolated-test.exe"));
   console.log("OK failed verification returns screenshot and does not retry an input");
+
+  const desktopBefore = invoked.filter((x) => x.tool === "desktop_click").length;
+  result = await call("computer_act", {
+    provider: "desktop", tool: "desktop_click", arguments: { ref_id: "@s1:e9" },
+    allow_input: true, expected_text: "Ready",
+  });
+  assert.match(JSON.stringify(result), /verification_target/);
+  assert.equal(invoked.filter((x) => x.tool === "desktop_click").length, desktopBefore);
+  result = await call("computer_act", {
+    provider: "desktop", tool: "desktop_click", arguments: { ref_id: "@s1:e9" },
+    allow_input: true, screenshot_on_failure: true,
+  });
+  assert.match(JSON.stringify(result), /verification_target/);
+  assert.equal(invoked.filter((x) => x.tool === "desktop_click").length, desktopBefore);
+  console.log("OK desktop verification cannot silently inspect another window");
+
+  result = await call("computer_act", {
+    provider: "browser", tool: "agent_browser_click",
+    arguments: { simulateSafeOnce: true }, allow_input: true, safe_retries: 1,
+  });
+  assert.equal(result.structuredContent?.ok, true);
+  assert.equal(result.structuredContent?.data?.attempts, 2);
+  assert.equal(invoked.filter((x) => x.args.simulateSafeOnce).length, 2);
+  result = await call("computer_act", {
+    provider: "browser", tool: "agent_browser_click",
+    arguments: { simulateUnsafeFailure: true }, allow_input: true, safe_retries: 1,
+  });
+  assert.equal(result.structuredContent?.ok, false);
+  assert.equal(result.structuredContent?.data?.attempts, 1);
+  assert.equal(invoked.filter((x) => x.args.simulateUnsafeFailure).length, 1);
+  console.log("OK input retry only when not_delivered and safe, never on uncertainty");
 
   result = await call("computer_act", {
     provider: "browser", tool: "agent_browser_click", arguments: { simulateFailure: true },
